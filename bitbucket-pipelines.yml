@@ -1,0 +1,45 @@
+image: docker:27
+
+options:
+  size: 2x
+
+clone:
+  depth: full
+
+pipelines:
+  default:
+    - step:
+        name: Native webOS build and IPK
+        services:
+          - docker
+        caches:
+          - docker
+        script:
+          - docker build -t gnomecast-native-build -f Dockerfile .
+          - >-
+            docker run --rm
+            -v "$BITBUCKET_CLONE_DIR:/workspace"
+            -w /workspace
+            gnomecast-native-build
+            bash -lc '
+              set -euo pipefail
+              git config --global --add safe.directory /workspace
+              git submodule update --init third_party/IronRDP third_party/ss4s third_party/commons third_party/lvgl
+              cargo fmt --manifest-path webrdp-min/Cargo.toml --check
+              cargo test --manifest-path webrdp-min/Cargo.toml --features native --locked native::tests::
+              cc -fsyntax-only -Inative/include \
+                native/src/main.c native/src/media_ss4s.c native/src/video_ss4s.c \
+                native/src/audio_ss4s.c native/src/video_rgba_sdl.c \
+                native/src/h264_annexb.c native/src/input_sdl.c native/src/rdp_ffi_stub.c
+              cmake -S native -B /tmp/gnomecast-native-build
+              cmake --build /tmp/gnomecast-native-build
+              ctest --test-dir /tmp/gnomecast-native-build --output-on-failure
+              ./tools/build-native-webos.sh
+            '
+        artifacts:
+          - dist/native-webos/**
+
+definitions:
+  services:
+    docker:
+      memory: 4096

@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  host-tests:
+    name: Host tests (Rust + native C)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libsdl2-dev cmake build-essential pkg-config
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            webrdp-min/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('webrdp-min/Cargo.lock') }}
+
+      - name: Rust format and tests
+        run: |
+          cargo fmt --manifest-path webrdp-min/Cargo.toml --check
+          cargo test --manifest-path webrdp-min/Cargo.toml --features native --locked native::tests::
+
+      - name: Native C syntax check
+        run: |
+          cc -fsyntax-only -Inative/include \
+            native/src/main.c native/src/media_ss4s.c native/src/video_ss4s.c \
+            native/src/audio_ss4s.c native/src/video_rgba_sdl.c \
+            native/src/h264_annexb.c native/src/input_sdl.c native/src/rdp_ffi_stub.c
+
+      - name: Native CMake build and ctest
+        run: |
+          cmake -S native -B "$RUNNER_TEMP/native-build"
+          cmake --build "$RUNNER_TEMP/native-build" -j"$(nproc)"
+          ctest --test-dir "$RUNNER_TEMP/native-build" --output-on-failure
+
+  webos-ipk:
+    name: webOS cross-build (.ipk)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build toolchain container
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          tags: gnomecast-native-build
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and verify .ipk
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/workspace" \
+            -w /workspace \
+            gnomecast-native-build \
+            bash -lc '
+              set -euo pipefail
+              git config --global --add safe.directory /workspace
+              ./tools/build-native-webos.sh
+            '
+
+      - name: Upload .ipk artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gnomecast-native-ipk
+          path: dist/native-webos/*.ipk
+          if-no-files-found: error

@@ -1,0 +1,1316 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 0172548..a6a9dab 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -3036,6 +3036,7 @@ dependencies = [
+  "ironrdp",
+  "ironrdp-cliprdr-format",
+  "ironrdp-core",
++ "ironrdp-egfx",
+  "ironrdp-futures",
+  "ironrdp-pdu",
+  "ironrdp-propertyset",
+diff --git a/crates/ironrdp-connector/Cargo.toml b/crates/ironrdp-connector/Cargo.toml
+index 82776e9..6a7b2c1 100644
+--- a/crates/ironrdp-connector/Cargo.toml
++++ b/crates/ironrdp-connector/Cargo.toml
+@@ -17,7 +17,8 @@ doctest = false
+ test = false
+ 
+ [features]
+-default = []
++default = ["credssp"]
++credssp = ["dep:sspi", "dep:picky", "dep:picky-asn1-der", "dep:picky-asn1-x509"]
+ qoi = ["ironrdp-pdu/qoi"]
+ qoiz = ["ironrdp-pdu/qoiz"]
+ 
+@@ -26,13 +27,13 @@ ironrdp-svc = { path = "../ironrdp-svc", version = "0.7" } # public
+ ironrdp-core = { path = "../ironrdp-core", version = "0.2" } # public
+ ironrdp-error = { path = "../ironrdp-error", version = "0.2" } # public
+ ironrdp-pdu = { path = "../ironrdp-pdu", version = "0.8", features = ["std"] } # public
+-sspi = { version = "0.21", features = ["scard"] }
++sspi = { version = "0.21", features = ["scard"], optional = true }
+ url = "2.5" # public
+ rand = { version = "0.9", features = ["std"] } # TODO: dependency injection?
+ tracing = { version = "0.1", features = ["log"] }
+-picky-asn1-der = "0.5"
+-picky-asn1-x509 = "0.15"
+-picky = "=7.0.0-rc.23" # FIXME: We are pinning with = because the candidate version number counts as the minor number by Cargo, and will be automatically bumped in the Cargo.lock.
++picky-asn1-der = { version = "0.5", optional = true }
++picky-asn1-x509 = { version = "0.15", optional = true }
++picky = { version = "=7.0.0-rc.23", optional = true } # FIXME: We are pinning with = because the candidate version number counts as the minor number by Cargo, and will be automatically bumped in the Cargo.lock.
+ 
+ [lints]
+ workspace = true
+diff --git a/crates/ironrdp-connector/src/connection.rs b/crates/ironrdp-connector/src/connection.rs
+index 95b53bd..59104f3 100644
+--- a/crates/ironrdp-connector/src/connection.rs
++++ b/crates/ironrdp-connector/src/connection.rs
+@@ -2,8 +2,13 @@ use core::mem;
+ use core::net::SocketAddr;
+ use std::borrow::Cow;
+ use std::sync::Arc;
++use std::time::Instant;
+ 
+-use ironrdp_core::{Encode, WriteBuf, decode, encode_vec};
++use ironrdp_core::{Decode as _, Encode, EncodeResult, ReadCursor, WriteBuf, WriteCursor, decode, encode_vec};
++use ironrdp_pdu::rdp::autodetect::{
++    AutoDetectRequest, AutoDetectResponse, BW_RESULTS_CONNECT_TIME, BW_RESULTS_CONTINUOUS, BW_STOP_CONNECT_TIME,
++};
++use ironrdp_pdu::rdp::headers::{BasicSecurityHeader, BasicSecurityHeaderFlags};
+ use ironrdp_pdu::x224::X224;
+ use ironrdp_pdu::{PduHint, gcc, mcs, nego, rdp};
+ use ironrdp_svc::{StaticChannelSet, StaticVirtualChannel, SvcClientProcessor};
+@@ -29,6 +34,9 @@ pub struct ConnectionResult {
+     pub connection_activation: ConnectionActivationSequence,
+     /// The bulk compression type that was negotiated, if any.
+     pub compression_type: Option<rdp::client_info::CompressionType>,
++    /// The MCS message channel granted by the server (SC_MCS_MSGCHANNEL), used for
++    /// network-characteristics autodetection PDUs during the active session.
++    pub message_channel_id: Option<u16>,
+ }
+ 
+ #[derive(Default, Debug)]
+@@ -126,6 +134,10 @@ pub struct ClientConnector {
+     /// The client address to be used in the Client Info PDU.
+     pub client_addr: SocketAddr,
+     pub static_channels: StaticChannelSet,
++    /// MCS message channel id granted by the server (SC_MCS_MSGCHANNEL), if any.
++    message_channel_id: Option<u16>,
++    /// In-progress connect-time bandwidth measurement: (start time, bytes received).
++    connect_time_bw: Option<(Instant, u32)>,
+ }
+ 
+ impl ClientConnector {
+@@ -135,6 +147,8 @@ impl ClientConnector {
+             state: ClientConnectorState::ConnectionInitiationSendRequest,
+             client_addr,
+             static_channels: StaticChannelSet::new(),
++            message_channel_id: None,
++            connect_time_bw: None,
+         }
+     }
+ 
+@@ -200,6 +214,107 @@ impl ClientConnector {
+     }
+ }
+ 
++/// Payload of an MCS message-channel PDU carrying an Auto-Detect Response: a basic
++/// security header (SEC_AUTODETECT_RSP) followed by the response body ([MS-RDPBCGR] 2.2.14.2).
++struct SecuredAutoDetectResponse(AutoDetectResponse);
++
++impl Encode for SecuredAutoDetectResponse {
++    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
++        BasicSecurityHeader {
++            flags: BasicSecurityHeaderFlags::AUTODETECT_RSP,
++        }
++        .encode(dst)?;
++        self.0.encode(dst)
++    }
++
++    fn name(&self) -> &'static str {
++        "SecuredAutoDetectResponse"
++    }
++
++    fn size(&self) -> usize {
++        BasicSecurityHeader::FIXED_PART_SIZE + self.0.size()
++    }
++}
++
++impl ClientConnector {
++    /// Handles one connect-time Auto-Detect Request PDU from the MCS message channel and
++    /// writes the response (if the request kind warrants one) to `output`.
++    fn process_connect_time_autodetect(
++        &mut self,
++        message_channel_id: u16,
++        user_channel_id: u16,
++        input: &[u8],
++        output: &mut WriteBuf,
++    ) -> ConnectorResult<Written> {
++        let ctx = crate::legacy::decode_send_data_indication(input)?;
++        let mut cursor = ReadCursor::new(ctx.user_data);
++        let header = BasicSecurityHeader::decode(&mut cursor).map_err(ConnectorError::decode)?;
++        if !header.flags.contains(BasicSecurityHeaderFlags::AUTODETECT_REQ) {
++            debug!(?header, "Ignoring non-autodetect PDU on the MCS message channel");
++            return Ok(Written::Nothing);
++        }
++        let request = AutoDetectRequest::decode(&mut cursor).map_err(ConnectorError::decode)?;
++        debug!(?request, "Connect-time autodetect request");
++
++        let response = match request {
++            AutoDetectRequest::RttRequest { sequence_number, .. } => {
++                Some(AutoDetectResponse::RttResponse { sequence_number })
++            }
++            AutoDetectRequest::BandwidthMeasureStart { .. } => {
++                self.connect_time_bw = Some((Instant::now(), 0));
++                None
++            }
++            AutoDetectRequest::BandwidthMeasurePayload { payload, .. } => {
++                if let Some((_, bytes)) = self.connect_time_bw.as_mut() {
++                    *bytes = bytes.saturating_add(u32::try_from(payload.len()).unwrap_or(u32::MAX));
++                }
++                None
++            }
++            AutoDetectRequest::BandwidthMeasureStop {
++                sequence_number,
++                request_type,
++                payload,
++            } => {
++                let (time_delta_ms, byte_count) = match self.connect_time_bw.take() {
++                    Some((started_at, bytes)) => {
++                        let bytes = bytes.saturating_add(
++                            payload.map_or(0, |data| u32::try_from(data.len()).unwrap_or(u32::MAX)),
++                        );
++                        let elapsed = u32::try_from(started_at.elapsed().as_millis()).unwrap_or(u32::MAX);
++                        (elapsed, bytes)
++                    }
++                    None => (0, 0),
++                };
++                let response_type = if request_type == BW_STOP_CONNECT_TIME {
++                    BW_RESULTS_CONNECT_TIME
++                } else {
++                    BW_RESULTS_CONTINUOUS
++                };
++                Some(AutoDetectResponse::BandwidthMeasureResults {
++                    sequence_number,
++                    response_type,
++                    time_delta_ms,
++                    byte_count,
++                })
++            }
++            AutoDetectRequest::NetworkCharacteristicsResult { .. } => None,
++        };
++
++        match response {
++            Some(response) => {
++                let written = crate::legacy::encode_send_data_request(
++                    user_channel_id,
++                    message_channel_id,
++                    &SecuredAutoDetectResponse(response),
++                    output,
++                )?;
++                Written::from_size(written)
++            }
++            None => Ok(Written::Nothing),
++        }
++    }
++}
++
+ impl Sequence for ClientConnector {
+     fn next_pdu_hint(&self) -> Option<&dyn PduHint> {
+         match &self.state {
+@@ -212,7 +327,9 @@ impl Sequence for ClientConnector {
+             ClientConnectorState::BasicSettingsExchangeWaitResponse { .. } => Some(&ironrdp_pdu::X224_HINT),
+             ClientConnectorState::ChannelConnection { channel_connection, .. } => channel_connection.next_pdu_hint(),
+             ClientConnectorState::SecureSettingsExchange { .. } => None,
+-            ClientConnectorState::ConnectTimeAutoDetection { .. } => None,
++            // Connect-time autodetect requests (message channel) or the first licensing
++            // PDU (IO channel) — either way the next step consumes an X224 PDU.
++            ClientConnectorState::ConnectTimeAutoDetection { .. } => Some(&ironrdp_pdu::X224_HINT),
+             ClientConnectorState::LicensingExchange { license_exchange, .. } => license_exchange.next_pdu_hint(),
+             ClientConnectorState::MultitransportBootstrapping { .. } => None,
+             ClientConnectorState::CapabilitiesExchange {
+@@ -382,8 +499,16 @@ impl Sequence for ClientConnector {
+                     return Err(general_err!("can't satisfy server security settings"));
+                 }
+ 
+-                if server_gcc_blocks.message_channel.is_some() {
+-                    warn!("Unexpected ServerMessageChannelData GCC block (not supported)");
++                // The server grants an MCS message channel in response to our
++                // ClientMessageChannelData block; network-characteristics autodetection
++                // PDUs (which gnome-remote-desktop requires for audio output redirection)
++                // flow over it, both at connect time and during the active session.
++                self.message_channel_id = server_gcc_blocks
++                    .message_channel
++                    .as_ref()
++                    .map(|channel| channel.mcs_message_channel_id);
++                if let Some(message_channel_id) = self.message_channel_id {
++                    debug!(message_channel_id, "Server granted MCS message channel");
+                 }
+ 
+                 if server_gcc_blocks.multi_transport_channel.is_some() {
+@@ -418,7 +543,10 @@ impl Sequence for ClientConnector {
+                         channel_connection: if skip_channel_join {
+                             ChannelConnectionSequence::skip_channel_join()
+                         } else {
+-                            ChannelConnectionSequence::new(io_channel_id, static_channel_ids)
++                            // The message channel must be joined like any static channel.
++                            let mut channel_ids = static_channel_ids;
++                            channel_ids.extend(self.message_channel_id);
++                            ChannelConnectionSequence::new(io_channel_id, channel_ids)
+                         },
+                     },
+                 )
+@@ -481,16 +609,27 @@ impl Sequence for ClientConnector {
+             }
+ 
+             //== Optional Connect-Time Auto-Detection ==//
+-            // NOTE: IronRDP is not expecting the Auto-Detect Request PDU from server.
++            // Since the client advertises SUPPORT_NET_CHAR_AUTODETECT, FreeRDP-based servers
++            // (e.g. gnome-remote-desktop, which refuses audio output redirection without it)
++            // run connect-time autodetection here and block until the client responds.
++            // Requests arrive on the MCS message channel; the first PDU on the IO channel is
++            // the licensing exchange starting, which ends this phase.
+             ClientConnectorState::ConnectTimeAutoDetection {
+                 io_channel_id,
+                 user_channel_id,
+-            } => (
+-                Written::Nothing,
+-                ClientConnectorState::LicensingExchange {
+-                    io_channel_id,
+-                    user_channel_id,
+-                    license_exchange: LicenseExchangeSequence::new(
++            } => {
++                let channel_id = crate::legacy::decode_send_data_indication(input)?.channel_id;
++                if self.message_channel_id == Some(channel_id) {
++                    let written = self.process_connect_time_autodetect(channel_id, user_channel_id, input, output)?;
++                    (
++                        written,
++                        ClientConnectorState::ConnectTimeAutoDetection {
++                            io_channel_id,
++                            user_channel_id,
++                        },
++                    )
++                } else {
++                    let mut license_exchange = LicenseExchangeSequence::new(
+                         io_channel_id,
+                         self.config.credentials.username().unwrap_or("").to_owned(),
+                         self.config.domain.clone(),
+@@ -499,9 +638,24 @@ impl Sequence for ClientConnector {
+                             .license_cache
+                             .clone()
+                             .unwrap_or_else(|| Arc::new(NoopLicenseCache)),
+-                    ),
+-                },
+-            ),
++                    );
++                    // This input already carries the first licensing PDU; feed it through.
++                    let written = license_exchange.step(input, output)?;
++                    let next_state = if license_exchange.state.is_terminal() {
++                        ClientConnectorState::MultitransportBootstrapping {
++                            io_channel_id,
++                            user_channel_id,
++                        }
++                    } else {
++                        ClientConnectorState::LicensingExchange {
++                            io_channel_id,
++                            user_channel_id,
++                            license_exchange,
++                        }
++                    };
++                    (written, next_state)
++                }
++            }
+ 
+             //== Licensing ==//
+             // Server is sending information regarding licensing.
+@@ -558,6 +712,14 @@ impl Sequence for ClientConnector {
+                         written,
+                         ClientConnectorState::ConnectionFinalization { connection_activation },
+                     ),
++                    // The inner sequence may stay in CapabilitiesExchange when it skips a
++                    // Server Deactivate All PDU (sent by e.g. GNOME Remote Desktop before the
++                    // Server Demand Active PDU, MS-RDPBCGR §1.3.1.3). Remain in this outer state
++                    // and keep reading until the Demand Active PDU actually arrives.
++                    ConnectionActivationState::CapabilitiesExchange { .. } => (
++                        written,
++                        ClientConnectorState::CapabilitiesExchange { connection_activation },
++                    ),
+                     _ => return Err(general_err!("invalid state (this is a bug)")),
+                 }
+             }
+@@ -592,6 +754,7 @@ impl Sequence for ClientConnector {
+                                 pointer_software_rendering,
+                                 connection_activation,
+                                 compression_type: self.config.compression_type,
++                                message_channel_id: self.message_channel_id,
+                             },
+                         },
+                         _ => return Err(general_err!("invalid state (this is a bug)")),
+@@ -638,9 +801,9 @@ fn create_gcc_blocks<'a>(
+     static_channels: impl Iterator<Item = &'a StaticVirtualChannel>,
+ ) -> ConnectorResult<gcc::ClientGccBlocks> {
+     use ironrdp_pdu::gcc::{
+-        ClientCoreData, ClientCoreOptionalData, ClientEarlyCapabilityFlags, ClientGccBlocks, ClientNetworkData,
+-        ClientSecurityData, ColorDepth, ConnectionType, EncryptionMethod, HighColorDepth, MonitorOrientation,
+-        RdpVersion, SecureAccessSequence, SupportedColorDepths,
++        ClientCoreData, ClientCoreOptionalData, ClientEarlyCapabilityFlags, ClientGccBlocks, ClientMessageChannelData,
++        ClientNetworkData, ClientSecurityData, ColorDepth, ConnectionType, EncryptionMethod, HighColorDepth,
++        MonitorOrientation, RdpVersion, SecureAccessSequence, SupportedColorDepths,
+     };
+ 
+     let max_color_depth = config.bitmap.as_ref().map(|bitmap| bitmap.color_depth).unwrap_or(32);
+@@ -695,7 +858,18 @@ fn create_gcc_blocks<'a>(
+                     let mut early_capability_flags = ClientEarlyCapabilityFlags::VALID_CONNECTION_TYPE
+                         | ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU
+                         | ClientEarlyCapabilityFlags::STRONG_ASYMMETRIC_KEYS
+-                        | ClientEarlyCapabilityFlags::SUPPORT_SKIP_CHANNELJOIN;
++                        | ClientEarlyCapabilityFlags::SUPPORT_SKIP_CHANNELJOIN
++                        // Advertise Graphics Pipeline (EGFX) support in the GCC Core Data.
++                        // FreeRDP-based servers (e.g. gnome-remote-desktop) gate
++                        // SupportGraphicsPipeline solely on this early-capability bit
++                        // (RNS_UD_CS_SUPPORT_DYNVC_GFX_PROTOCOL) and refuse the connection
++                        // at capability exchange without it.
++                        | ClientEarlyCapabilityFlags::SUPPORT_DYN_VC_GFX_PROTOCOL
++                        // Advertise network-characteristics autodetection
++                        // (RNS_UD_CS_SUPPORT_NETCHAR_AUTODETECT), paired with the
++                        // ClientMessageChannelData block below. gnome-remote-desktop
++                        // disables audio output redirection for clients without it.
++                        | ClientEarlyCapabilityFlags::SUPPORT_NET_CHAR_AUTODETECT;
+ 
+                     // TODO(#136): support for ClientEarlyCapabilityFlags::SUPPORT_STATUS_INFO_PDU
+ 
+@@ -735,8 +909,9 @@ fn create_gcc_blocks<'a>(
+         // TODO(#139): support for Some(ClientClusterData { flags: RedirectionFlags::REDIRECTION_SUPPORTED, redirection_version: RedirectionVersion::V4, redirected_session_id: 0, }),
+         cluster: None,
+         monitor: None,
+-        // TODO(#140): support for Client Message Channel Data (https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/f50e791c-de03-4b25-b17e-e914c9020bc3)
+-        message_channel: None,
++        // Request an MCS message channel for network-characteristics autodetection PDUs
++        // (paired with SUPPORT_NET_CHAR_AUTODETECT in the early capability flags above).
++        message_channel: Some(ClientMessageChannelData),
+         multi_transport_channel: config
+             .multitransport_flags
+             .map(|flags| gcc::MultiTransportChannelData { flags }),
+@@ -750,7 +925,6 @@ fn create_client_info_pdu(config: &Config, client_addr: &SocketAddr) -> rdp::Cli
+         AddressFamily, ClientInfo, ClientInfoFlags, CompressionType, Credentials, ExtendedClientInfo,
+         ExtendedClientOptionalInfo,
+     };
+-    use ironrdp_pdu::rdp::headers::{BasicSecurityHeader, BasicSecurityHeaderFlags};
+ 
+     let security_header = BasicSecurityHeader {
+         flags: BasicSecurityHeaderFlags::INFO_PKT,
+diff --git a/crates/ironrdp-connector/src/connection_activation.rs b/crates/ironrdp-connector/src/connection_activation.rs
+index fa05367..52c7fa8 100644
+--- a/crates/ironrdp-connector/src/connection_activation.rs
++++ b/crates/ironrdp-connector/src/connection_activation.rs
+@@ -118,37 +118,25 @@ impl Sequence for ConnectionActivationSequence {
+                     );
+                 }
+ 
+-                // Some servers (e.g. GNOME Remote Desktop) send a ServerDeactivateAll PDU
+-                // before ServerDemandActive as part of a Deactivation-Reactivation Sequence
+-                // (MS-RDPBCGR §1.3.1.3). Skip it and stay in the same state to wait for
+-                // the actual DemandActive PDU.
+-                //
+-                // The decoded PDU is intentionally discarded: the DeactivateAll body carries
+-                // no payload we need during initial activation.
+-                if matches!(
+-                    share_control_ctx.pdu,
+-                    rdp::headers::ShareControlPdu::ServerDeactivateAll(_)
+-                ) {
++                // Some servers (e.g. GNOME Remote Desktop) interleave a ServerDeactivateAll
++                // PDU — and even Share Data PDUs — before the ServerDemandActive during a
++                // Deactivation-Reactivation Sequence (MS-RDPBCGR §1.3.1.3). Skip anything that
++                // is not the DemandActive and stay in this state until it actually arrives.
++                // (mstsc/FreeRDP tolerate the same interleaving.)
++                let capability_sets = if let rdp::headers::ShareControlPdu::ServerDemandActive(server_demand_active) =
++                    share_control_ctx.pdu
++                {
++                    server_demand_active.pdu.capability_sets
++                } else {
+                     debug!(
+-                        "Skipping Server Deactivate All PDU received during Capabilities Exchange, awaiting Server Demand Active"
++                        pdu = share_control_ctx.pdu.as_short_name(),
++                        "Skipping non-DemandActive Share Control PDU during Capabilities Exchange, awaiting Server Demand Active"
+                     );
+                     self.state = ConnectionActivationState::CapabilitiesExchange {
+                         io_channel_id,
+                         user_channel_id,
+                     };
+                     return Ok(Written::Nothing);
+-                }
+-
+-                let capability_sets = if let rdp::headers::ShareControlPdu::ServerDemandActive(server_demand_active) =
+-                    share_control_ctx.pdu
+-                {
+-                    server_demand_active.pdu.capability_sets
+-                } else {
+-                    return Err(reason_err!(
+-                        "ConnectionActivation::CapabilitiesExchange",
+-                        "unexpected Share Control PDU during capabilities exchange: got {} (expected Server Demand Active PDU)",
+-                        share_control_ctx.pdu.as_short_name(),
+-                    ));
+                 };
+ 
+                 for c in &capability_sets {
+diff --git a/crates/ironrdp-connector/src/lib.rs b/crates/ironrdp-connector/src/lib.rs
+index d81e144..3f9354a 100644
+--- a/crates/ironrdp-connector/src/lib.rs
++++ b/crates/ironrdp-connector/src/lib.rs
+@@ -9,6 +9,7 @@ mod channel_connection;
+ mod connection;
+ pub mod connection_activation;
+ mod connection_finalization;
++#[cfg(feature = "credssp")]
+ pub mod credssp;
+ mod license_exchange;
+ mod server_name;
+@@ -23,6 +24,7 @@ use ironrdp_pdu::rdp::capability_sets::{self, BitmapCodecs};
+ use ironrdp_pdu::rdp::client_info::{self, PerformanceFlags, TimezoneInfo};
+ use ironrdp_pdu::x224::X224;
+ use ironrdp_pdu::{PduHint, gcc, x224};
++#[cfg(feature = "credssp")]
+ pub use sspi;
+ 
+ pub use self::channel_connection::{ChannelConnectionSequence, ChannelConnectionState};
+@@ -342,6 +344,7 @@ pub type ConnectorResult<T> = Result<T, ConnectorError>;
+ pub enum ConnectorErrorKind {
+     Encode(ironrdp_core::EncodeError),
+     Decode(ironrdp_core::DecodeError),
++    #[cfg(feature = "credssp")]
+     Credssp(sspi::Error),
+     Reason(String),
+     AccessDenied,
+@@ -355,6 +358,7 @@ impl fmt::Display for ConnectorErrorKind {
+         match &self {
+             ConnectorErrorKind::Encode(_) => write!(f, "encode error"),
+             ConnectorErrorKind::Decode(_) => write!(f, "decode error"),
++            #[cfg(feature = "credssp")]
+             ConnectorErrorKind::Credssp(_) => write!(f, "CredSSP"),
+             ConnectorErrorKind::Reason(description) => write!(f, "reason: {description}"),
+             ConnectorErrorKind::AccessDenied => write!(f, "access denied"),
+@@ -370,6 +374,7 @@ impl core::error::Error for ConnectorErrorKind {
+         match &self {
+             ConnectorErrorKind::Encode(e) => Some(e),
+             ConnectorErrorKind::Decode(e) => Some(e),
++            #[cfg(feature = "credssp")]
+             ConnectorErrorKind::Credssp(e) => Some(e),
+             ConnectorErrorKind::Reason(_) => None,
+             ConnectorErrorKind::AccessDenied => None,
+diff --git a/crates/ironrdp-egfx/src/client.rs b/crates/ironrdp-egfx/src/client.rs
+index 4610f7c..60ec013 100644
+--- a/crates/ironrdp-egfx/src/client.rs
++++ b/crates/ironrdp-egfx/src/client.rs
+@@ -57,6 +57,7 @@ use std::collections::BTreeMap;
+ 
+ use ironrdp_core::{Decode as _, ReadCursor, impl_as_any};
+ use ironrdp_dvc::{DvcClientProcessor, DvcMessage, DvcProcessor};
++use ironrdp_graphics::progressive::ProgressiveDecoder;
+ use ironrdp_graphics::zgfx;
+ use ironrdp_pdu::geometry::{ExclusiveRectangle, Rectangle as _};
+ use ironrdp_pdu::{PduResult, decode_cursor, decode_err, pdu_other_err};
+@@ -67,9 +68,9 @@ use crate::decode::H264Decoder;
+ use crate::pdu::{
+     Avc420BitmapStream, CacheImportReplyPdu, CacheToSurfacePdu, CapabilitiesAdvertisePdu, CapabilitiesV8Flags,
+     CapabilitiesV81Flags, CapabilitiesV107Flags, CapabilitySet, Codec1Type, DeleteEncodingContextPdu,
+-    EvictCacheEntryPdu, FrameAcknowledgePdu, GfxPdu, MapSurfaceToScaledOutputPdu, MapSurfaceToScaledWindowPdu,
+-    MapSurfaceToWindowPdu, PixelFormat, QueueDepth, RawCapabilitySet, SolidFillPdu, SurfaceToCachePdu,
+-    SurfaceToSurfacePdu, WireToSurface2Pdu,
++    EvictCacheEntryPdu, FrameAcknowledgePdu, GfxPdu, MapSurfaceToOutputPdu, MapSurfaceToScaledOutputPdu,
++    MapSurfaceToScaledWindowPdu, MapSurfaceToWindowPdu, PixelFormat, QueueDepth, RawCapabilitySet, SolidFillPdu,
++    SurfaceToCachePdu, SurfaceToSurfacePdu, WireToSurface2Pdu,
+ };
+ 
+ /// Max capacity to keep for decompressed buffer when cleared.
+@@ -183,8 +184,10 @@ impl CodecCapabilities {
+ ///
+ /// Delivered to [`GraphicsPipelineHandler::on_bitmap_updated`] when
+ /// a `WireToSurface1` PDU is processed with decoded pixel data.
++///
++/// Not `#[non_exhaustive]`: this fork's sole consumer (`webrdp-min`) constructs it directly in
++/// tests, and there is no external API-stability concern for a vendored, patched fork.
+ #[derive(Debug)]
+-#[non_exhaustive]
+ pub struct BitmapUpdate {
+     /// Surface this update applies to
+     pub surface_id: u16,
+@@ -307,6 +310,15 @@ pub trait GraphicsPipelineHandler: Send {
+     /// [MS-RDPEGFX 3.3.5.8]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/9dd32c5c-fabc-497b-81be-776fa581a4f6
+     fn on_evict_cache_entry(&mut self, _pdu: &EvictCacheEntryPdu) {}
+ 
++    /// Called when the server maps a surface to an absolute position on the output
++    ///
++    /// Per [MS-RDPEGFX 2.2.2.15]. Unlike the other `on_map_surface_to_*` variants, the base
++    /// `handle_pdu` dispatcher previously consumed this PDU internally (to track
++    /// `Surface::output_origin_x/y`) without exposing it to the handler at all.
++    ///
++    /// [MS-RDPEGFX 2.2.2.15]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/a1c6ff83-c385-4ad6-9437-f17697cc001c
++    fn on_map_surface_to_output(&mut self, _pdu: &MapSurfaceToOutputPdu) {}
++
+     /// Called when the server maps a surface to a RAIL window
+     ///
+     /// Per [MS-RDPEGFX 2.2.2.20].
+@@ -335,6 +347,21 @@ pub trait GraphicsPipelineHandler: Send {
+     /// [MS-RDPEGFX 3.3.5.3]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/e6dbb3a7-3de0-44a5-a1ee-9de90f75e7e0
+     fn on_wire_to_surface2(&mut self, _pdu: &WireToSurface2Pdu) {}
+ 
++    /// Called for each AVC420 (H.264) surface frame BEFORE IronRDP's software decode.
++    /// `left`/`top`/`width`/`height` are the destination rectangle on the surface; `nal`
++    /// is the raw H.264 bitstream (AVC length-prefixed). Return `true` to take ownership
++    /// of the frame (e.g. to hardware-decode it on the host via WebCodecs), which skips
++    /// the built-in software H.264 decode for this frame.
++    fn on_avc420_frame(&mut self, _surface_id: u16, _left: u16, _top: u16, _width: u16, _height: u16, _nal: &[u8]) -> bool {
++        false
++    }
++
++    /// Advertise AVC420 capabilities even when no software H.264 decoder is configured,
++    /// because `on_avc420_frame` will hardware-decode the bitstream elsewhere.
++    fn wants_avc420_passthrough(&self) -> bool {
++        false
++    }
++
+     /// Called when the server deletes a progressive encoding context
+     ///
+     /// Per [MS-RDPEGFX 2.2.2.3].
+@@ -386,6 +413,7 @@ pub struct GraphicsPipelineClient {
+ 
+     decompressor: zgfx::Decompressor,
+     decompressed_buffer: Vec<u8>,
++    progressive_decoder: ProgressiveDecoder,
+ 
+     state: ClientState,
+     negotiated_caps: Option<CapabilitySet>,
+@@ -407,6 +435,7 @@ impl GraphicsPipelineClient {
+             h264_decoder,
+             decompressor: zgfx::Decompressor::new(),
+             decompressed_buffer: Vec::new(),
++            progressive_decoder: ProgressiveDecoder::new(),
+             state: ClientState::WaitingForConfirm,
+             negotiated_caps: None,
+             codec_caps: CodecCapabilities::default(),
+@@ -475,6 +504,7 @@ impl GraphicsPipelineClient {
+             }
+             GfxPdu::MapSurfaceToOutput(map) => {
+                 self.handle_map_surface(map.surface_id, map.output_origin_x, map.output_origin_y);
++                self.handler.on_map_surface_to_output(&map);
+                 Ok(vec![])
+             }
+             GfxPdu::StartFrame(start) => {
+@@ -490,6 +520,7 @@ impl GraphicsPipelineClient {
+             GfxPdu::WireToSurface2(pdu) => {
+                 trace!("WireToSurface2 (progressive codec)");
+                 self.handler.on_wire_to_surface2(&pdu);
++                self.handle_wire_to_surface2(pdu)?;
+                 Ok(vec![])
+             }
+             GfxPdu::EndFrame(end) => self.handle_end_frame(end.frame_id),
+@@ -568,6 +599,11 @@ impl GraphicsPipelineClient {
+                     codec_context_id = pdu.codec_context_id,
+                     "DeleteEncodingContext"
+                 );
++                // Drop this context's tile state so a later WireToSurface2 that reuses the
++                // same codec_context_id (permitted by spec once deleted) is forced to
++                // re-establish it via a fresh CONTEXT block instead of decoding REGION
++                // updates against stale tiles.
++                self.progressive_decoder.delete_context(pdu.codec_context_id);
+                 self.handler.on_delete_encoding_context(&pdu);
+                 Ok(vec![])
+             }
+@@ -628,10 +664,15 @@ impl GraphicsPipelineClient {
+         self.current_frame_id = None;
+         self.frames_queued = 0;
+ 
+-        // Reset decoder state for new stream
++        // Reset decoder state for new stream. Per spec, ResetGraphics destroys all
++        // surfaces (and thus every codec_context_id scoped to them), so stale per-context
++        // tile state must not survive into whatever surfaces/contexts get created next --
++        // otherwise a reused codec_context_id could decode REGION updates against tiles
++        // left over from before the reset.
+         if let Some(ref mut decoder) = self.h264_decoder {
+             decoder.reset();
+         }
++        self.progressive_decoder.reset();
+ 
+         debug!(width, height, "Graphics reset");
+         self.handler.on_reset_graphics(width, height);
+@@ -732,10 +773,76 @@ impl GraphicsPipelineClient {
+         Ok(())
+     }
+ 
++    /// Decode a RemoteFX Progressive (`WireToSurface2`) bitmap stream and emit each
++    /// updated 64x64 tile through `on_bitmap_updated`. gnome-remote-desktop streams
++    /// graphics this way once AVC is disabled, so this is the primary path for it.
++    fn handle_wire_to_surface2(&mut self, pdu: WireToSurface2Pdu) -> PduResult<()> {
++        let Some(surface) = self.surfaces.get(&pdu.surface_id) else {
++            warn!(surface_id = pdu.surface_id, "WireToSurface2 for unknown surface");
++            return Ok(());
++        };
++        let (surface_width, surface_height) = (surface.width, surface.height);
++
++        // Unlike an unknown surface (which can benignly race a queued update against a
++        // DeleteSurface), a decode failure here means the tile/context state for this
++        // codec_context_id is now unreliable: silently returning would leave the native
++        // worker in Active state with no further bitmap callbacks, presenting a
++        // black/stale screen with no indication anything went wrong. Match
++        // decode_avc420()'s behavior and propagate this as a terminal error instead.
++        let tiles = match self.progressive_decoder.decode_bitmap(
++            pdu.codec_context_id,
++            surface_width,
++            surface_height,
++            &pdu.bitmap_data,
++        ) {
++            Ok(tiles) => tiles,
++            Err(e) => {
++                warn!(error = ?e, "RFX progressive decode failed");
++                return Err(pdu_other_err!("RFX progressive decode failed", source: e));
++            }
++        };
++
++        // Each tile is a 64x64 RGBA block placed on the surface tile grid. Emit it as a
++        // decoded BitmapUpdate (codec marked Uncompressed, since the data is already RGBA)
++        // so it flows through the same handler path as the other codecs.
++        for tile in tiles {
++            let left = tile.x_idx.saturating_mul(64);
++            let top = tile.y_idx.saturating_mul(64);
++            let update = BitmapUpdate {
++                surface_id: pdu.surface_id,
++                destination_rectangle: ExclusiveRectangle {
++                    left,
++                    top,
++                    right: left.saturating_add(64),
++                    bottom: top.saturating_add(64),
++                },
++                codec_id: Codec1Type::Uncompressed,
++                data: tile.pixels,
++                width: 64,
++                height: 64,
++            };
++            self.handler.on_bitmap_updated(&update);
++        }
++        Ok(())
++    }
++
+     fn decode_avc420(&mut self, surface_id: u16, dest_rect: &ExclusiveRectangle, bitmap_data: &[u8]) -> PduResult<()> {
+         let mut cursor = ReadCursor::new(bitmap_data);
+         let stream = Avc420BitmapStream::decode(&mut cursor).map_err(|e| decode_err!(e))?;
+ 
++        // Passthrough: hand the raw H.264 bitstream to the handler (e.g. for hardware
++        // decode in the browser via WebCodecs). If consumed, skip the software decode.
++        if self.handler.on_avc420_frame(
++            surface_id,
++            dest_rect.left,
++            dest_rect.top,
++            dest_rect.width(),
++            dest_rect.height(),
++            stream.data,
++        ) {
++            return Ok(());
++        }
++
+         let Some(ref mut decoder) = self.h264_decoder else {
+             debug!("No H.264 decoder configured, skipping AVC420 frame");
+             return Ok(());
+@@ -827,7 +934,7 @@ impl DvcProcessor for GraphicsPipelineClient {
+     }
+ 
+     fn start(&mut self, _channel_id: u32) -> PduResult<Vec<DvcMessage>> {
+-        let caps = if self.h264_decoder.is_some() {
++        let caps = if self.h264_decoder.is_some() || self.handler.wants_avc420_passthrough() {
+             self.handler.capabilities()
+         } else {
+             // No H.264 decoder: filter out capability sets that imply AVC support.
+@@ -1042,6 +1149,164 @@ mod tests {
+         assert_eq!(client.frames_queued, 0, "frame queue should be reset");
+     }
+ 
++    /// Builds a minimal single-tile RFX Progressive stream. With `with_context`, it opens
++    /// a codec context (SYNC+CONTEXT, as required on a context's first frame per
++    /// MS-RDPEGFX 2.2.4.2); without it, it's a REGION-only continuation frame, which is
++    /// only valid against a context an earlier CONTEXT block already established.
++    fn build_progressive_stream(with_context: bool) -> Vec<u8> {
++        use ironrdp_pdu::codecs::rfx::RfxRectangle;
++        use ironrdp_pdu::codecs::rfx::progressive::{
++            ProgressiveBlock, ProgressiveContextPdu, ProgressiveFrameBeginPdu, ProgressiveFrameEndPdu,
++            ProgressiveRegion, ProgressiveSyncPdu, encode_progressive_stream,
++        };
++
++        let region = ProgressiveRegion {
++            tile_size: 0x40,
++            rects: vec![RfxRectangle {
++                x: 0,
++                y: 0,
++                width: 64,
++                height: 64,
++            }],
++            quant_vals: vec![],
++            quant_prog_vals: vec![],
++            flags: 0,
++            tiles: vec![],
++        };
++
++        let mut blocks = Vec::new();
++        if with_context {
++            blocks.push(ProgressiveBlock::Sync(ProgressiveSyncPdu));
++            blocks.push(ProgressiveBlock::Context(ProgressiveContextPdu {
++                context_id: 0,
++                tile_size: 0x0040,
++                flags: 0,
++            }));
++        }
++        blocks.push(ProgressiveBlock::FrameBegin(ProgressiveFrameBeginPdu {
++            frame_index: 0,
++            region_count: 1,
++        }));
++        blocks.push(ProgressiveBlock::Region(region));
++        blocks.push(ProgressiveBlock::FrameEnd(ProgressiveFrameEndPdu));
++
++        encode_progressive_stream(&blocks).unwrap()
++    }
++
++    #[test]
++    fn wire_to_surface2_decode_failure_propagates_error() {
++        use crate::pdu::Codec2Type;
++
++        let mut client = GraphicsPipelineClient::new(Box::new(TestHandler), None);
++        let _ = client.handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
++            surface_id: 1,
++            width: 640,
++            height: 480,
++            pixel_format: PixelFormat::XRgb,
++        }));
++
++        // First use of a codec_context_id without a CONTEXT block is a malformed stream
++        // (MS-RDPEGFX 2.2.4.2 requires SYNC+CONTEXT on a context's first frame).
++        let result = client.handle_pdu(GfxPdu::WireToSurface2(WireToSurface2Pdu {
++            surface_id: 1,
++            codec_id: Codec2Type::RemoteFxProgressive,
++            codec_context_id: 7,
++            pixel_format: PixelFormat::XRgb,
++            bitmap_data: build_progressive_stream(false),
++        }));
++
++        assert!(
++            result.is_err(),
++            "a progressive decode failure must propagate as a terminal error, not be silently dropped"
++        );
++    }
++
++    #[test]
++    fn reset_graphics_clears_progressive_decoder_context() {
++        use crate::pdu::Codec2Type;
++
++        let mut client = GraphicsPipelineClient::new(Box::new(TestHandler), None);
++        let _ = client.handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
++            surface_id: 1,
++            width: 640,
++            height: 480,
++            pixel_format: PixelFormat::XRgb,
++        }));
++
++        let result = client.handle_pdu(GfxPdu::WireToSurface2(WireToSurface2Pdu {
++            surface_id: 1,
++            codec_id: Codec2Type::RemoteFxProgressive,
++            codec_context_id: 7,
++            pixel_format: PixelFormat::XRgb,
++            bitmap_data: build_progressive_stream(true),
++        }));
++        assert!(result.is_ok(), "establishing the context should succeed: {:?}", result.as_ref().err());
++
++        let _ = client.handle_pdu(GfxPdu::ResetGraphics(crate::pdu::ResetGraphicsPdu {
++            width: 1920,
++            height: 1080,
++            monitors: vec![],
++        }));
++        // ResetGraphics destroys all surfaces; re-create one under the same id so this
++        // assertion isolates the progressive decoder's own state, not a missing surface.
++        let _ = client.handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
++            surface_id: 1,
++            width: 640,
++            height: 480,
++            pixel_format: PixelFormat::XRgb,
++        }));
++
++        // A REGION-only continuation reusing the same codec_context_id must fail now that
++        // ResetGraphics cleared the context -- if stale tile state survived, this would
++        // instead silently decode against leftover tiles from before the reset.
++        let result = client.handle_pdu(GfxPdu::WireToSurface2(WireToSurface2Pdu {
++            surface_id: 1,
++            codec_id: Codec2Type::RemoteFxProgressive,
++            codec_context_id: 7,
++            pixel_format: PixelFormat::XRgb,
++            bitmap_data: build_progressive_stream(false),
++        }));
++        assert!(result.is_err(), "progressive decoder context must not survive ResetGraphics");
++    }
++
++    #[test]
++    fn delete_encoding_context_clears_progressive_decoder_context() {
++        use crate::pdu::Codec2Type;
++
++        let mut client = GraphicsPipelineClient::new(Box::new(TestHandler), None);
++        let _ = client.handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
++            surface_id: 1,
++            width: 640,
++            height: 480,
++            pixel_format: PixelFormat::XRgb,
++        }));
++
++        let result = client.handle_pdu(GfxPdu::WireToSurface2(WireToSurface2Pdu {
++            surface_id: 1,
++            codec_id: Codec2Type::RemoteFxProgressive,
++            codec_context_id: 7,
++            pixel_format: PixelFormat::XRgb,
++            bitmap_data: build_progressive_stream(true),
++        }));
++        assert!(result.is_ok(), "establishing the context should succeed: {:?}", result.as_ref().err());
++
++        let _ = client.handle_pdu(GfxPdu::DeleteEncodingContext(DeleteEncodingContextPdu {
++            surface_id: 1,
++            codec_context_id: 7,
++        }));
++
++        // Same codec_context_id, reused after deletion (permitted by spec): must fail
++        // rather than resume decoding against the deleted context's leftover tiles.
++        let result = client.handle_pdu(GfxPdu::WireToSurface2(WireToSurface2Pdu {
++            surface_id: 1,
++            codec_id: Codec2Type::RemoteFxProgressive,
++            codec_context_id: 7,
++            pixel_format: PixelFormat::XRgb,
++            bitmap_data: build_progressive_stream(false),
++        }));
++        assert!(result.is_err(), "progressive decoder context must not survive DeleteEncodingContext");
++    }
++
+     #[test]
+     fn crop_decoded_frame_identity() {
+         let data = vec![0xFFu8; 4 * 4 * 4];
+diff --git a/crates/ironrdp-graphics/src/progressive.rs b/crates/ironrdp-graphics/src/progressive.rs
+index 6cdcf09..9dea1e1 100644
+--- a/crates/ironrdp-graphics/src/progressive.rs
++++ b/crates/ironrdp-graphics/src/progressive.rs
+@@ -1020,6 +1020,8 @@ impl core::fmt::Display for ProgressiveDecodeError {
+     }
+ }
+ 
++impl core::error::Error for ProgressiveDecodeError {}
++
+ impl From<ironrdp_core::DecodeError> for ProgressiveDecodeError {
+     fn from(e: ironrdp_core::DecodeError) -> Self {
+         Self::Pdu(e)
+@@ -1095,23 +1097,29 @@ impl ProgressiveDecoder {
+         // Extract context flags from the CONTEXT block. Per MS-RDPEGFX 2.2.4.2
+         // a Progressive stream MUST begin with SYNC + CONTEXT; treat absence as
+         // a malformed stream rather than silently defaulting band layout.
+-        let use_reduce_extrapolate = blocks
+-            .iter()
+-            .find_map(|block| match block {
+-                ProgressiveBlock::Context(ctx) => Some(ctx.uses_reduce_extrapolate()),
+-                _ => None,
+-            })
+-            .ok_or(ProgressiveDecodeError::MissingBlock("CONTEXT"))?;
++        // The CONTEXT block (carrying the reduce-extrapolate flag) is only sent on the
++        // FIRST frame for a given codec context. Subsequent frames in the same stream
++        // omit SYNC/CONTEXT and just carry REGION blocks, reusing the negotiated value.
++        let context_flag = blocks.iter().find_map(|block| match block {
++            ProgressiveBlock::Context(ctx) => Some(ctx.uses_reduce_extrapolate()),
++            _ => None,
++        });
+ 
+         // Get or create the context for this codec_context_id
+         let context = match self.contexts.entry(codec_context_id) {
+             Entry::Occupied(e) => e.into_mut(),
+             Entry::Vacant(e) => {
++                // A new context MUST be established by a CONTEXT block on its first frame.
++                let use_reduce_extrapolate = context_flag.ok_or(ProgressiveDecodeError::MissingBlock("CONTEXT"))?;
+                 let surface = SurfaceTiles::new(surface_width, surface_height, use_reduce_extrapolate)?;
+                 e.insert(ProgressiveContext { surface })
+             }
+         };
+ 
++        // Use the freshly-signalled flag if a CONTEXT block was present this frame,
++        // otherwise keep the value negotiated when the context was created.
++        let use_reduce_extrapolate = context_flag.unwrap_or(context.surface.use_reduce_extrapolate);
++
+         // If surface dimensions changed, reallocate
+         let expected_wide = surface_width.div_ceil(64);
+         let expected_high = surface_height.div_ceil(64);
+diff --git a/crates/ironrdp-session/Cargo.toml b/crates/ironrdp-session/Cargo.toml
+index 5be827b..4a0a8da 100644
+--- a/crates/ironrdp-session/Cargo.toml
++++ b/crates/ironrdp-session/Cargo.toml
+@@ -24,7 +24,7 @@ qoiz = ["dep:zstd-safe", "qoi"]
+ [dependencies]
+ ironrdp-bulk = { path = "../ironrdp-bulk", version = "0.1" }
+ ironrdp-core = { path = "../ironrdp-core", version = "0.2" } # public
+-ironrdp-connector = { path = "../ironrdp-connector", version = "0.9" } # public # TODO: at some point, this dependency could be removed (good for compilation speed)
++ironrdp-connector = { path = "../ironrdp-connector", version = "0.9", default-features = false } # public # TODO: at some point, this dependency could be removed (good for compilation speed)
+ ironrdp-svc = { path = "../ironrdp-svc", version = "0.7" } # public
+ ironrdp-dvc = { path = "../ironrdp-dvc", version = "0.6" } # public
+ ironrdp-error = { path = "../ironrdp-error", version = "0.2" } # public
+diff --git a/crates/ironrdp-web/Cargo.toml b/crates/ironrdp-web/Cargo.toml
+index e5b75a5..36e9b77 100644
+--- a/crates/ironrdp-web/Cargo.toml
++++ b/crates/ironrdp-web/Cargo.toml
+@@ -39,6 +39,7 @@ ironrdp = { path = "../ironrdp", features = [
+     "pdu",
+ ] }
+ ironrdp-core.path = "../ironrdp-core"
++ironrdp-egfx.path = "../ironrdp-egfx"
+ ironrdp-cliprdr-format.path = "../ironrdp-cliprdr-format"
+ ironrdp-futures.path = "../ironrdp-futures"
+ ironrdp-pdu.path = "../ironrdp-pdu"
+diff --git a/crates/ironrdp-web/src/session.rs b/crates/ironrdp-web/src/session.rs
+index 6189013..b964f0f 100644
+--- a/crates/ironrdp-web/src/session.rs
++++ b/crates/ironrdp-web/src/session.rs
+@@ -22,6 +22,10 @@ use ironrdp::connector::credssp::KerberosConfig;
+ use ironrdp::connector::{self, ClientConnector, Credentials};
+ use ironrdp::displaycontrol::client::DisplayControlClient;
+ use ironrdp::dvc::DrdynvcClient;
++use ironrdp_egfx::client::{BitmapUpdate, GraphicsPipelineClient, GraphicsPipelineHandler, Surface};
++use ironrdp_egfx::pdu::GfxPdu;
++use ironrdp_pdu::geometry::InclusiveRectangle;
++use std::sync::{Arc, Mutex};
+ use ironrdp::graphics::image_processing::PixelFormat;
+ use ironrdp::pdu::input::fast_path::FastPathInputEvent;
+ use ironrdp::pdu::rdp::capability_sets::client_codecs_capabilities;
+@@ -466,7 +470,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
+ 
+         let use_display_control = self.0.borrow().use_display_control;
+ 
+-        let (connection_result, ws) = connect(ConnectParams {
++        let (connection_result, ws, gfx_framebuffer) = connect(ConnectParams {
+             ws,
+             config,
+             proxy_auth_token: auth_token,
+@@ -506,6 +510,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
+             connection_result: RefCell::new(Some(connection_result)),
+             clipboard: RefCell::new(Some(clipboard)),
+             printer: RefCell::new(Some(printer)),
++            gfx_framebuffer,
+         })
+     }
+ }
+@@ -555,6 +560,10 @@ pub(crate) struct Session {
+     rdp_reader: RefCell<Option<ReadHalf<WebSocket>>>,
+     clipboard: RefCell<Option<Option<WasmClipboard>>>,
+     printer: RefCell<Option<Option<WasmPrinter>>>,
++
++    /// Decoded EGFX (RemoteFX Progressive) tiles queued by the graphics handler,
++    /// drained and composited to the canvas by the render loop.
++    gfx_framebuffer: Arc<Mutex<GfxFramebuffer>>,
+ }
+ 
+ impl Session {
+@@ -651,6 +660,11 @@ impl iron_remote_desktop::Session for Session {
+ 
+         let mut active_stage = ActiveStage::new(connection_result);
+ 
++        // EGFX tiles are decoded inside channel processing (the handler) and queued here;
++        // we drain and composite them to the canvas each loop iteration.
++        let gfx_fb = Arc::clone(&self.gfx_framebuffer);
++        let (gfx_w, gfx_h) = (desktop_width.get(), desktop_height.get());
++
+         // Timer interval for driving clipboard lock timeouts (5 second interval)
+         let mut cleanup_interval = IntervalStream::new(5_000).fuse();
+ 
+@@ -859,6 +873,10 @@ impl iron_remote_desktop::Session for Session {
+                 }
+             };
+ 
++            // Composite any EGFX (RemoteFX Progressive) tiles decoded while processing
++            // this frame's input above.
++            draw_gfx_tiles(&gfx_fb, &mut gui, gfx_w, gfx_h)?;
++
+             for out in outputs {
+                 match out {
+                     ActiveStageOutput::ResponseFrame(frame) => {
+@@ -1492,6 +1510,108 @@ struct ConnectParams {
+     use_display_control: bool,
+ }
+ 
++/// A decoded GFX tile (RGBA) awaiting compositing to the canvas.
++struct GfxTileUpdate {
++    left: u16,
++    top: u16,
++    width: u16,
++    height: u16,
++    rgba: Vec<u8>,
++}
++
++/// Shared between the EGFX handler (producer, runs inside channel processing) and the
++/// render loop (consumer). The handler must be `Send`, so this uses `Arc<Mutex<_>>`
++/// (cheap in single-threaded wasm) rather than `Rc<RefCell<_>>`.
++#[derive(Default)]
++struct GfxFramebuffer {
++    pending: Vec<GfxTileUpdate>,
++}
++
++/// EGFX handler for gnome-remote-desktop: decoded RemoteFX-Progressive tiles arrive
++/// via `on_bitmap_updated` and are queued into the shared framebuffer for the render
++/// loop to composite onto the canvas.
++struct GfxRenderHandler {
++    bitmaps: u32,
++    fb: Arc<Mutex<GfxFramebuffer>>,
++}
++
++impl GraphicsPipelineHandler for GfxRenderHandler {
++    fn on_reset_graphics(&mut self, width: u32, height: u32) {
++        info!(width, height, "EGFX: reset_graphics");
++        if let Ok(mut fb) = self.fb.lock() {
++            fb.pending.clear();
++        }
++    }
++
++    fn on_surface_created(&mut self, surface: &Surface) {
++        info!(id = surface.id, w = surface.width, h = surface.height, "EGFX: surface_created");
++    }
++
++    fn on_surface_mapped(&mut self, surface_id: u16, origin_x: u32, origin_y: u32) {
++        info!(surface_id, origin_x, origin_y, "EGFX: surface_mapped");
++    }
++
++    fn on_bitmap_updated(&mut self, update: &BitmapUpdate) {
++        self.bitmaps = self.bitmaps.saturating_add(1);
++        if let Ok(mut fb) = self.fb.lock() {
++            fb.pending.push(GfxTileUpdate {
++                left: update.destination_rectangle.left,
++                top: update.destination_rectangle.top,
++                width: update.width,
++                height: update.height,
++                rgba: update.data.clone(),
++            });
++        }
++    }
++
++    fn on_unhandled_pdu(&mut self, pdu: &GfxPdu) {
++        warn!(pdu = ?core::mem::discriminant(pdu), "EGFX: UNHANDLED pdu (codec not decoded)");
++    }
++}
++
++/// Drain queued GFX tiles and composite them onto the canvas. Tiles are up to 64x64 in
++/// surface coordinates; clip to canvas bounds and repack the clipped region row-by-row
++/// (source rows are `width` pixels wide).
++fn draw_gfx_tiles(
++    fb: &Arc<Mutex<GfxFramebuffer>>,
++    gui: &mut Canvas,
++    canvas_width: u32,
++    canvas_height: u32,
++) -> anyhow::Result<()> {
++    let tiles = match fb.lock() {
++        Ok(mut fb) => core::mem::take(&mut fb.pending),
++        Err(_) => return Ok(()),
++    };
++    for t in tiles {
++        let (left, top) = (u32::from(t.left), u32::from(t.top));
++        if left >= canvas_width || top >= canvas_height {
++            continue;
++        }
++        let tile_w = u32::from(t.width);
++        let clip_w = tile_w.min(canvas_width - left);
++        let clip_h = u32::from(t.height).min(canvas_height - top);
++        if clip_w == 0 || clip_h == 0 {
++            continue;
++        }
++        let row_bytes = (clip_w * 4) as usize;
++        let mut buf = Vec::with_capacity(row_bytes * clip_h as usize);
++        for row in 0..clip_h {
++            let off = (row * tile_w * 4) as usize;
++            if off + row_bytes <= t.rgba.len() {
++                buf.extend_from_slice(&t.rgba[off..off + row_bytes]);
++            }
++        }
++        let region = InclusiveRectangle {
++            left: t.left,
++            top: t.top,
++            right: t.left + (clip_w as u16) - 1,
++            bottom: t.top + (clip_h as u16) - 1,
++        };
++        gui.draw(&buf, region).context("draw gfx tile")?;
++    }
++    Ok(())
++}
++
+ fn default_printer_driver_name() -> String {
+     printer_driver_name_for_macos_major_version(browser_macos_major_version()).to_owned()
+ }
+@@ -1540,7 +1660,7 @@ async fn connect(
+         computer_name,
+         use_display_control,
+     }: ConnectParams,
+-) -> Result<(connector::ConnectionResult, WebSocket), IronError> {
++) -> Result<(connector::ConnectionResult, WebSocket, Arc<Mutex<GfxFramebuffer>>), IronError> {
+     let mut framed = ironrdp_futures::LocalFuturesFramed::new(ws);
+ 
+     // In web browser environments, we do not have an easy access to the local address of the socket.
+@@ -1566,10 +1686,26 @@ async fn connect(
+         );
+     }
+ 
+-    if use_display_control {
+-        connector.attach_static_channel(
+-            DrdynvcClient::new().with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new()))),
+-        );
++    // Shared framebuffer: the EGFX handler queues decoded tiles here; the render loop
++    // (in `run`) drains and composites them to the canvas.
++    let gfx_framebuffer: Arc<Mutex<GfxFramebuffer>> = Arc::new(Mutex::new(GfxFramebuffer::default()));
++    {
++        // Always advertise drdynvc + the Graphics Pipeline (EGFX). gnome-remote-desktop
++        // is GFX-only and rejects clients that don't advertise the Graphics Pipeline.
++        // No H.264 decoder (None) -> a no-AVC capability set is advertised, so gnome
++        // streams RemoteFX Progressive, which we decode in pure Rust.
++        let mut drdynvc = DrdynvcClient::new();
++        if use_display_control {
++            drdynvc = drdynvc.with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new())));
++        }
++        drdynvc = drdynvc.with_dynamic_channel(GraphicsPipelineClient::new(
++            Box::new(GfxRenderHandler {
++                bitmaps: 0,
++                fb: Arc::clone(&gfx_framebuffer),
++            }),
++            None,
++        ));
++        connector.attach_static_channel(drdynvc);
+     }
+ 
+     let (upgraded, server_public_key) =
+@@ -1595,7 +1731,7 @@ async fn connect(
+ 
+     let ws = framed.into_inner_no_leftover();
+ 
+-    Ok((connection_result, ws))
++    Ok((connection_result, ws, gfx_framebuffer))
+ }
+ 
+ async fn connect_rdcleanpath<S>(
+diff --git a/crates/ironrdp-session/src/x224/mod.rs b/crates/ironrdp-session/src/x224/mod.rs
+index 529aa39..d258936 100644
+--- a/crates/ironrdp-session/src/x224/mod.rs
++++ b/crates/ironrdp-session/src/x224/mod.rs
+@@ -1,10 +1,10 @@
+ use ironrdp_connector::connection_activation::ConnectionActivationSequence;
+ use ironrdp_connector::legacy::SendDataIndicationCtx;
+-use ironrdp_core::WriteBuf;
++use ironrdp_core::{Decode as _, Encode, EncodeResult, ReadCursor, WriteBuf, WriteCursor};
+ use ironrdp_dvc::{DrdynvcClient, DvcProcessor, DynamicVirtualChannel};
+ use ironrdp_pdu::mcs::{DisconnectProviderUltimatum, DisconnectReason, McsMessage};
+ use ironrdp_pdu::rdp::autodetect::{AutoDetectRequest, AutoDetectResponse};
+-use ironrdp_pdu::rdp::headers::ShareDataPdu;
++use ironrdp_pdu::rdp::headers::{BasicSecurityHeader, BasicSecurityHeaderFlags, ShareDataPdu};
+ use ironrdp_pdu::rdp::multitransport::MultitransportRequestPdu;
+ use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode, ServerSetErrorInfoPdu};
+ use ironrdp_pdu::x224::X224;
+@@ -61,12 +61,37 @@ pub enum DisconnectDescription {
+     ErrorInfo(ErrorInfo),
+ }
+ 
++/// Payload of an MCS message-channel PDU carrying an Auto-Detect Response: a basic
++/// security header (SEC_AUTODETECT_RSP) followed by the response body ([MS-RDPBCGR] 2.2.14.2).
++struct SecuredAutoDetectResponse(AutoDetectResponse);
++
++impl Encode for SecuredAutoDetectResponse {
++    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
++        BasicSecurityHeader {
++            flags: BasicSecurityHeaderFlags::AUTODETECT_RSP,
++        }
++        .encode(dst)?;
++        self.0.encode(dst)
++    }
++
++    fn name(&self) -> &'static str {
++        "SecuredAutoDetectResponse"
++    }
++
++    fn size(&self) -> usize {
++        BasicSecurityHeader::FIXED_PART_SIZE + self.0.size()
++    }
++}
++
+ pub struct Processor {
+     static_channels: StaticChannelSet,
+     user_channel_id: u16,
+     io_channel_id: u16,
+     share_id: u32,
+     connection_activation: ConnectionActivationSequence,
++    /// MCS message channel granted at connect time; carries network-characteristics
++    /// autodetection PDUs during the active session ([MS-RDPBCGR] 2.2.14).
++    message_channel_id: Option<u16>,
+ }
+ 
+ impl Processor {
+@@ -76,6 +101,7 @@ impl Processor {
+         io_channel_id: u16,
+         share_id: u32,
+         connection_activation: ConnectionActivationSequence,
++        message_channel_id: Option<u16>,
+     ) -> Self {
+         Self {
+             static_channels,
+@@ -83,6 +109,7 @@ impl Processor {
+             io_channel_id,
+             share_id,
+             connection_activation,
++            message_channel_id,
+         }
+     }
+ 
+@@ -134,6 +161,8 @@ impl Processor {
+ 
+         if channel_id == self.io_channel_id {
+             self.process_io_channel(data_ctx)
++        } else if self.message_channel_id == Some(channel_id) {
++            self.process_message_channel(data_ctx)
+         } else if let Some(svc) = self.static_channels.get_by_channel_id_mut(channel_id) {
+             let response_pdus = svc.process(data_ctx.user_data).map_err(SessionError::pdu)?;
+             process_svc_messages(response_pdus, channel_id, data_ctx.initiator_id)
+@@ -143,6 +172,44 @@ impl Processor {
+         }
+     }
+ 
++    /// Handles a PDU on the MCS message channel ([MS-RDPBCGR] 2.2.14): a basic security
++    /// header followed by an Auto-Detect Request. RTT requests are answered inline (e.g.
++    /// gnome-remote-desktop pings continuously to estimate audio render latency); anything
++    /// else is ignored — the message channel must never take down the session.
++    fn process_message_channel(&self, data_ctx: SendDataIndicationCtx<'_>) -> SessionResult<Vec<ProcessorOutput>> {
++        let message_channel_id = data_ctx.channel_id;
++        let mut cursor = ReadCursor::new(data_ctx.user_data);
++        let header = BasicSecurityHeader::decode(&mut cursor).map_err(SessionError::decode)?;
++        if !header.flags.contains(BasicSecurityHeaderFlags::AUTODETECT_REQ) {
++            debug!(?header, "Ignoring non-autodetect PDU on the MCS message channel");
++            return Ok(Vec::new());
++        }
++        let request = AutoDetectRequest::decode(&mut cursor).map_err(SessionError::decode)?;
++        match request {
++            AutoDetectRequest::RttRequest { sequence_number, .. } => {
++                let response = SecuredAutoDetectResponse(AutoDetectResponse::RttResponse { sequence_number });
++                let mut buf = WriteBuf::new();
++                ironrdp_connector::legacy::encode_send_data_request(
++                    self.user_channel_id,
++                    message_channel_id,
++                    &response,
++                    &mut buf,
++                )
++                .map_err(crate::legacy::map_error)?;
++                debug!(sequence_number, "Responded to message-channel RTT request");
++                Ok(vec![ProcessorOutput::ResponseFrame(buf.into_inner())])
++            }
++            req @ AutoDetectRequest::NetworkCharacteristicsResult { .. } => {
++                debug!(?req, "Received network characteristics from server");
++                Ok(vec![ProcessorOutput::AutoDetect(req)])
++            }
++            req => {
++                debug!(?req, "Ignoring unsupported message-channel autodetect request");
++                Ok(Vec::new())
++            }
++        }
++    }
++
+     fn process_io_channel(&self, data_ctx: SendDataIndicationCtx<'_>) -> SessionResult<Vec<ProcessorOutput>> {
+         debug_assert_eq!(data_ctx.channel_id, self.io_channel_id);
+ 
+diff --git a/crates/ironrdp-session/src/active_stage.rs b/crates/ironrdp-session/src/active_stage.rs
+index b7bb824..8f570d8 100644
+--- a/crates/ironrdp-session/src/active_stage.rs
++++ b/crates/ironrdp-session/src/active_stage.rs
+@@ -46,6 +46,7 @@ impl ActiveStage {
+             connection_result.io_channel_id,
+             connection_result.share_id,
+             connection_result.connection_activation,
++            connection_result.message_channel_id,
+         );
+ 
+         // Create bulk decompressor if compression was negotiated
+diff --git a/crates/ironrdp-testsuite-core/tests/session/autodetect.rs b/crates/ironrdp-testsuite-core/tests/session/autodetect.rs
+index 9e931de..51566e4 100644
+--- a/crates/ironrdp-testsuite-core/tests/session/autodetect.rs
++++ b/crates/ironrdp-testsuite-core/tests/session/autodetect.rs
+@@ -63,7 +63,7 @@ fn test_config() -> ironrdp_connector::Config {
+ fn make_processor() -> Processor {
+     let config = test_config();
+     let cas = ConnectionActivationSequence::new(config, IO_CHANNEL_ID, USER_CHANNEL_ID);
+-    Processor::new(StaticChannelSet::new(), USER_CHANNEL_ID, IO_CHANNEL_ID, SHARE_ID, cas)
++    Processor::new(StaticChannelSet::new(), USER_CHANNEL_ID, IO_CHANNEL_ID, SHARE_ID, cas, None)
+ }
+ 
+ /// Encode a ShareDataPdu as a server-to-client SendDataIndication frame.

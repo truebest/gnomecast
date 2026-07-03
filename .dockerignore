@@ -1,0 +1,11 @@
+.git/
+build/
+dist/
+/tmp/
+*.ipk
+*.log
+native/config.local.json
+webrdp-min/target/
+webrdp-min/pkg/
+third_party/IronRDP/target/
+node_modules/
