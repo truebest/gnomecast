@@ -1,0 +1,16 @@
+{
+  "id": "com.truebest.gnomecast.native",
+  "version": "0.1.1",
+  "vendor": "truebest",
+  "type": "native",
+  "main": "bin/gnomecast-native",
+  "title": "GnomeCast",
+  "icon": "icon.png",
+  "splashBackground": "splash.png",
+  "iconColor": "blue",
+  "largeIcon": "icon.png",
+  "cloudgame_active": true,
+  "useAllMouseButtons": true,
+  "disableBackHistoryAPI": true,
+  "useAllKeyboardKeys": true
+}

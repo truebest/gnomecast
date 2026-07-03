@@ -1,0 +1,13 @@
+[submodule "third_party/ss4s"]
+	path = third_party/ss4s
+	url = https://github.com/mariotaku/ss4s.git
+[submodule "third_party/commons"]
+	path = third_party/commons
+	url = https://github.com/mariotaku/commons-c.git
+[submodule "third_party/lvgl"]
+	path = third_party/lvgl
+	url = https://github.com/mariotaku/lvgl.git
+[submodule "third_party/IronRDP"]
+	path = third_party/IronRDP
+	url = https://github.com/truebest/IronRDP.git
+	branch = gnome-rdp-support

@@ -1,0 +1,14 @@
+# build artifacts
+dist/
+build/
+*.ipk
+/tmp/
+
+# logs
+*.log
+
+# local native config
+native/config.local.json
+
+# vendored Rust build artifacts
+third_party/IronRDP/target/

@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200" viewBox="0 0 200 200">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#5AB6F2"/>
+      <stop offset="100%" stop-color="#1B5FBF"/>
+    </linearGradient>
+    <clipPath id="roundedSquare">
+      <rect x="0" y="0" width="200" height="200" rx="38" ry="38"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#roundedSquare)">
+    <rect x="0" y="0" width="200" height="200" fill="url(#bg)"/>
+
+    <!-- cast / broadcast arcs, radiating from bottom-right corner -->
+    <g stroke="#FFFFFF" fill="none" stroke-linecap="round">
+      <circle cx="200" cy="200" r="46" stroke-width="9" opacity="0.95"/>
+      <circle cx="200" cy="200" r="70" stroke-width="9" opacity="0.65"/>
+      <circle cx="200" cy="200" r="94" stroke-width="9" opacity="0.35"/>
+    </g>
+    <circle cx="200" cy="200" r="9" fill="#FFFFFF"/>
+
+    <!-- gnome silhouette -->
+    <g>
+      <!-- hat -->
+      <path d="M 100 34
+               C 84 34 60 78 52 100
+               C 74 92 128 92 150 100
+               C 142 78 116 34 100 34 Z"
+            fill="#FFFFFF"/>
+      <circle cx="100" cy="102" r="9" fill="#FFFFFF"/>
+
+      <!-- body / beard -->
+      <path d="M 58 104
+               C 54 132 62 160 100 166
+               C 138 160 146 132 142 104
+               C 118 114 82 114 58 104 Z"
+            fill="#F3F7FC"/>
+
+      <!-- eyes -->
+      <circle cx="86" cy="120" r="5.5" fill="#1B5FBF"/>
+      <circle cx="114" cy="120" r="5.5" fill="#1B5FBF"/>
+
+      <!-- nose -->
+      <circle cx="100" cy="130" r="5" fill="#E8794F"/>
+    </g>
+  </g>
+</svg>

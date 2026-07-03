@@ -1,0 +1,59 @@
+[package]
+name = "webrdp-min"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Native webOS RDP core with C ABI, AVC420 passthrough, and RemoteFX bitmap support"
+
+[lib]
+crate-type = ["staticlib"]
+
+[features]
+default = []
+native = ["dep:rustls"]
+
+[dependencies]
+# Native entropy for CredSSP nonces and TLS helpers.
+getrandom = "0.3"
+
+# Minimal NTLMv2 + CredSSP crypto primitives. RC4 is hand-rolled in src/crypto.rs
+# to match MS-NLMP sealing semantics exactly.
+md4 = "0.10"
+md-5 = "0.10"
+hmac = "0.12"
+sha2 = "0.10"
+
+# IronRDP protocol crates (patched checkout). NO sspi/picky/Kerberos/RC-crypto:
+# connector is built with the `credssp` feature OFF (default-features = false).
+# Keep egfx/graphics/session/pdu RemoteFX pieces: native servers may negotiate
+# software-decoded bitmap updates when AVC420/H.264 is unavailable.
+ironrdp-core = { path = "../third_party/IronRDP/crates/ironrdp-core" }
+ironrdp-pdu = { path = "../third_party/IronRDP/crates/ironrdp-pdu" }
+ironrdp-svc = { path = "../third_party/IronRDP/crates/ironrdp-svc" }
+ironrdp-dvc = { path = "../third_party/IronRDP/crates/ironrdp-dvc" }
+ironrdp-connector = { path = "../third_party/IronRDP/crates/ironrdp-connector", default-features = false }
+ironrdp-session = { path = "../third_party/IronRDP/crates/ironrdp-session", default-features = false }
+ironrdp-egfx = { path = "../third_party/IronRDP/crates/ironrdp-egfx" }
+ironrdp-graphics = { path = "../third_party/IronRDP/crates/ironrdp-graphics" }
+# Audio output: only the public `pdu` module is used; the crate's own client is
+# static-channel rdpsnd, while gnome-remote-desktop speaks MS-RDPEA over the
+# AUDIO_PLAYBACK_DVC dynamic channel (see RdpsndDvcHandler in src/native.rs).
+ironrdp-rdpsnd = { path = "../third_party/IronRDP/crates/ironrdp-rdpsnd" }
+
+# Diagnostics for the native direct TCP/TLS worker.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+
+# X.509 parsing to extract the server public key from the TLS certificate
+# for CredSSP pubKeyAuth.
+x509-cert = { version = "0.2", default-features = false, features = ["std"] }
+
+# Native-only direct TCP/TLS RDP transport.
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"], optional = true }
+
+[profile.release]
+opt-level = "s"
+lto = true
+
+# Own workspace root — isolate from any parent; path deps resolve their own (IronRDP) workspace.
+[workspace]
