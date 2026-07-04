@@ -32,8 +32,24 @@ static void test_invalid_lengths(void) {
     native_rgba_surface_close(surface);
 }
 
+static void test_overflowing_dimensions(void) {
+    NativeRgbaSurface *surface = native_rgba_surface_open(4, 4);
+    assert(surface);
+    uint8_t pixels[16];
+    /* width * 4 wraps to 0 in 32-bit arithmetic; must not pass the stride/length checks. */
+    assert(native_rgba_surface_apply(surface, 0, 0, 0x40000000u, 1, 0, pixels, sizeof(pixels)) ==
+           NATIVE_RGBA_INVALID);
+    assert(native_rgba_surface_apply(surface, 0, 0, 0x40000000u, 1, 0xFFFFFFFFu, pixels, sizeof(pixels)) ==
+           NATIVE_RGBA_INVALID);
+    /* stride * (height - 1) wraps in 32-bit size_t; the guard must reject it. */
+    assert(native_rgba_surface_apply(surface, 0, 0, 32768u, 32768u, 32768u * 4u, pixels, sizeof(pixels)) ==
+           NATIVE_RGBA_INVALID);
+    native_rgba_surface_close(surface);
+}
+
 int main(void) {
     test_apply_and_clip();
     test_invalid_lengths();
+    test_overflowing_dimensions();
     return 0;
 }

@@ -46,6 +46,7 @@ add_executable(gnomecast-native
   src/audio_ss4s.c
   src/h264_annexb.c
   src/input_sdl.c
+  src/cursor_sdl.c
 )
 
 find_package(Threads REQUIRED)
@@ -221,4 +222,12 @@ if(BUILD_TESTING)
   )
   target_include_directories(test-input-sdl PRIVATE include)
   add_test(NAME input-sdl COMMAND test-input-sdl)
+
+  add_executable(test-cursor-sdl
+    tests/test_cursor_sdl.c
+    src/cursor_sdl.c
+  )
+  target_include_directories(test-cursor-sdl PRIVATE include)
+  target_link_libraries(test-cursor-sdl PRIVATE Threads::Threads)
+  add_test(NAME cursor-sdl COMMAND test-cursor-sdl)
 endif()

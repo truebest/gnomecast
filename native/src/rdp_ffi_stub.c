@@ -70,3 +70,10 @@ void rdp_send_unicode(RdpSession *session, uint16_t codepoint, bool down) {
     (void)codepoint;
     (void)down;
 }
+
+void rdp_send_sync(RdpSession *session, bool scroll_lock, bool num_lock, bool caps_lock) {
+    (void)session;
+    (void)scroll_lock;
+    (void)num_lock;
+    (void)caps_lock;
+}

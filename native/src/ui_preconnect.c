@@ -17,6 +17,11 @@
 #define UI_FORM_KEY_EVENT (LV_EVENT_KEY | LV_EVENT_PREPROCESS)
 
 static const uint16_t UI_FPS_OPTIONS[] = {30, 60};
+/* Audio jitter prebuffer slider bounds (milliseconds); 0 disables buffering. Trades
+ * audio latency for resilience against audio packets stalling behind large video frames
+ * on the shared RDP connection. */
+#define UI_AUDIO_BUFFER_MAX_MS 300
+#define UI_AUDIO_BUFFER_STEP_MS 10
 
 typedef struct NativePreconnectKeyDriver {
     lv_indev_drv_t base;
@@ -47,9 +52,12 @@ struct NativePreconnectUi {
     lv_obj_t *domain_input;
     lv_obj_t *password_input;
     lv_obj_t *fps_dropdown;
+    lv_obj_t *audio_buffer_slider;
+    lv_obj_t *audio_buffer_value_label;
     lv_obj_t *mouse_mode_switch;
     lv_obj_t *mouse_absolute_label;
     lv_obj_t *mouse_relative_label;
+    lv_obj_t *jump_filter_switch;
     lv_obj_t *connect_btn;
     lv_obj_t *status_label;
     lv_style_t root_style;
@@ -84,6 +92,8 @@ struct NativePreconnectUi {
     bool connect_requested;
     bool relative_mouse;
     bool requested_relative_mouse;
+    bool jump_filter;
+    bool requested_jump_filter;
     bool current_fps_option;
     uint16_t current_fps;
     uint16_t selected_fps;
@@ -93,6 +103,8 @@ struct NativePreconnectUi {
     char requested_password[UI_HOST_MAX];
     uint16_t requested_port;
     uint16_t requested_fps;
+    uint16_t selected_audio_buffer;
+    uint16_t requested_audio_buffer;
 };
 
 static void ui_flush(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *src);
@@ -101,8 +113,10 @@ static void ui_pointer_read(lv_indev_drv_t *drv, lv_indev_data_t *data);
 static void ui_key_read(lv_indev_drv_t *drv, lv_indev_data_t *data);
 static void ui_input_changed(lv_event_t *event);
 static void ui_fps_changed(lv_event_t *event);
+static void ui_audio_buffer_changed(lv_event_t *event);
 static void ui_form_key_event(lv_event_t *event);
 static void ui_mouse_mode_changed(lv_event_t *event);
+static void ui_jump_filter_changed(lv_event_t *event);
 static void ui_connect_clicked(lv_event_t *event);
 static void ui_scroll_focused_into_view(NativePreconnectUi *ui);
 
@@ -227,6 +241,35 @@ static void ui_set_fps_options(NativePreconnectUi *ui) {
         (void)snprintf(options, sizeof(options), "%u FPS\n%u FPS", (unsigned)UI_FPS_OPTIONS[0], (unsigned)UI_FPS_OPTIONS[1]);
     }
     lv_dropdown_set_options(ui->fps_dropdown, options);
+}
+
+static uint16_t ui_audio_buffer_clamp(uint16_t value) {
+    if (value > UI_AUDIO_BUFFER_MAX_MS) {
+        value = UI_AUDIO_BUFFER_MAX_MS;
+    }
+    /* Snap to the slider step so remote-control adjustments land on round values. */
+    return (uint16_t)((value + UI_AUDIO_BUFFER_STEP_MS / 2) / UI_AUDIO_BUFFER_STEP_MS * UI_AUDIO_BUFFER_STEP_MS);
+}
+
+static void ui_update_audio_buffer_label(NativePreconnectUi *ui) {
+    if (!ui->audio_buffer_value_label) {
+        return;
+    }
+    if (ui->selected_audio_buffer == 0) {
+        lv_label_set_text(ui->audio_buffer_value_label, "Off");
+    } else {
+        lv_label_set_text_fmt(ui->audio_buffer_value_label, "%u ms", (unsigned)ui->selected_audio_buffer);
+    }
+}
+
+/* The slider works in UI_AUDIO_BUFFER_STEP_MS units so one remote-control key press
+ * moves the value by a meaningful step instead of 1 ms. */
+static void ui_set_audio_buffer_value(NativePreconnectUi *ui, uint16_t value) {
+    ui->selected_audio_buffer = ui_audio_buffer_clamp(value);
+    if (ui->audio_buffer_slider) {
+        lv_slider_set_value(ui->audio_buffer_slider, ui->selected_audio_buffer / UI_AUDIO_BUFFER_STEP_MS, LV_ANIM_OFF);
+    }
+    ui_update_audio_buffer_label(ui);
 }
 
 static bool ui_form_valid(NativePreconnectUi *ui) {
@@ -454,7 +497,7 @@ static lv_obj_t *ui_make_dropdown(NativePreconnectUi *ui, lv_obj_t *parent, lv_c
 }
 
 static void ui_build(NativePreconnectUi *ui, const char *host, uint16_t port, const char *username, const char *password,
-                     const char *domain, uint16_t fps) {
+                     const char *domain, uint16_t fps, uint16_t audio_prebuffer_ms) {
     ui->root = lv_obj_create(lv_scr_act());
     lv_obj_remove_style_all(ui->root);
     lv_obj_add_style(ui->root, &ui->root_style, 0);
@@ -578,6 +621,40 @@ static void ui_build(NativePreconnectUi *ui, const char *host, uint16_t port, co
     lv_obj_add_event_cb(ui->fps_dropdown, ui_fps_changed, LV_EVENT_VALUE_CHANGED, ui);
     lv_obj_add_event_cb(ui->fps_dropdown, ui_form_key_event, UI_FORM_KEY_EVENT, ui);
 
+    ui_make_label(detail, "Audio buffer", &ui->label_style);
+    lv_obj_t *audio_row = lv_obj_create(detail);
+    lv_obj_remove_style_all(audio_row);
+    lv_obj_set_size(audio_row, UI_WIDE_FIELD_WIDTH, LV_DPX(52));
+    lv_obj_clear_flag(audio_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_layout(audio_row, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(audio_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(audio_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(audio_row, LV_DPX(16), 0);
+
+    ui->audio_buffer_slider = lv_slider_create(audio_row);
+    lv_obj_remove_style_all(ui->audio_buffer_slider);
+    lv_obj_set_size(ui->audio_buffer_slider, UI_COMPACT_FIELD_WIDTH, LV_DPX(10));
+    lv_obj_set_style_bg_opa(ui->audio_buffer_slider, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(ui->audio_buffer_slider, lv_color_hex(0x2c3540), LV_PART_MAIN);
+    lv_obj_set_style_radius(ui->audio_buffer_slider, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(ui->audio_buffer_slider, LV_OPA_COVER, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(ui->audio_buffer_slider, lv_color_hex(0x3f8efc), LV_PART_INDICATOR);
+    lv_obj_set_style_radius(ui->audio_buffer_slider, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(ui->audio_buffer_slider, LV_OPA_COVER, LV_PART_KNOB);
+    lv_obj_set_style_bg_color(ui->audio_buffer_slider, lv_color_hex(0xffffff), LV_PART_KNOB);
+    lv_obj_set_style_radius(ui->audio_buffer_slider, LV_RADIUS_CIRCLE, LV_PART_KNOB);
+    lv_obj_set_style_pad_all(ui->audio_buffer_slider, LV_DPX(8), LV_PART_KNOB);
+    lv_obj_set_style_outline_width(ui->audio_buffer_slider, LV_DPX(2), LV_STATE_FOCUSED);
+    lv_obj_set_style_outline_color(ui->audio_buffer_slider, lv_color_hex(0x3f8efc), LV_STATE_FOCUSED);
+    lv_obj_set_style_outline_opa(ui->audio_buffer_slider, LV_OPA_COVER, LV_STATE_FOCUSED);
+    lv_slider_set_range(ui->audio_buffer_slider, 0, UI_AUDIO_BUFFER_MAX_MS / UI_AUDIO_BUFFER_STEP_MS);
+    lv_obj_add_event_cb(ui->audio_buffer_slider, ui_audio_buffer_changed, LV_EVENT_VALUE_CHANGED, ui);
+    lv_obj_add_event_cb(ui->audio_buffer_slider, ui_form_key_event, UI_FORM_KEY_EVENT, ui);
+
+    ui->audio_buffer_value_label = ui_make_label(audio_row, "", &ui->label_style);
+    lv_obj_set_width(ui->audio_buffer_value_label, LV_DPX(90));
+    ui_set_audio_buffer_value(ui, audio_prebuffer_ms);
+
     ui_make_label(detail, "Mouse mode", &ui->label_style);
     lv_obj_t *mouse_row = lv_obj_create(detail);
     lv_obj_remove_style_all(mouse_row);
@@ -594,11 +671,25 @@ static void ui_build(NativePreconnectUi *ui, const char *host, uint16_t port, co
     lv_obj_add_style(ui->mouse_mode_switch, &ui->switch_checked_style, LV_PART_INDICATOR | LV_STATE_CHECKED);
     lv_obj_add_style(ui->mouse_mode_switch, &ui->switch_knob_style, LV_PART_KNOB);
     lv_obj_set_style_outline_opa(ui->mouse_mode_switch, LV_OPA_COVER, LV_STATE_FOCUSED);
-    lv_obj_set_size(ui->mouse_mode_switch, LV_DPX(70), LV_DPX(34));
+    lv_obj_set_size(ui->mouse_mode_switch, LV_DPX(35), LV_DPX(17));
     lv_obj_add_event_cb(ui->mouse_mode_switch, ui_mouse_mode_changed, LV_EVENT_VALUE_CHANGED, ui);
     lv_obj_add_event_cb(ui->mouse_mode_switch, ui_form_key_event, UI_FORM_KEY_EVENT, ui);
     ui->mouse_relative_label = ui_make_label(mouse_row, "Relative", &ui->label_style);
     ui_update_mouse_mode_state(ui);
+
+    lv_obj_t *jump_filter_label = ui_make_label(mouse_row, "Jump filter", &ui->label_style);
+    lv_obj_set_style_pad_left(jump_filter_label, LV_DPX(18), 0);
+    ui->jump_filter_switch = lv_switch_create(mouse_row);
+    lv_obj_add_style(ui->jump_filter_switch, &ui->switch_style, LV_PART_MAIN);
+    lv_obj_add_style(ui->jump_filter_switch, &ui->switch_checked_style, LV_PART_INDICATOR | LV_STATE_CHECKED);
+    lv_obj_add_style(ui->jump_filter_switch, &ui->switch_knob_style, LV_PART_KNOB);
+    lv_obj_set_style_outline_opa(ui->jump_filter_switch, LV_OPA_COVER, LV_STATE_FOCUSED);
+    lv_obj_set_size(ui->jump_filter_switch, LV_DPX(35), LV_DPX(17));
+    if (ui->jump_filter) {
+        lv_obj_add_state(ui->jump_filter_switch, LV_STATE_CHECKED);
+    }
+    lv_obj_add_event_cb(ui->jump_filter_switch, ui_jump_filter_changed, LV_EVENT_VALUE_CHANGED, ui);
+    lv_obj_add_event_cb(ui->jump_filter_switch, ui_form_key_event, UI_FORM_KEY_EVENT, ui);
 
     ui->connect_btn = lv_btn_create(detail);
     lv_obj_remove_style_all(ui->connect_btn);
@@ -628,7 +719,9 @@ static void ui_build(NativePreconnectUi *ui, const char *host, uint16_t port, co
     lv_group_add_obj(ui->group, ui->domain_input);
     lv_group_add_obj(ui->group, ui->password_input);
     lv_group_add_obj(ui->group, ui->fps_dropdown);
+    lv_group_add_obj(ui->group, ui->audio_buffer_slider);
     lv_group_add_obj(ui->group, ui->mouse_mode_switch);
+    lv_group_add_obj(ui->group, ui->jump_filter_switch);
     lv_group_add_obj(ui->group, ui->connect_btn);
     lv_group_focus_obj(ui->host_input);
     ui_scroll_focused_into_view(ui);
@@ -638,7 +731,8 @@ static void ui_build(NativePreconnectUi *ui, const char *host, uint16_t port, co
 
 NativePreconnectUi *native_preconnect_ui_create(SDL_Window *window, SDL_Renderer *renderer, const char *host,
                                                 uint16_t port, const char *username, const char *password,
-                                                const char *domain, uint16_t fps, bool relative_mouse) {
+                                                const char *domain, uint16_t fps, uint16_t audio_prebuffer_ms,
+                                                bool relative_mouse, bool jump_filter) {
     if (!window || !renderer) {
         return NULL;
     }
@@ -651,6 +745,7 @@ NativePreconnectUi *native_preconnect_ui_create(SDL_Window *window, SDL_Renderer
     ui->renderer = renderer;
     ui->visible = true;
     ui->relative_mouse = relative_mouse;
+    ui->jump_filter = jump_filter;
 
     SDL_GetWindowSize(window, &ui->width, &ui->height);
     if (ui->width <= 0 || ui->height <= 0) {
@@ -703,7 +798,7 @@ NativePreconnectUi *native_preconnect_ui_create(SDL_Window *window, SDL_Renderer
     ui->key_indev = lv_indev_drv_register(&ui->key_drv.base);
 
     ui_init_styles(ui);
-    ui_build(ui, host, port, username, password, domain, fps);
+    ui_build(ui, host, port, username, password, domain, fps, audio_prebuffer_ms);
     if (ui->key_indev && ui->group) {
         lv_indev_set_group(ui->key_indev, ui->group);
     }
@@ -810,6 +905,7 @@ void native_preconnect_ui_set_connecting(NativePreconnectUi *ui, bool connecting
             lv_obj_add_state(ui->password_input, LV_STATE_DISABLED);
             lv_obj_add_state(ui->fps_dropdown, LV_STATE_DISABLED);
             lv_obj_add_state(ui->mouse_mode_switch, LV_STATE_DISABLED);
+            lv_obj_add_state(ui->jump_filter_switch, LV_STATE_DISABLED);
         } else {
             lv_obj_clear_state(ui->host_input, LV_STATE_DISABLED);
             lv_obj_clear_state(ui->username_input, LV_STATE_DISABLED);
@@ -817,6 +913,7 @@ void native_preconnect_ui_set_connecting(NativePreconnectUi *ui, bool connecting
             lv_obj_clear_state(ui->password_input, LV_STATE_DISABLED);
             lv_obj_clear_state(ui->fps_dropdown, LV_STATE_DISABLED);
             lv_obj_clear_state(ui->mouse_mode_switch, LV_STATE_DISABLED);
+            lv_obj_clear_state(ui->jump_filter_switch, LV_STATE_DISABLED);
         }
     }
     native_preconnect_ui_set_status(ui, status, false);
@@ -833,7 +930,8 @@ void native_preconnect_ui_set_status(NativePreconnectUi *ui, const char *status,
 
 bool native_preconnect_ui_take_connect(NativePreconnectUi *ui, char *host, size_t host_cap, uint16_t *port,
                                        char *username, size_t username_cap, char *password, size_t password_cap,
-                                       char *domain, size_t domain_cap, uint16_t *fps, bool *relative_mouse) {
+                                       char *domain, size_t domain_cap, uint16_t *fps, uint16_t *audio_prebuffer_ms,
+                                       bool *relative_mouse, bool *jump_filter) {
     if (!ui || !ui->connect_requested) {
         return false;
     }
@@ -876,15 +974,22 @@ bool native_preconnect_ui_take_connect(NativePreconnectUi *ui, char *host, size_
         memcpy(domain, ui->requested_domain, len);
         domain[len] = '\0';
     }
+    if (audio_prebuffer_ms) {
+        *audio_prebuffer_ms = ui->requested_audio_buffer;
+    }
     if (relative_mouse) {
         *relative_mouse = ui->requested_relative_mouse;
+    }
+    if (jump_filter) {
+        *jump_filter = ui->requested_jump_filter;
     }
     return true;
 }
 
 bool native_preconnect_ui_read_current(NativePreconnectUi *ui, char *host, size_t host_cap, uint16_t *port,
                                        char *username, size_t username_cap, char *password, size_t password_cap,
-                                       char *domain, size_t domain_cap, uint16_t *fps, bool *relative_mouse) {
+                                       char *domain, size_t domain_cap, uint16_t *fps, uint16_t *audio_prebuffer_ms,
+                                       bool *relative_mouse, bool *jump_filter) {
     if (!ui) {
         return false;
     }
@@ -936,8 +1041,14 @@ bool native_preconnect_ui_read_current(NativePreconnectUi *ui, char *host, size_
     if (fps) {
         *fps = ui->selected_fps;
     }
+    if (audio_prebuffer_ms) {
+        *audio_prebuffer_ms = ui->selected_audio_buffer;
+    }
     if (relative_mouse) {
         *relative_mouse = ui->relative_mouse;
+    }
+    if (jump_filter) {
+        *jump_filter = ui->jump_filter;
     }
     return true;
 }
@@ -1231,6 +1342,20 @@ static void ui_fps_changed(lv_event_t *event) {
     native_preconnect_ui_set_status(ui, "Connection settings are not saved.", false);
 }
 
+static void ui_audio_buffer_changed(lv_event_t *event) {
+    NativePreconnectUi *ui = (NativePreconnectUi *)lv_event_get_user_data(event);
+    if (!ui || ui->connecting) {
+        return;
+    }
+    int32_t raw = lv_slider_get_value(ui->audio_buffer_slider);
+    if (raw < 0) {
+        raw = 0;
+    }
+    ui->selected_audio_buffer = ui_audio_buffer_clamp((uint16_t)(raw * UI_AUDIO_BUFFER_STEP_MS));
+    ui_update_audio_buffer_label(ui);
+    native_preconnect_ui_set_status(ui, "Connection settings are not saved.", false);
+}
+
 static void ui_mouse_mode_changed(lv_event_t *event) {
     NativePreconnectUi *ui = (NativePreconnectUi *)lv_event_get_user_data(event);
     if (!ui || ui->connecting) {
@@ -1238,6 +1363,15 @@ static void ui_mouse_mode_changed(lv_event_t *event) {
     }
     ui->relative_mouse = lv_obj_has_state(ui->mouse_mode_switch, LV_STATE_CHECKED);
     ui_update_mouse_mode_state(ui);
+    native_preconnect_ui_set_status(ui, "Connection settings are not saved.", false);
+}
+
+static void ui_jump_filter_changed(lv_event_t *event) {
+    NativePreconnectUi *ui = (NativePreconnectUi *)lv_event_get_user_data(event);
+    if (!ui || ui->connecting) {
+        return;
+    }
+    ui->jump_filter = lv_obj_has_state(ui->jump_filter_switch, LV_STATE_CHECKED);
     native_preconnect_ui_set_status(ui, "Connection settings are not saved.", false);
 }
 
@@ -1289,6 +1423,8 @@ static void ui_connect_clicked(lv_event_t *event) {
     memcpy(ui->requested_password, password, len + 1);
     ui->requested_port = port;
     ui->requested_fps = ui->selected_fps;
+    ui->requested_audio_buffer = ui->selected_audio_buffer;
     ui->requested_relative_mouse = ui->relative_mouse;
+    ui->requested_jump_filter = ui->jump_filter;
     ui->connect_requested = true;
 }

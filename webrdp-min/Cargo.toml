@@ -39,6 +39,10 @@ ironrdp-graphics = { path = "../third_party/IronRDP/crates/ironrdp-graphics" }
 # static-channel rdpsnd, while gnome-remote-desktop speaks MS-RDPEA over the
 # AUDIO_PLAYBACK_DVC dynamic channel (see RdpsndDvcHandler in src/native.rs).
 ironrdp-rdpsnd = { path = "../third_party/IronRDP/crates/ironrdp-rdpsnd" }
+# Display Control DVC (MS-RDPEDISP): the client dictates the server's monitor resolution
+# right after connect, so headless hosts with odd virtual-display defaults (e.g.
+# 2048x1152) stream at a resolution the TV pipeline can actually start on.
+ironrdp-displaycontrol = { path = "../third_party/IronRDP/crates/ironrdp-displaycontrol" }
 
 # Diagnostics for the native direct TCP/TLS worker.
 tracing = "0.1"

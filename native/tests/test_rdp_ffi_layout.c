@@ -45,7 +45,10 @@ _Static_assert(offsetof(RdpCallbacks, on_video_au) == 32, "RdpCallbacks.on_video
 _Static_assert(offsetof(RdpCallbacks, on_bitmap_update) == 40, "RdpCallbacks.on_bitmap_update offset changed");
 _Static_assert(offsetof(RdpCallbacks, on_audio_format) == 48, "RdpCallbacks.on_audio_format offset changed");
 _Static_assert(offsetof(RdpCallbacks, on_audio_data) == 56, "RdpCallbacks.on_audio_data offset changed");
-_Static_assert(sizeof(RdpCallbacks) == 64, "RdpCallbacks size changed");
+_Static_assert(offsetof(RdpCallbacks, on_pointer_bitmap) == 64, "RdpCallbacks.on_pointer_bitmap offset changed");
+_Static_assert(offsetof(RdpCallbacks, on_pointer_position) == 72, "RdpCallbacks.on_pointer_position offset changed");
+_Static_assert(offsetof(RdpCallbacks, on_pointer_state) == 80, "RdpCallbacks.on_pointer_state offset changed");
+_Static_assert(sizeof(RdpCallbacks) == 88, "RdpCallbacks size changed");
 #elif UINTPTR_MAX == UINT32_MAX
 _Static_assert(offsetof(RdpConfig, host) == 0, "RdpConfig.host offset changed");
 _Static_assert(offsetof(RdpConfig, port) == 4, "RdpConfig.port offset changed");
@@ -65,7 +68,10 @@ _Static_assert(offsetof(RdpCallbacks, on_video_au) == 16, "RdpCallbacks.on_video
 _Static_assert(offsetof(RdpCallbacks, on_bitmap_update) == 20, "RdpCallbacks.on_bitmap_update offset changed");
 _Static_assert(offsetof(RdpCallbacks, on_audio_format) == 24, "RdpCallbacks.on_audio_format offset changed");
 _Static_assert(offsetof(RdpCallbacks, on_audio_data) == 28, "RdpCallbacks.on_audio_data offset changed");
-_Static_assert(sizeof(RdpCallbacks) == 32, "RdpCallbacks size changed");
+_Static_assert(offsetof(RdpCallbacks, on_pointer_bitmap) == 32, "RdpCallbacks.on_pointer_bitmap offset changed");
+_Static_assert(offsetof(RdpCallbacks, on_pointer_position) == 36, "RdpCallbacks.on_pointer_position offset changed");
+_Static_assert(offsetof(RdpCallbacks, on_pointer_state) == 40, "RdpCallbacks.on_pointer_state offset changed");
+_Static_assert(sizeof(RdpCallbacks) == 44, "RdpCallbacks size changed");
 #else
 #error "Unsupported pointer width for RDP FFI layout test"
 #endif

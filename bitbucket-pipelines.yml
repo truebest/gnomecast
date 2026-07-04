@@ -1,7 +1,10 @@
-image: docker:27
-
-options:
-  size: 2x
+# The step runs directly inside the prebuilt build-environment image (public, no
+# credentials involved) instead of docker-building it per run: Bitbucket's sandboxed
+# docker daemon forbids the privileged buildkit container modern `docker build` boots
+# ("--privileged=true is not allowed"), and rebuilding the toolchain image every run
+# wasted minutes anyway. Rebuild + push with tools/push-build-image.sh after changing
+# the Dockerfile, then bump the tag here.
+image: cubicattache/gnomecast-webos-build:20260703
 
 clone:
   depth: full
@@ -10,36 +13,26 @@ pipelines:
   default:
     - step:
         name: Native webOS build and IPK
-        services:
-          - docker
-        caches:
-          - docker
+        # Self-hosted workspace runners: no Bitbucket build minutes consumed.
+        # (`size` is a cloud-runner option and is intentionally absent.)
+        runs-on:
+          - "self.hosted"
+          - "linux"
         script:
-          - docker build -t gnomecast-native-build -f Dockerfile .
+          - git config --global --add safe.directory '*'
+          - git submodule update --init third_party/IronRDP third_party/ss4s third_party/commons third_party/lvgl
+          - cargo fmt --manifest-path webrdp-min/Cargo.toml --check
+          # Quoted: a plain YAML scalar ending in ':' parses as a mapping key.
+          - "cargo test --manifest-path webrdp-min/Cargo.toml --features native --locked native::tests::"
           - >-
-            docker run --rm
-            -v "$BITBUCKET_CLONE_DIR:/workspace"
-            -w /workspace
-            gnomecast-native-build
-            bash -lc '
-              set -euo pipefail
-              git config --global --add safe.directory /workspace
-              git submodule update --init third_party/IronRDP third_party/ss4s third_party/commons third_party/lvgl
-              cargo fmt --manifest-path webrdp-min/Cargo.toml --check
-              cargo test --manifest-path webrdp-min/Cargo.toml --features native --locked native::tests::
-              cc -fsyntax-only -Inative/include \
-                native/src/main.c native/src/media_ss4s.c native/src/video_ss4s.c \
-                native/src/audio_ss4s.c native/src/video_rgba_sdl.c \
-                native/src/h264_annexb.c native/src/input_sdl.c native/src/rdp_ffi_stub.c
-              cmake -S native -B /tmp/gnomecast-native-build
-              cmake --build /tmp/gnomecast-native-build
-              ctest --test-dir /tmp/gnomecast-native-build --output-on-failure
-              ./tools/build-native-webos.sh
-            '
+            cc -fsyntax-only -Inative/include
+            native/src/main.c native/src/media_ss4s.c native/src/video_ss4s.c
+            native/src/audio_ss4s.c native/src/video_rgba_sdl.c
+            native/src/h264_annexb.c native/src/input_sdl.c native/src/cursor_sdl.c
+            native/src/rdp_ffi_stub.c
+          - cmake -S native -B /tmp/gnomecast-native-build
+          - cmake --build /tmp/gnomecast-native-build
+          - ctest --test-dir /tmp/gnomecast-native-build --output-on-failure
+          - ./tools/build-native-webos.sh
         artifacts:
           - dist/native-webos/**
-
-definitions:
-  services:
-    docker:
-      memory: 4096

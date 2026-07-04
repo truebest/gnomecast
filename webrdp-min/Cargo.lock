@@ -1052,6 +1052,7 @@ dependencies = [
  "hmac",
  "ironrdp-connector",
  "ironrdp-core",
+ "ironrdp-displaycontrol",
  "ironrdp-dvc",
  "ironrdp-egfx",
  "ironrdp-graphics",

@@ -91,16 +91,22 @@ NativeRgbaResult native_rgba_surface_resize(NativeRgbaSurface *surface, uint16_t
 
 NativeRgbaResult native_rgba_surface_apply(NativeRgbaSurface *surface, uint32_t left, uint32_t top, uint32_t width,
                                            uint32_t height, uint32_t stride, const uint8_t *rgba, size_t len) {
-    if (!surface || !surface->pixels || !rgba || width == 0 || height == 0 || stride < width * 4u) {
+    /* On 32-bit targets `width * 4` wraps for width >= 2^30, so the row size must be
+     * range-checked before any comparison that uses it. */
+    if (!surface || !surface->pixels || !rgba || width == 0 || height == 0 || (size_t)width > SIZE_MAX / 4u) {
+        return NATIVE_RGBA_INVALID;
+    }
+    const size_t row_size = (size_t)width * 4u;
+    if ((size_t)stride < row_size) {
         return NATIVE_RGBA_INVALID;
     }
     if (left >= surface->width || top >= surface->height) {
         return NATIVE_RGBA_OK;
     }
-    if (height > 1 && (size_t)stride > (SIZE_MAX - (size_t)width * 4u) / (size_t)(height - 1u)) {
+    if (height > 1 && (size_t)stride > (SIZE_MAX - row_size) / (size_t)(height - 1u)) {
         return NATIVE_RGBA_INVALID;
     }
-    size_t required = (size_t)stride * (size_t)(height - 1u) + (size_t)width * 4u;
+    size_t required = (size_t)stride * (size_t)(height - 1u) + row_size;
     if (len < required) {
         return NATIVE_RGBA_INVALID;
     }

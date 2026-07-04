@@ -23,6 +23,11 @@ struct NativeVideo {
     bool video_opened;
     bool decoder_keyframe_pending;
     bool feed_not_ready_logged;
+    /* Feed diagnostics: with these in the log, "frames are being fed but the pipeline
+     * never reported PLAYING" (e.g. a server resolution the TV cannot start on) is
+     * visible at a glance next to the ss4s LoadCallback lines. */
+    uint32_t fed_au_count;
+    uint32_t fed_keyframe_count;
 #endif
 };
 
@@ -241,8 +246,15 @@ NativeVideoResult native_video_feed(NativeVideo *video, const uint8_t *data, siz
         case SS4S_VIDEO_FEED_OK:
             if (ss4s_keyframe) {
                 video->decoder_keyframe_pending = false;
+                video->fed_keyframe_count++;
             }
             video->feed_not_ready_logged = false;
+            video->fed_au_count++;
+            if (video->fed_au_count == 1 || video->fed_au_count == 60 || video->fed_au_count == 300 ||
+                video->fed_au_count % 3600 == 0) {
+                fprintf(stderr, "[native-video] fed %u AUs (%u keyframes)\n", (unsigned)video->fed_au_count,
+                        (unsigned)video->fed_keyframe_count);
+            }
             return NATIVE_VIDEO_OK;
         case SS4S_VIDEO_FEED_REQUEST_KEYFRAME:
             if (video->decoder_keyframe_pending) {

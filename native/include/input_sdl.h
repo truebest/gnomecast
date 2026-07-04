@@ -39,7 +39,30 @@ bool native_input_pointer_button(NativeInput *input, int window_x, int window_y,
 bool native_input_pointer_wheel(NativeInput *input, int window_x, int window_y, int16_t delta);
 bool native_input_key(NativeInput *input, uint8_t scancode, bool down, bool extended);
 bool native_input_unicode(NativeInput *input, uint16_t codepoint, bool down);
+bool native_input_sync_locks(NativeInput *input, bool scroll_lock, bool num_lock, bool caps_lock);
 bool native_input_sdl_scancode_to_rdp(uint32_t sdl_scancode, uint8_t *rdp_scancode, bool *extended);
 bool native_input_text_utf8(NativeInput *input, const char *utf8);
+
+/* Pointer-jump filter: the webOS compositor warps the system pointer to the screen
+ * center around IME show/hide transitions (there is no setting to disable it). The warp
+ * has a precise signature — a single SDL_MOUSEMOTION landing at the window center with a
+ * large delta — so it is detected by coordinates, not by a time window that would also
+ * penalize legitimate movement while typing. Real devices report small per-event deltas,
+ * and a genuine glide to the center ends with a small final delta, so neither trips it. */
+#define NATIVE_INPUT_JUMP_ALWAYS_PX 500
+#define NATIVE_INPUT_CENTER_JUMP_MIN_PX 40
+#define NATIVE_INPUT_CENTER_TOLERANCE_PX 2
+/* The warp can coalesce with concurrent real movement (typing while moving the mouse),
+ * landing near — not exactly at — the center. Second tier: a landing within this radius
+ * combined with a delta no real per-event motion reaches is still the recenter. */
+#define NATIVE_INPUT_CENTER_RADIUS_PX 100
+#define NATIVE_INPUT_CENTER_RADIUS_JUMP_PX 200
+
+/* True for a delta no physical device produces in one event (coarse net, any mode). */
+bool native_input_motion_is_jump(int dx, int dy);
+/* True when a single motion of (dx, dy) lands within tolerance of the window center —
+ * the webOS IME recenter signature (absolute mode). */
+bool native_input_motion_is_center_jump(int x, int y, int dx, int dy, uint16_t window_w,
+                                        uint16_t window_h);
 
 #endif

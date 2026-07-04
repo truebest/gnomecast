@@ -52,7 +52,21 @@ typedef struct RdpCallbacks {
     void (*on_audio_format)(void *ctx, uint32_t codec, uint32_t sample_rate, uint16_t channels);
     /* One encoded packet (Opus) or PCM chunk per call; bytes are valid only for the call. */
     void (*on_audio_data)(void *ctx, const uint8_t *data, size_t len, uint32_t ts_ms);
+    /* Decoded server cursor shape: RGBA byte order, top-down rows, tight stride
+     * (width * 4), straight (non-premultiplied) alpha. Bytes are valid only for the call. */
+    void (*on_pointer_bitmap)(void *ctx, uint16_t width, uint16_t height, uint16_t hotspot_x,
+                              uint16_t hotspot_y, const uint8_t *rgba, size_t len);
+    /* Server-initiated pointer warp, in desktop coordinates. */
+    void (*on_pointer_position)(void *ctx, uint16_t x, uint16_t y);
+    /* state takes RDP_POINTER_STATE_* values. */
+    void (*on_pointer_state)(void *ctx, uint32_t state);
 } RdpCallbacks;
+
+/* Values shared with RDP_POINTER_STATE_* constants in webrdp-min/src/native.rs. */
+enum {
+    RDP_POINTER_STATE_HIDDEN = 0,
+    RDP_POINTER_STATE_DEFAULT = 1
+};
 
 typedef struct RdpSession RdpSession;
 
@@ -64,6 +78,8 @@ void rdp_send_pointer_button(RdpSession *session, uint16_t x, uint16_t y, uint8_
 void rdp_send_pointer_wheel(RdpSession *session, uint16_t x, uint16_t y, int16_t delta);
 void rdp_send_key(RdpSession *session, uint8_t scancode, bool down, bool extended);
 void rdp_send_unicode(RdpSession *session, uint16_t codepoint, bool down);
+/* Absolute toggle-key state (TS_FP_SYNC_EVENT); the server resets its lock state to match. */
+void rdp_send_sync(RdpSession *session, bool scroll_lock, bool num_lock, bool caps_lock);
 
 #ifdef __cplusplus
 }

@@ -39,7 +39,8 @@ Targeted local loop:
 cc -fsyntax-only -Inative/include \
   native/src/main.c native/src/media_ss4s.c native/src/video_ss4s.c \
   native/src/audio_ss4s.c native/src/video_rgba_sdl.c \
-  native/src/h264_annexb.c native/src/input_sdl.c native/src/rdp_ffi_stub.c
+  native/src/h264_annexb.c native/src/input_sdl.c native/src/cursor_sdl.c \
+  native/src/rdp_ffi_stub.c
 cargo test --manifest-path webrdp-min/Cargo.toml --features native native::tests::
 cmake -S native -B /tmp/gnomecast-native-build-tests
 cmake --build /tmp/gnomecast-native-build-tests
@@ -128,9 +129,31 @@ native executable and native `appinfo.json`; package verification rejects browse
 - The SDL graphics layer presents one transparent frame to punch through to the ss4s hardware
   video plane, then stops touching the window (`App.video_plane_punched`). Re-presenting every
   loop tick raced the video plane's own buffer swaps and produced visible flicker.
+- The server's cursor shapes (RDP pointer updates) are rendered through the platform cursor
+  plane (`SDL_CreateColorCursor`, see `cursor_sdl.c`) — never as an SDL overlay, which would
+  need per-tick presents and re-introduce the flicker above. Check the log for
+  `[native-cursor] server cursor WxH ...` on connect; `[native-cursor] color cursor
+  unavailable: ...` means the webOS SDL port refused color cursors and the client stays on
+  the default arrow. In relative-mouse (Magic Remote) mode the system cursor is hidden by
+  SDL, so server shapes only show with a real (absolute) mouse.
+- Video track loads (`NDL_DirectMediaLoad(video=1 ...)`) but `LoadCallback
+  STATE_UPDATE_LOADCOMPLETED/PLAYING` never follow while `[native-video] fed N AUs` keeps
+  growing → the server is streaming at a resolution the TV's hardware pipeline cannot
+  start on. Observed live with a 2048x1152 virtual display (black screen, zero errors);
+  standard video resolutions (1920x1080, 3840x2160) are confirmed good — keep the server
+  display on one of those. The Display Control DVC prevents this by forcing the
+  configured resolution at connect — check the log for `display: requesting server
+  resolution ...`; its absence means the server never opened the MS-RDPEDISP channel
+  (older gnome-remote-desktop versions do not), in which case the resolution must be
+  fixed server-side.
 - Decoder/render failures should surface as `DecoderError` and must not fall back to
   MSE, WebCodecs, RDCleanPath, or browser rendering.
 - Input issues: run `ctest --test-dir /tmp/gnomecast-native-build-tests -R input-sdl --output-on-failure`.
+- Known webOS platform limitation: the TV delivers no SDL event at all for keypad-5
+  (SDL scancode 93) or NumLock (83) from an attached keyboard — both are consumed at the
+  system level before the app (verified live: all neighbouring keypad keys arrive, those
+  two never do, with unmapped-key logging enabled). Not fixable client-side; use the
+  top-row 5. Other keyboards may behave differently.
 
 ## Current Status
 

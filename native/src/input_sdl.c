@@ -138,6 +138,41 @@ bool native_input_unicode(NativeInput *input, uint16_t codepoint, bool down) {
     return true;
 }
 
+bool native_input_sync_locks(NativeInput *input, bool scroll_lock, bool num_lock, bool caps_lock) {
+    if (!native_input_ready(input)) {
+        return false;
+    }
+    rdp_send_sync(input->session, scroll_lock, num_lock, caps_lock);
+    return true;
+}
+
+static int native_abs_max(int dx, int dy) {
+    int magnitude = dx < 0 ? -dx : dx;
+    int magnitude_y = dy < 0 ? -dy : dy;
+    return magnitude_y > magnitude ? magnitude_y : magnitude;
+}
+
+bool native_input_motion_is_jump(int dx, int dy) {
+    return native_abs_max(dx, dy) > NATIVE_INPUT_JUMP_ALWAYS_PX;
+}
+
+bool native_input_motion_is_center_jump(int x, int y, int dx, int dy, uint16_t window_w,
+                                        uint16_t window_h) {
+    if (window_w == 0 || window_h == 0) {
+        return false;
+    }
+    int magnitude = native_abs_max(dx, dy);
+    int center_dx = x - (int)(window_w / 2u);
+    int center_dy = y - (int)(window_h / 2u);
+    int center_distance = native_abs_max(center_dx, center_dy);
+    if (center_distance <= NATIVE_INPUT_CENTER_TOLERANCE_PX &&
+        magnitude >= NATIVE_INPUT_CENTER_JUMP_MIN_PX) {
+        return true;
+    }
+    return center_distance <= NATIVE_INPUT_CENTER_RADIUS_PX &&
+           magnitude >= NATIVE_INPUT_CENTER_RADIUS_JUMP_PX;
+}
+
 bool native_input_sdl_scancode_to_rdp(uint32_t sdl_scancode, uint8_t *rdp_scancode, bool *extended) {
     uint8_t scancode = 0;
     bool is_extended = false;
@@ -149,8 +184,9 @@ bool native_input_sdl_scancode_to_rdp(uint32_t sdl_scancode, uint8_t *rdp_scanco
     static const uint8_t numbers[10] = {
         0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b,
     };
+    /* SDL scancode order is KP_1..KP_9 then KP_0 (USB HID), not KP_0-first. */
     static const uint8_t keypad_digits[10] = {
-        0x52, 0x4f, 0x50, 0x51, 0x4b, 0x4c, 0x4d, 0x47, 0x48, 0x49,
+        0x4f, 0x50, 0x51, 0x4b, 0x4c, 0x4d, 0x47, 0x48, 0x49, 0x52,
     };
 
     if (sdl_scancode >= 4 && sdl_scancode <= 29) {

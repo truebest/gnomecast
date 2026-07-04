@@ -24,16 +24,21 @@ use ironrdp_connector::{
 use ironrdp_core::{
     impl_as_any, Decode as _, Encode, EncodeResult, ReadCursor, WriteBuf, WriteCursor,
 };
+use ironrdp_displaycontrol::client::DisplayControlClient;
+use ironrdp_displaycontrol::pdu::{
+    DisplayControlMonitorLayout, DisplayControlPdu, MonitorLayoutEntry,
+};
 use ironrdp_dvc::{DrdynvcClient, DvcEncode, DvcMessage, DvcProcessor};
 use ironrdp_egfx::client::{BitmapUpdate, GraphicsPipelineClient, GraphicsPipelineHandler};
 use ironrdp_egfx::pdu::{
-    CapabilitiesV81Flags, CapabilitiesV8Flags, CapabilitySet, Codec1Type, GfxPdu,
-    MapSurfaceToOutputPdu, WireToSurface2Pdu,
+    CacheToSurfacePdu, CapabilitiesV81Flags, CapabilitiesV8Flags, CapabilitySet, Codec1Type,
+    GfxPdu, MapSurfaceToOutputPdu, SolidFillPdu, SurfaceToSurfacePdu, WireToSurface2Pdu,
 };
 use ironrdp_graphics::image_processing::PixelFormat;
+use ironrdp_graphics::pointer::DecodedPointer;
 use ironrdp_pdu::gcc::KeyboardType;
 use ironrdp_pdu::geometry::Rectangle as _;
-use ironrdp_pdu::input::fast_path::{FastPathInputEvent, KeyboardFlags};
+use ironrdp_pdu::input::fast_path::{FastPathInputEvent, KeyboardFlags, SynchronizeFlags};
 use ironrdp_pdu::input::mouse::{MousePdu, PointerFlags};
 use ironrdp_pdu::rdp::capability_sets::MajorPlatformType;
 use ironrdp_pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
@@ -103,7 +108,19 @@ pub struct RdpCallbacks {
     /// (ctx, data, len, audio_timestamp_ms). One encoded packet (Opus) or PCM chunk per
     /// call; bytes are valid only for the duration of the call.
     pub on_audio_data: Option<extern "C" fn(*mut core::ffi::c_void, *const u8, usize, u32)>,
+    /// (ctx, width, height, hotspot_x, hotspot_y, rgba, len). Decoded server cursor shape:
+    /// RGBA byte order, top-down rows, tight stride (width * 4), straight (non-premultiplied)
+    /// alpha. Bytes are valid only for the duration of the call.
+    pub on_pointer_bitmap:
+        Option<extern "C" fn(*mut core::ffi::c_void, u16, u16, u16, u16, *const u8, usize)>,
+    /// (ctx, x, y). Server-initiated pointer warp, in desktop coordinates.
+    pub on_pointer_position: Option<extern "C" fn(*mut core::ffi::c_void, u16, u16)>,
+    /// (ctx, state: RDP_POINTER_STATE_*). 0 = hidden, 1 = system default arrow.
+    pub on_pointer_state: Option<extern "C" fn(*mut core::ffi::c_void, u32)>,
 }
+
+pub const RDP_POINTER_STATE_HIDDEN: u32 = 0;
+pub const RDP_POINTER_STATE_DEFAULT: u32 = 1;
 
 pub struct RdpSession {
     stop: Arc<AtomicBool>,
@@ -145,6 +162,9 @@ impl CallbackSink {
                 on_bitmap_update: None,
                 on_audio_format: None,
                 on_audio_data: None,
+                on_pointer_bitmap: None,
+                on_pointer_position: None,
+                on_pointer_state: None,
             },
         }
     }
@@ -203,6 +223,32 @@ impl CallbackSink {
     fn audio_format(&self, codec: u32, sample_rate: u32, channels: u16) {
         if let Some(cb) = self.callbacks.on_audio_format {
             cb(self.callbacks.ctx, codec, sample_rate, channels);
+        }
+    }
+
+    fn pointer_bitmap(&self, pointer: &DecodedPointer) {
+        if let Some(cb) = self.callbacks.on_pointer_bitmap {
+            cb(
+                self.callbacks.ctx,
+                pointer.width,
+                pointer.height,
+                pointer.hotspot_x,
+                pointer.hotspot_y,
+                pointer.bitmap_data.as_ptr(),
+                pointer.bitmap_data.len(),
+            );
+        }
+    }
+
+    fn pointer_position(&self, x: u16, y: u16) {
+        if let Some(cb) = self.callbacks.on_pointer_position {
+            cb(self.callbacks.ctx, x, y);
+        }
+    }
+
+    fn pointer_state(&self, state: u32) {
+        if let Some(cb) = self.callbacks.on_pointer_state {
+            cb(self.callbacks.ctx, state);
         }
     }
 
@@ -274,6 +320,10 @@ enum InputCommand {
         codepoint: u16,
         down: bool,
     },
+    /// Absolute toggle-key state (TS_FP_SYNC_EVENT); bits follow `SynchronizeFlags`.
+    SyncLocks {
+        flags: u8,
+    },
 }
 
 impl InputCommand {
@@ -331,6 +381,9 @@ impl InputCommand {
                 }
                 vec![FastPathInputEvent::UnicodeKeyboardEvent(flags, codepoint)]
             }
+            InputCommand::SyncLocks { flags } => vec![FastPathInputEvent::SyncEvent(
+                SynchronizeFlags::from_bits_truncate(flags),
+            )],
         }
     }
 }
@@ -439,8 +492,10 @@ impl GraphicsPipelineHandler for NativeGfxHandler {
             return;
         }
         let stride = u32::from(update.width) * 4;
-        let expected = stride as usize * update.height as usize;
-        if update.data.len() < expected {
+        // u64: `stride * height` overflows usize on the 32-bit webOS target for
+        // dimensions a hostile server can still claim (e.g. 32768x32768).
+        let expected = u64::from(stride) * u64::from(update.height);
+        if (update.data.len() as u64) < expected {
             self.mark_unsupported_graphics(format!(
                 "server produced short bitmap update ({:?}, {} < {})",
                 update.codec_id,
@@ -501,6 +556,40 @@ impl GraphicsPipelineHandler for NativeGfxHandler {
         true
     }
 
+    // Surface-mutating EGFX operations the client deliberately IGNORES — do not turn these
+    // into mark_unsupported_graphics (a review once did; every live session then died with
+    // "server used unsupported EGFX SurfaceToSurface" right after Active):
+    //
+    // - gnome-remote-desktop sends SurfaceToSurface as part of ROUTINE AVC420 sessions.
+    // - On the hardware path the TV's video plane shows the complete decoded H.264 stream;
+    //   server-side surface composition never reaches the screen, so ignoring these ops is
+    //   visually correct there — confirmed by every live session to date.
+    // - They matter only for the RemoteFX/RGBA software fallback, where ignoring them CAN
+    //   leave stale pixels on servers that use them for that path (grd does not today). If
+    //   such a server appears, implement the ops on the RGBA canvas instead of failing.
+    //
+    // The dispatcher matches these PDUs explicitly, so they never reach on_unhandled_pdu;
+    // the trait defaults are silent no-ops. Trace them (WEBRDP_LOG=debug) to stay observable.
+    fn on_solid_fill(&mut self, pdu: &SolidFillPdu) {
+        tracing::debug!(surface_id = pdu.surface_id, "ignoring EGFX SolidFill");
+    }
+
+    fn on_surface_to_surface(&mut self, pdu: &SurfaceToSurfacePdu) {
+        tracing::debug!(
+            src = pdu.source_surface_id,
+            dst = pdu.destination_surface_id,
+            "ignoring EGFX SurfaceToSurface"
+        );
+    }
+
+    fn on_cache_to_surface(&mut self, pdu: &CacheToSurfacePdu) {
+        tracing::debug!(
+            slot = pdu.cache_slot,
+            surface_id = pdu.surface_id,
+            "ignoring EGFX CacheToSurface"
+        );
+    }
+
     fn on_unhandled_pdu(&mut self, pdu: &GfxPdu) {
         let codec = match pdu {
             GfxPdu::WireToSurface1(pdu) => match pdu.codec_id {
@@ -511,6 +600,40 @@ impl GraphicsPipelineHandler for NativeGfxHandler {
         };
         self.mark_unsupported_graphics(format!("server produced unsupported {codec} EGFX PDU"));
     }
+}
+
+/// Builds the MS-RDPEDISP Display Control client that dictates the server's monitor
+/// resolution the moment the channel becomes operational (server capabilities received —
+/// this happens before the video stream starts). Headless hosts otherwise come up with
+/// virtual-display defaults like 2048x1152 that the TV's hardware video pipeline silently
+/// cannot start on. Failures log and send nothing: a DVC processor error is
+/// session-fatal, and an unchanged server layout is a working (if suboptimal) session.
+fn make_display_control(width: u16, height: u16, sink: CallbackSink) -> DisplayControlClient {
+    DisplayControlClient::new(move |caps| {
+        let (width, height) =
+            MonitorLayoutEntry::adjust_display_size(u32::from(width), u32::from(height));
+        if u64::from(width) * u64::from(height) > caps.max_monitor_area() {
+            sink.log(format!(
+                "display: {width}x{height} exceeds the server's max monitor area; keeping the server layout"
+            ));
+            return Ok(Vec::new());
+        }
+        let layout = match DisplayControlMonitorLayout::new_single_primary_monitor(
+            width, height, None, None,
+        ) {
+            Ok(layout) => layout,
+            Err(e) => {
+                sink.log(format!(
+                    "display: failed to build {width}x{height} monitor layout: {e}"
+                ));
+                return Ok(Vec::new());
+            }
+        };
+        sink.log(format!(
+            "display: requesting server resolution {width}x{height}"
+        ));
+        Ok(vec![Box::new(DisplayControlPdu::from(layout)) as DvcMessage])
+    })
 }
 
 /// `ClientAudioOutputPdu` implements `SvcEncode` (for the static rdpsnd channel) but not
@@ -795,6 +918,43 @@ impl NativeWorker {
     }
 
     fn run(&mut self) -> Result<(), NativeError> {
+        // gnome-remote-desktop closes the connection with an MCS Disconnect Provider
+        // Ultimatum (preceded by ServerSetErrorInfo(RpcInitiatedDisconnect)) as a NORMAL
+        // part of e.g. handing a session over between its daemons, and expects the
+        // client to reconnect — mstsc/FreeRDP do so automatically. Retry a few times
+        // before surfacing the failure.
+        const MAX_SESSION_ATTEMPTS: u32 = 3;
+        for attempt in 1..=MAX_SESSION_ATTEMPTS {
+            match self.run_session() {
+                Ok(()) => return Ok(()),
+                Err(e)
+                    if attempt < MAX_SESSION_ATTEMPTS
+                        && !self.stop.load(Ordering::SeqCst)
+                        && e.message.contains("disconnect provider ultimatum") =>
+                {
+                    self.callbacks.log(format!(
+                        "server closed the session (attempt {attempt}/{MAX_SESSION_ATTEMPTS}); reconnecting"
+                    ));
+                    self.reset_session_state();
+                    thread::sleep(Duration::from_millis(1000));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        unreachable!("loop either returns or retries")
+    }
+
+    /// Clears per-session accumulated state so a reconnect starts clean.
+    fn reset_session_state(&mut self) {
+        self.inbuf.clear();
+        self.reactivation = None;
+        self.next_pts90k = 0;
+        if let Ok(mut shared) = self.gfx.lock() {
+            *shared = NativeGfxState::default();
+        }
+    }
+
+    fn run_session(&mut self) -> Result<(), NativeError> {
         self.callbacks.emit_state(
             RdpState::Connecting,
             format!("connecting to {}:{}", self.config.host, self.config.port),
@@ -905,7 +1065,9 @@ impl NativeWorker {
             client_dir: "C:\\Windows\\System32\\mstscax.dll".to_owned(),
             platform: MajorPlatformType::UNSPECIFIED,
             compression_type: None,
-            enable_server_pointer: false,
+            // The server ships cursor shapes as pointer updates (gnome-remote-desktop never
+            // embeds them into the video); they are forwarded to the C shell for rendering.
+            enable_server_pointer: true,
             autologon: false,
             // Clears the NO_AUDIO_PLAYBACK client-info flag; without this the server
             // never streams audio regardless of the AUDIO_PLAYBACK_DVC channel below.
@@ -931,7 +1093,12 @@ impl NativeWorker {
                 }),
                 None,
             ))
-            .with_dynamic_channel(RdpsndDvcHandler::new(self.callbacks));
+            .with_dynamic_channel(RdpsndDvcHandler::new(self.callbacks))
+            .with_dynamic_channel(make_display_control(
+                self.config.width,
+                self.config.height,
+                self.callbacks,
+            ));
         connector.attach_static_channel(drdynvc);
         connector
     }
@@ -1135,9 +1302,16 @@ impl NativeWorker {
                             self.write_all(&mut tls, &frame, "active response")?
                         }
                         ActiveStageOutput::Terminate(reason) => {
-                            self.callbacks
-                                .log(format!("server terminated session: {reason:?}"));
-                            return Ok(());
+                            // Any Terminate we receive is server-side origin (a client
+                            // stop closes the TCP stream without one), and
+                            // gnome-remote-desktop sends its handoff ultimatum with the
+                            // reason wired as UserRequested — so every reason must reach
+                            // the reconnect loop in run(), which matches this message and
+                            // is guarded by the stop flag for genuine client stops.
+                            return Err(NativeError::protocol(format!(
+                                "received disconnect provider ultimatum: {}",
+                                reason.description()
+                            )));
                         }
                         ActiveStageOutput::DeactivateAll(seq) => deactivate = Some(seq),
                         ActiveStageOutput::GraphicsUpdate(rect) => {
@@ -1160,6 +1334,18 @@ impl NativeWorker {
                                     data: image.data_for_rect(&rect).to_vec(),
                                 });
                             }
+                        }
+                        ActiveStageOutput::PointerBitmap(pointer) => {
+                            self.callbacks.pointer_bitmap(&pointer);
+                        }
+                        ActiveStageOutput::PointerPosition { x, y } => {
+                            self.callbacks.pointer_position(x, y);
+                        }
+                        ActiveStageOutput::PointerHidden => {
+                            self.callbacks.pointer_state(RDP_POINTER_STATE_HIDDEN);
+                        }
+                        ActiveStageOutput::PointerDefault => {
+                            self.callbacks.pointer_state(RDP_POINTER_STATE_DEFAULT);
                         }
                         _ => {}
                     }
@@ -1721,6 +1907,31 @@ pub extern "C" fn rdp_send_unicode(session: *mut RdpSession, codepoint: u16, dow
     enqueue(session, InputCommand::Unicode { codepoint, down });
 }
 
+#[no_mangle]
+pub extern "C" fn rdp_send_sync(
+    session: *mut RdpSession,
+    scroll_lock: bool,
+    num_lock: bool,
+    caps_lock: bool,
+) {
+    let mut flags = SynchronizeFlags::empty();
+    if scroll_lock {
+        flags |= SynchronizeFlags::SCROLL_LOCK;
+    }
+    if num_lock {
+        flags |= SynchronizeFlags::NUM_LOCK;
+    }
+    if caps_lock {
+        flags |= SynchronizeFlags::CAPS_LOCK;
+    }
+    enqueue(
+        session,
+        InputCommand::SyncLocks {
+            flags: flags.bits(),
+        },
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1765,12 +1976,151 @@ mod tests {
         assert!(
             offset_of!(RdpCallbacks, on_audio_data) > offset_of!(RdpCallbacks, on_audio_format)
         );
+        assert!(
+            offset_of!(RdpCallbacks, on_pointer_bitmap) > offset_of!(RdpCallbacks, on_audio_data)
+        );
+        assert!(
+            offset_of!(RdpCallbacks, on_pointer_position)
+                > offset_of!(RdpCallbacks, on_pointer_bitmap)
+        );
+        assert!(
+            offset_of!(RdpCallbacks, on_pointer_state)
+                > offset_of!(RdpCallbacks, on_pointer_position)
+        );
+    }
+
+    #[test]
+    fn pointer_state_constants_match_header() {
+        assert_eq!(RDP_POINTER_STATE_HIDDEN, 0);
+        assert_eq!(RDP_POINTER_STATE_DEFAULT, 1);
+    }
+
+    #[test]
+    fn pointer_sink_forwards_shape_and_state() {
+        use std::sync::Mutex as StdMutex;
+
+        #[derive(Default)]
+        struct Seen {
+            bitmaps: Vec<(u16, u16, u16, u16, Vec<u8>)>,
+            positions: Vec<(u16, u16)>,
+            states: Vec<u32>,
+        }
+
+        extern "C" fn on_pointer_bitmap(
+            ctx: *mut core::ffi::c_void,
+            width: u16,
+            height: u16,
+            hotspot_x: u16,
+            hotspot_y: u16,
+            rgba: *const u8,
+            len: usize,
+        ) {
+            let seen = unsafe { &*(ctx.cast::<StdMutex<Seen>>()) };
+            let bytes = unsafe { core::slice::from_raw_parts(rgba, len) }.to_vec();
+            seen.lock()
+                .unwrap()
+                .bitmaps
+                .push((width, height, hotspot_x, hotspot_y, bytes));
+        }
+        extern "C" fn on_pointer_position(ctx: *mut core::ffi::c_void, x: u16, y: u16) {
+            let seen = unsafe { &*(ctx.cast::<StdMutex<Seen>>()) };
+            seen.lock().unwrap().positions.push((x, y));
+        }
+        extern "C" fn on_pointer_state(ctx: *mut core::ffi::c_void, state: u32) {
+            let seen = unsafe { &*(ctx.cast::<StdMutex<Seen>>()) };
+            seen.lock().unwrap().states.push(state);
+        }
+
+        let seen = StdMutex::new(Seen::default());
+        let mut callbacks = CallbackSink::empty().callbacks;
+        callbacks.ctx = (&seen as *const StdMutex<Seen>).cast_mut().cast();
+        callbacks.on_pointer_bitmap = Some(on_pointer_bitmap);
+        callbacks.on_pointer_position = Some(on_pointer_position);
+        callbacks.on_pointer_state = Some(on_pointer_state);
+        let sink = CallbackSink::new(callbacks);
+
+        let pointer = DecodedPointer {
+            width: 2,
+            height: 1,
+            hotspot_x: 1,
+            hotspot_y: 0,
+            bitmap_data: vec![0x10, 0x20, 0x30, 0xff, 0x40, 0x50, 0x60, 0x80],
+        };
+        sink.pointer_bitmap(&pointer);
+        sink.pointer_position(123, 456);
+        sink.pointer_state(RDP_POINTER_STATE_HIDDEN);
+        sink.pointer_state(RDP_POINTER_STATE_DEFAULT);
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen.bitmaps,
+            vec![(2, 1, 1, 0, pointer.bitmap_data.clone())]
+        );
+        assert_eq!(seen.positions, vec![(123, 456)]);
+        assert_eq!(seen.states, vec![0, 1]);
     }
 
     #[test]
     fn audio_codec_constants_match_header() {
         assert_eq!(RDP_AUDIO_CODEC_OPUS, 1);
         assert_eq!(RDP_AUDIO_CODEC_PCM_S16LE, 2);
+    }
+
+    #[test]
+    fn surface_mutating_egfx_ops_stay_non_fatal() {
+        use ironrdp_egfx::pdu::{Color, Point};
+
+        let cases: [(&str, fn(&mut NativeGfxHandler)); 3] = [
+            ("SolidFill", |handler| {
+                handler.on_solid_fill(&SolidFillPdu {
+                    surface_id: 1,
+                    fill_pixel: Color {
+                        b: 0,
+                        g: 0,
+                        r: 0,
+                        xa: 0xff,
+                    },
+                    rectangles: Vec::new(),
+                })
+            }),
+            ("SurfaceToSurface", |handler| {
+                handler.on_surface_to_surface(&SurfaceToSurfacePdu {
+                    source_surface_id: 1,
+                    destination_surface_id: 2,
+                    source_rectangle: ExclusiveRectangle {
+                        left: 0,
+                        top: 0,
+                        right: 1,
+                        bottom: 1,
+                    },
+                    destination_points: Vec::new(),
+                })
+            }),
+            ("CacheToSurface", |handler| {
+                handler.on_cache_to_surface(&CacheToSurfacePdu {
+                    cache_slot: 1,
+                    surface_id: 1,
+                    destination_points: vec![Point { x: 0, y: 0 }],
+                })
+            }),
+        ];
+        for (name, invoke) in cases {
+            let mut handler = NativeGfxHandler {
+                shared: Arc::new(Mutex::new(NativeGfxState::default())),
+            };
+            invoke(&mut handler);
+            // gnome-remote-desktop sends these during routine AVC420 sessions; they must
+            // never take the session down (regression: they briefly did).
+            assert!(
+                handler
+                    .shared
+                    .lock()
+                    .unwrap()
+                    .unsupported_graphics
+                    .is_none(),
+                "{name} must not mark graphics unsupported"
+            );
+        }
     }
 
     #[test]
@@ -1975,6 +2325,24 @@ mod tests {
     }
 
     #[test]
+    fn sync_locks_command_encodes_toggle_flags() {
+        let events = InputCommand::SyncLocks {
+            flags: (SynchronizeFlags::NUM_LOCK | SynchronizeFlags::CAPS_LOCK).bits(),
+        }
+        .into_events();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            FastPathInputEvent::SyncEvent(flags) => {
+                assert_eq!(
+                    *flags,
+                    SynchronizeFlags::NUM_LOCK | SynchronizeFlags::CAPS_LOCK
+                );
+            }
+            other => panic!("expected sync event, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn null_config_reports_protocol_error() {
         extern "C" fn on_state(
             ctx: *mut core::ffi::c_void,
@@ -1995,6 +2363,9 @@ mod tests {
             on_bitmap_update: None,
             on_audio_format: None,
             on_audio_data: None,
+            on_pointer_bitmap: None,
+            on_pointer_position: None,
+            on_pointer_state: None,
         };
         let session = unsafe { rdp_session_start(ptr::null(), &callbacks) };
         assert!(session.is_null());
@@ -2045,6 +2416,9 @@ mod tests {
             on_bitmap_update: None,
             on_audio_format: Some(capture_audio_format),
             on_audio_data: Some(capture_audio_data),
+            on_pointer_bitmap: None,
+            on_pointer_position: None,
+            on_pointer_state: None,
         };
         RdpsndDvcHandler::new(CallbackSink::new(callbacks))
     }
@@ -2289,5 +2663,77 @@ mod tests {
             "renegotiation must re-fire on_audio_format even for the same format"
         );
         assert_eq!(capture.data.len(), 2);
+    }
+
+    // ---- Display Control DVC ----
+
+    use ironrdp_displaycontrol::pdu::DisplayControlCapabilities;
+
+    /// Encodes the full `DISPLAYCONTROL_CAPS_PDU` as a real server puts it on the wire:
+    /// the `DISPLAYCONTROL_HEADER` (Type + Length) followed by the capability set
+    /// (MS-RDPEDISP 2.2.2.1). Feeding the raw capability body without the header would
+    /// exercise a wire shape no server ever sends.
+    fn display_caps_payload(max_num_monitors: u32, factor_a: u32, factor_b: u32) -> Vec<u8> {
+        let caps: DisplayControlPdu =
+            DisplayControlCapabilities::new(max_num_monitors, factor_a, factor_b)
+                .expect("caps")
+                .into();
+        ironrdp_core::encode_vec(&caps).expect("encode caps")
+    }
+
+    fn decode_monitor_layout(message: &DvcMessage) -> DisplayControlMonitorLayout {
+        let bytes = ironrdp_core::encode_vec(message.as_ref()).expect("encode layout message");
+        let mut cursor = ReadCursor::new(&bytes);
+        match DisplayControlPdu::decode(&mut cursor).expect("decode DisplayControlPdu") {
+            DisplayControlPdu::MonitorLayout(layout) => layout,
+            other => panic!("expected MonitorLayout, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn display_control_pushes_configured_resolution_on_caps() {
+        let payload = display_caps_payload(1, 1920, 1080);
+        // Golden wire bytes: DISPLAYCONTROL_HEADER (Type=0x05 Caps, Length=0x14) + body.
+        // Matches the vendored IronRDP testsuite vector shape and MS-RDPEDISP 2.2.2.1.
+        assert_eq!(
+            payload,
+            [
+                0x05, 0x00, 0x00, 0x00, // Header: Type = DISPLAYCONTROL_PDU_TYPE_CAPS
+                0x14, 0x00, 0x00, 0x00, // Header: Length = 20
+                0x01, 0x00, 0x00, 0x00, // MaxNumMonitors = 1
+                0x80, 0x07, 0x00, 0x00, // MaxMonitorAreaFactorA = 1920
+                0x38, 0x04, 0x00, 0x00, // MaxMonitorAreaFactorB = 1080
+            ]
+        );
+        let mut client = make_display_control(1920, 1080, CallbackSink::empty());
+        let replies = client.process(0, &payload).expect("process caps");
+        assert_eq!(replies.len(), 1);
+        let layout = decode_monitor_layout(&replies[0]);
+        assert_eq!(layout.monitors().len(), 1);
+        let monitor = &layout.monitors()[0];
+        assert!(monitor.is_primary());
+        assert_eq!(monitor.dimensions(), (1920, 1080));
+        assert_eq!(monitor.position(), Some((0, 0)));
+    }
+
+    #[test]
+    fn display_control_skips_layout_exceeding_server_area() {
+        let mut client = make_display_control(1920, 1080, CallbackSink::empty());
+        // A 640x480 max monitor area cannot fit 1920x1080; must stay silent, never error.
+        let replies = client
+            .process(0, &display_caps_payload(1, 640, 480))
+            .expect("process caps");
+        assert!(replies.is_empty());
+    }
+
+    #[test]
+    fn display_control_evens_odd_width() {
+        let mut client = make_display_control(1367, 768, CallbackSink::empty());
+        let replies = client
+            .process(0, &display_caps_payload(1, 8192, 8192))
+            .expect("process caps");
+        assert_eq!(replies.len(), 1);
+        let layout = decode_monitor_layout(&replies[0]);
+        assert_eq!(layout.monitors()[0].dimensions(), (1366, 768));
     }
 }

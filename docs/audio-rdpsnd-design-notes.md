@@ -227,6 +227,18 @@ Three additional blockers surfaced on the real TV↔grd pair, all fixed:
    `on_video_au` reopens it on the next SPS+PPS+IDR rather than feeding P-frames into a
    freshly reset hardware decoder.
 
+5. **Audio dropouts under heavy video traffic → client jitter buffer.** Audio and video
+   share one TCP connection; bursts of large 4K frames delay the audio DVC packets, which
+   then arrive in a late burst (arrival gaps of 60–230 ms measured in live logs) while
+   the NDL buffer runs dry — audible sub-second dropouts. Server-side QoS was ruled out:
+   grd estimates render latency purely from the client's WaveConfirm `wTimeStamp` (grd
+   sends its waves with timestamp 0, our confirms echo it, and grd skips zero values —
+   its 300 ms drop logic never fires for us). Fix: `native_audio_feed` fronts a
+   configurable jitter prebuffer (`audioPrebufferMs`, default 100, 0 disables) — it
+   accumulates that much audio before the first hardware feed and re-arms after source
+   pauses, so playback always carries a safety margin at the cost of the same added audio
+   latency; arrival gaps above 60 ms are logged as evidence for future tuning.
+
 Also observed (benign): one `omxopusdec ... failed to setup output format` GStreamer
 error on the audio-only NDL load, gone after the full audio+video reload; noisy
 `gst_object_unref` GStreamer-CRITICAL warnings from the platform pipeline during reloads.
