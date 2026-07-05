@@ -1,150 +1,111 @@
-You are an experienced, pragmatic software engineering AI agent. Keep edits minimal and do not over-engineer.
+# AGENTS.md
 
-# Agent Guide
+Guidance for AI agents working in this repo. Keep changes minimal, tested, and in the style
+of the surrounding code; do not over-engineer.
 
-## Project Overview
+## Project
 
-`gnomecast` is moving to a **native-only webOS app** on branch `integration/native-e2e`. The native target lives under `native/` and uses the Rust RDP core in `webrdp-min/` through a C ABI.
+`gnomecast` is a native webOS RDP client for LG TVs that casts a GNOME desktop
+(gnome-remote-desktop) to the TV with hardware-decoded video and audio. It is a C11/CMake
+shell (`native/`) around a Rust RDP core (`webrdp-min/`), linked through a C ABI
+(`native/include/rdp_ffi.h`).
 
-The native product path prefers AVC420/H.264 through the webOS hardware video plane via `ss4s` / NDL / SMP. RemoteFX is also required as a native compatibility path for servers without H.264: Rust/IronRDP decodes bitmap updates and the native SDL presenter displays RGBA frames. If neither native graphics path can work, report a terminal native error. Do not add runtime fallback to Web, MSE, WebCodecs, RDCleanPath, or the historical browser app.
+- **Video**: AVC420/H.264 over RDPEGFX, decoded by the TV hardware video plane via `ss4s`
+  (NDL/SMP). Servers without H.264 fall back to native RemoteFX/bitmap decoding in Rust,
+  presented as RGBA through SDL. If neither native path works, report a terminal native
+  error — never fall back to Web/MSE/WebCodecs/RDCleanPath or the removed browser app.
+- **Audio**: MS-RDPEA over `AUDIO_PLAYBACK_DVC`; Opus preferred, 16-bit PCM fallback;
+  strictly best-effort (failures degrade to silent video, never a dropped session).
+- **Input**: the USB mouse and keyboard are read from grabbed `/dev/input` (evdev,
+  `EVIOCGRAB`) below the compositor; the SDL path is a fallback for the compositor pointer
+  (Magic Remote) only. The grab follows window focus so a webOS overlay (TV menu) stays usable.
 
-Main technologies:
+Stack: C11 + CMake (native shell, decoder boundary, CTests), Rust 2021 (`webrdp-min`
+`staticlib` + C ABI), vendored deps under `third_party/` (IronRDP fork, ss4s, commons, LVGL),
+and the webOS buildroot toolchain + `ares` CLI for packaging.
 
-- C11 and CMake for the native shell, decoder boundary, input helpers, package targets, and CTest tests.
-- Rust 2021 for `webrdp-min` and the native `staticlib` C ABI.
-- Vendored/pinned dependencies under `third_party/`, including IronRDP, ss4s, and commons.
-- webOS CLI and webOS buildroot toolchain for package/install/launch work.
+## Key paths
 
-## Important Paths
+- `native/src/main.c` — webOS lifecycle, config, RDP callbacks, SDL event loop, presentation.
+- `native/src/mouse_evdev.c`, `native/src/keyboard_evdev.c` — raw `/dev/input` readers (grabbed).
+- `native/src/input_sdl.c` / `.h` — RDP fast-path input: window↔desktop coordinate mapping and
+  the Linux-keycode / SDL-scancode → RDP scancode maps.
+- `native/src/cursor_sdl.c` / `.h` — server-driven cursor on the platform cursor plane.
+- `native/src/media_ss4s.c`, `video_ss4s.c`, `audio_ss4s.c` — the shared ss4s player and its
+  video/audio tracks.
+- `native/src/h264_annexb.c` — AVC length-prefixed H.264 → Annex-B conversion.
+- `native/src/video_rgba_sdl.c` — RemoteFX/bitmap RGBA surface.
+- `native/src/ui_preconnect.c` — on-TV LVGL pre-connect settings screen.
+- `native/include/rdp_ffi.h` — the C↔Rust ABI contract.
+- `webrdp-min/src/native.rs` — Rust native worker / C ABI implementation.
+- `native/CMakeLists.txt` — native target, options, CTests, webOS package.
+- `docs/native-runbook.md` — build/package/deploy/triage; `docs/build-environment.md` —
+  host/container toolchain setup; `third_party/PROVENANCE.md` and
+  `third_party/IronRDP/PROVENANCE.md` — pinned-dependency provenance and the IronRDP fork delta.
 
-- `docs/native-runbook.md` - current build, package, install, launch, and triage commands.
-- `docs/build-environment.md` - host/container setup notes.
-- `native/CMakeLists.txt` - native executable, tests, ss4s/SDL/staticlib options, and webOS package targets.
-- `native/include/rdp_ffi.h` - C ABI contract between native C and Rust.
-- `native/src/main.c` - native lifecycle, config, callbacks, SDL/webOS event loop.
-- `native/src/video_ss4s.c` and `native/include/video_ss4s.h` - ss4s H.264 decoder boundary.
-- `native/src/h264_annexb.c` and `native/include/h264_annexb.h` - AVC length-prefixed H.264 to Annex-B conversion.
-- `native/src/input_sdl.c` and `native/include/input_sdl.h` - native input mapping.
-- `native/src/video_rgba_sdl.c` and `native/include/video_rgba_sdl.h` - native RGBA/RemoteFX bitmap surface helper.
-- `native/tests/` - CTest coverage for ABI, H.264, and input helpers.
-- `webrdp-min/src/native.rs` - Rust native C ABI implementation.
-- `third_party/PROVENANCE.md` - pinned third-party dependency provenance and licenses.
+Historical web/browser/Luna trees were removed. Use git history for reference; do not
+reintroduce them.
 
-Historical web/browser/runtime trees were removed. Use git history for reference; do not reintroduce browser runtime fallback.
+## Commands
 
-## Essential Commands
-
-Run focused local checks before committing native changes:
+Local checks before committing native changes (these mirror CI):
 
 ```sh
 cc -fsyntax-only -Inative/include \
-  native/src/main.c native/src/video_ss4s.c native/src/video_rgba_sdl.c \
-  native/src/h264_annexb.c native/src/input_sdl.c native/src/rdp_ffi_stub.c
-cargo test --manifest-path webrdp-min/Cargo.toml --features native native::tests::
-```
-
-Local CMake test loop:
-
-```sh
-cmake -S native -B /tmp/gnomecast-native-build
-cmake --build /tmp/gnomecast-native-build
+  native/src/main.c native/src/media_ss4s.c native/src/video_ss4s.c \
+  native/src/audio_ss4s.c native/src/video_rgba_sdl.c native/src/h264_annexb.c \
+  native/src/input_sdl.c native/src/cursor_sdl.c native/src/rdp_ffi_stub.c
+cargo test --manifest-path webrdp-min/Cargo.toml --features native --locked native::tests::
+cmake -S native -B /tmp/gnomecast-native-build && cmake --build /tmp/gnomecast-native-build
 ctest --test-dir /tmp/gnomecast-native-build --output-on-failure
 ```
 
-Build Rust staticlib and link it into the native shell:
-
-```sh
-cargo build --manifest-path webrdp-min/Cargo.toml --features native
-cmake -S native -B /tmp/gnomecast-native-rust-build \
-  -DHELLOLG_LINK_RDP_FFI=ON \
-  -DRDP_FFI_LIB="$PWD/webrdp-min/target/debug/libwebrdp_min.a"
-cmake --build /tmp/gnomecast-native-rust-build
-```
-
-Cross-build, package, install, and launch for webOS:
+The host CMake/ctest build above is SDL-off, so it does not compile `main.c`/`ui_preconnect.c`
+or the evdev readers — only the full webOS cross-build (`HELLOLG_WITH_SDL=ON`) does. Cross-build,
+package, install, and launch for the TV:
 
 ```sh
 ./tools/build-native-webos.sh
 ARES_DEVICE=<tv-device> HELLOLG_NATIVE_CONFIG=native/config.local.json ./tools/deploy-native-webos.sh
 ```
 
-Do not use `arm-unknown-linux-gnueabi` for the TV Rust staticlib. Use
-`armv7-unknown-linux-gnueabi`; the generic ARM target can emit CP15 barrier instructions
-that crash as `Illegal instruction` on ARMv8 webOS.
+Use the `armv7-unknown-linux-gnueabi` Rust target, NOT `arm-unknown-linux-gnueabi`: the generic
+ARM target can emit CP15 barrier instructions that crash as `Illegal instruction` on ARMv8
+webOS. Toolchain default
+`/opt/arm-webos-linux-gnueabi_sdk-buildroot/share/buildroot/toolchainfile.cmake`; override with
+`WEBOS_TOOLCHAIN_FILE=...`.
 
-Default webOS toolchain path:
+## Conventions
 
-```text
-/opt/arm-webos-linux-gnueabi_sdk-buildroot/share/buildroot/toolchainfile.cmake
-```
+- Treat `native/include/rdp_ffi.h` as the ABI contract: a change there must update C, Rust,
+  tests, and docs together.
+- Callback byte lifetimes are synchronous — copy `on_video_au` / bitmap bytes before returning
+  if you retain them.
+- RDPEGFX AVC data is length-prefixed H.264; normalize to Annex-B before feeding ss4s.
+- Product webOS builds set `HELLOLG_WITH_SS4S=ON`, `HELLOLG_WITH_SDL=ON`, and
+  `HELLOLG_LINK_RDP_FFI=ON`.
+- C: C11, 4-space indent, small file-local helpers, explicit error returns, ASCII. Native
+  symbols use `native_*` / subsystem prefixes; exported ABI symbols use `rdp_*`. Rust: `cargo
+  fmt`. Shell: `#!/usr/bin/env bash` + `set -euo pipefail`.
+- Keep generated artifacts out of the repo (`native/config.local.json`, build dirs, logs,
+  `*.ipk`).
 
-Override as needed:
+## Git / release workflow
 
-```sh
-WEBOS_TOOLCHAIN_FILE=/path/to/toolchainfile.cmake ./tools/build-native-webos.sh
-```
+- Dev history lives in Bitbucket (`origin`, `kodavr/gnomecast`); pushes auto-trigger CI on
+  self-hosted runners. `main` is protected — land changes via `bkt pr` (create → `bkt pr checks
+  --wait` → `bkt pr merge`), not direct pushes.
+- GitHub (`truebest/gnomecast`) is an append-only, releases-only mirror: one snapshot commit +
+  `vX.Y.Z` tag per version, published with `tools/release-github.sh <version>`. Never
+  force-push or move tags there.
+- Bump `native/deploy/webos/appinfo.json` `version` for a release. Never add Claude/AI
+  attribution trailers to commit messages.
 
-## Patterns
+## Do not
 
-- Keep native work small and testable: helpers in `native/src/`, public headers in `native/include/`, focused tests in `native/tests/`.
-- Treat `native/include/rdp_ffi.h` as the ABI contract. If it changes, update C, Rust, tests, and docs together.
-- Callback byte lifetimes are synchronous. C must copy `on_video_au` data if it needs to retain it.
-- RDPEGFX AVC data is length-prefixed H.264. Normalize to Annex-B before feeding ss4s.
-- RemoteFX/bitmap updates are native RGBA dirty rectangles; copy callback bytes synchronously into the native bitmap surface before returning.
-- Product webOS builds should use `HELLOLG_WITH_SS4S=ON`, `HELLOLG_WITH_SDL=ON`, and `HELLOLG_LINK_RDP_FFI=ON`.
-- Keep generated artifacts out of the repo: `native/config.local.json`, build dirs, logs, and `*.ipk` outputs are ignored.
-
-## Anti-Patterns
-
-- Do not package `app/` or `service/` into the native target.
-- Do not use dummy/software ss4s video backends for MVP acceptance.
-- Do not copy or adapt Moonlight TV (https://github.com/mariotaku/moonlight-tv) GPL application code — gnomecast is MIT-licensed. Use it strictly as a read-only reference and preserve dependency licenses when pinning submodules.
+- Do not reintroduce Web/MSE/WebCodecs/RDCleanPath or the deleted browser/Luna trees, and do
+  not package `app/` or `service/` into the native target.
+- Do not use dummy/software ss4s video backends for acceptance.
+- Do not copy or adapt Moonlight-TV (GPL) application code — read-only reference only;
+  gnomecast is MIT-licensed. Preserve dependency licenses when pinning submodules.
 - Do not log passwords or local config contents.
-- Do not recreate deleted browser harnesses unless the native binary implements the corresponding runtime mode in the same change.
-
-## Code Style
-
-- C uses C11, 4-space indentation, small file-local helpers, explicit error returns, and standard headers.
-- Rust uses `cargo fmt`.
-- Shell scripts use `#!/usr/bin/env bash` and `set -euo pipefail`.
-- Prefer ASCII in new files unless there is a clear reason otherwise.
-- Match existing naming: native C symbols use `native_*` or subsystem prefixes; exported RDP ABI symbols use `rdp_*`.
-
-## Validation
-
-No repo-wide formatter or lint script is configured. Prefer the smallest relevant checks:
-
-```sh
-cc -fsyntax-only -Inative/include \
-  native/src/main.c native/src/video_ss4s.c native/src/video_rgba_sdl.c \
-  native/src/h264_annexb.c native/src/input_sdl.c native/src/rdp_ffi_stub.c
-cargo test --manifest-path webrdp-min/Cargo.toml --features native native::tests::
-cmake -S native -B /tmp/gnomecast-native-build
-cmake --build /tmp/gnomecast-native-build
-ctest --test-dir /tmp/gnomecast-native-build --output-on-failure
-```
-
-If a tool is unavailable or an existing unrelated warning blocks a check, report that explicitly.
-
-## Current Native Status
-
-Implemented:
-
-- Native CMake target and native `appinfo.json` for `com.truebest.gnomecast.native`.
-- Frozen C ABI and Rust `native` feature/staticlib output.
-- Direct Rust native worker scaffold with state/log/video callbacks.
-- C FFI stub for local scaffold builds, while product webOS builds require the Rust staticlib.
-- ss4s/commons submodule pinning and license/provenance staging.
-- ss4s NDL/SMP module selection, dummy backend rejection, and H.264 feed boundary.
-- H.264 AVC-to-Annex-B normalization with AU size caps and CTests.
-- ABI layout and input helper CTests.
-- SDL/webOS fullscreen event loop and input dispatch in product builds.
-- Native build/package/verify and deploy/launch helper scripts.
-- Native package/install/launch verification on the TV.
-- Live fullscreen GNOME desktop through the ss4s/NDL/SMP hardware plane, TV-verified
-  (`ndl-webos5`/AVC420), including correct behavior when the server's real EGFX surface
-  resolution differs from the negotiated MCS/GCC desktop size.
-
-Still pending or not TV-verified:
-
-- Native RemoteFX/bitmap fallback path against a server without H.264.

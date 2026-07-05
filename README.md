@@ -13,14 +13,23 @@
   hardware-decoded by the TV; 16-bit PCM is the fallback. A configurable jitter prebuffer
   (0–300 ms slider, default 100 ms) smooths bursty delivery. Audio is strictly best-effort:
   failures degrade to silent video, never to a dropped session.
-- **Input**: keyboard, unicode text, absolute/relative mouse, and scroll wheel mapped from
-  SDL/webOS (including magic-remote specifics) to RDP fast-path input. NumLock is synced on
-  connect so an attached keyboard's numpad types digits, and a toggleable jump filter
-  cancels the webOS IME pointer-recenter warp so the cursor stays put while typing.
+- **Input**: the USB mouse and keyboard are read straight from the kernel evdev layer
+  (`/dev/input`, `EVIOCGRAB`), below the webOS compositor, so physical input reaches the RDP
+  server untouched by the TV's SDL/Wayland munging — no synthesized Back on right-click, no
+  pointer recenter, no F-key/keypad/NumLock quirks, no IME double-input. Mouse motion, buttons
+  and wheel and every key are forwarded as RDP fast-path input, keys as raw AT set-1 scancodes;
+  NumLock is synced on connect so the numpad types digits. When no USB mouse is attached the
+  compositor pointer (Magic Remote) still drives the session through an SDL fallback. The grab
+  is global, so it follows window focus: a webOS overlay (the TV menu) that steals focus
+  releases the mouse and keyboard so they drive the overlay, and re-grabs — restoring the
+  cursor — on return; held buttons/keys are released to the server first so a mid-press focus
+  change never leaves a stuck drag.
 - **Server cursor**: the real pointer shapes (I-beam, resize arrows, ...) arrive as RDP
   pointer updates and are applied as the system color cursor, composited by the platform's
-  cursor plane above the hardware video with zero extra presents.
-- **Pre-connect UI**: an on-TV LVGL settings screen (host, credentials, fps, mouse mode)
+  cursor plane above the hardware video with zero extra presents. The grabbed mouse drives it
+  by warping the OS pointer to the logical position; visibility follows the server's pointer
+  state.
+- **Pre-connect UI**: an on-TV LVGL settings screen (host, credentials, fps, audio prebuffer)
   with persisted settings.
 - **Network autodetection**: the client answers connect-time and continuous RTT
   measurements over the MCS message channel — gnome-remote-desktop refuses audio
@@ -54,8 +63,6 @@ cost on both ends.
   open that channel, so their (virtual) display must be set to a standard resolution
   server-side — and note that a headless server's display can revert to its odd default
   after a service restart.
-- **Server cursor shapes require absolute mouse mode.** In relative mode (Magic Remote)
-  SDL hides the system cursor, so the server's pointer shapes cannot be shown there.
 - **AVC444 is not negotiated** — the client advertises AVC420 (4:2:0) only. Servers
   without a usable H.264 encoder fall back to software RemoteFX rendering (slower, and
   rendered on the ~1080p UI plane rather than the native-resolution video plane).
@@ -64,16 +71,12 @@ cost on both ends.
   routine AVC420 sessions and the picture is complete since the video plane carries full
   frames — but a server that relied on them for the software RemoteFX path would show
   stale regions.
-- **The pointer may briefly flash at the screen center while typing.** The webOS
-  compositor recenters the pointer around IME show/hide transitions and there is no
-  setting to disable it. The client filters the jump out of the input stream (the
-  "Jump filter" toggle in the settings screen), so the remote cursor position is
-  unaffected; the local flash is cosmetic.
 
 ## Layout
 
-- `native/` — C11/CMake shell: webOS lifecycle, SDL input and presentation, the shared
-  ss4s media player (`media_ss4s.c`) with its video (`video_ss4s.c`) and audio
+- `native/` — C11/CMake shell: webOS lifecycle, raw evdev input readers
+  (`mouse_evdev.c`/`keyboard_evdev.c`, with an SDL pointer fallback) and SDL presentation, the
+  shared ss4s media player (`media_ss4s.c`) with its video (`video_ss4s.c`) and audio
   (`audio_ss4s.c`) tracks, RemoteFX RGBA presentation, pre-connect UI, package targets.
 - `webrdp-min/` — Rust static library implementing the RDP client (direct TCP + TLS +
   CredSSP/NTLM, EGFX, rdpsnd-over-DVC), exposed through the C ABI in
