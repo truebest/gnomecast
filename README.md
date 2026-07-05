@@ -54,10 +54,6 @@ cost on both ends.
   open that channel, so their (virtual) display must be set to a standard resolution
   server-side — and note that a headless server's display can revert to its odd default
   after a service restart.
-- **Keypad-5 and NumLock don't work from an attached keyboard.** webOS consumes both keys
-  at the system level; the app receives no event at all (all neighbouring keypad keys
-  arrive normally). Not fixable client-side — use the top-row 5. Other keyboard models may
-  behave differently.
 - **Server cursor shapes require absolute mouse mode.** In relative mode (Magic Remote)
   SDL hides the system cursor, so the server's pointer shapes cannot be shown there.
 - **AVC444 is not negotiated** — the client advertises AVC420 (4:2:0) only. Servers

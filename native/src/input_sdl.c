@@ -130,14 +130,6 @@ bool native_input_key(NativeInput *input, uint8_t scancode, bool down, bool exte
     return true;
 }
 
-bool native_input_unicode(NativeInput *input, uint16_t codepoint, bool down) {
-    if (!native_input_ready(input)) {
-        return false;
-    }
-    rdp_send_unicode(input->session, codepoint, down);
-    return true;
-}
-
 bool native_input_sync_locks(NativeInput *input, bool scroll_lock, bool num_lock, bool caps_lock) {
     if (!native_input_ready(input)) {
         return false;
@@ -146,224 +138,93 @@ bool native_input_sync_locks(NativeInput *input, bool scroll_lock, bool num_lock
     return true;
 }
 
-static int native_abs_max(int dx, int dy) {
-    int magnitude = dx < 0 ? -dx : dx;
-    int magnitude_y = dy < 0 ? -dy : dy;
-    return magnitude_y > magnitude ? magnitude_y : magnitude;
-}
-
-bool native_input_motion_is_jump(int dx, int dy) {
-    return native_abs_max(dx, dy) > NATIVE_INPUT_JUMP_ALWAYS_PX;
-}
-
-bool native_input_motion_is_center_jump(int x, int y, int dx, int dy, uint16_t window_w,
-                                        uint16_t window_h) {
-    if (window_w == 0 || window_h == 0) {
-        return false;
-    }
-    int magnitude = native_abs_max(dx, dy);
-    int center_dx = x - (int)(window_w / 2u);
-    int center_dy = y - (int)(window_h / 2u);
-    int center_distance = native_abs_max(center_dx, center_dy);
-    if (center_distance <= NATIVE_INPUT_CENTER_TOLERANCE_PX &&
-        magnitude >= NATIVE_INPUT_CENTER_JUMP_MIN_PX) {
-        return true;
-    }
-    return center_distance <= NATIVE_INPUT_CENTER_RADIUS_PX &&
-           magnitude >= NATIVE_INPUT_CENTER_RADIUS_JUMP_PX;
-}
-
-bool native_input_sdl_scancode_to_rdp(uint32_t sdl_scancode, uint8_t *rdp_scancode, bool *extended) {
+bool native_input_linux_keycode_to_rdp(uint32_t code, uint8_t *rdp_scancode, bool *extended) {
     uint8_t scancode = 0;
     bool is_extended = false;
-
-    static const uint8_t letters[26] = {
-        0x1e, 0x30, 0x2e, 0x20, 0x12, 0x21, 0x22, 0x23, 0x17, 0x24, 0x25, 0x26, 0x32,
-        0x31, 0x18, 0x19, 0x10, 0x13, 0x1f, 0x14, 0x16, 0x2f, 0x11, 0x2d, 0x15, 0x2c,
-    };
-    static const uint8_t numbers[10] = {
-        0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b,
-    };
-    /* SDL scancode order is KP_1..KP_9 then KP_0 (USB HID), not KP_0-first. */
-    static const uint8_t keypad_digits[10] = {
-        0x4f, 0x50, 0x51, 0x4b, 0x4c, 0x4d, 0x47, 0x48, 0x49, 0x52,
-    };
-
-    if (sdl_scancode >= 4 && sdl_scancode <= 29) {
-        scancode = letters[sdl_scancode - 4];
-    } else if (sdl_scancode >= 30 && sdl_scancode <= 39) {
-        scancode = numbers[sdl_scancode - 30];
-    } else if (sdl_scancode >= 58 && sdl_scancode <= 67) {
-        scancode = (uint8_t)(0x3b + (sdl_scancode - 58));
-    } else if (sdl_scancode >= 89 && sdl_scancode <= 98) {
-        scancode = keypad_digits[sdl_scancode - 89];
+    /* Linux input event codes for the AT-keyboard main block (1..88) ARE the RDP set-1 make
+     * codes (KEY_ESC=1=0x01, KEY_A=30=0x1e, KEY_F5=63=0x3f, KEY_KP5=76=0x4c, KEY_102ND=86=
+     * 0x56), so those map identity, not extended. The E0-prefixed keys have Linux codes
+     * above 88 and need an explicit table. */
+    if (code >= 1 && code <= 88) {
+        scancode = (uint8_t)code;
     } else {
-        switch (sdl_scancode) {
-        case 40: /* Return */
+        switch (code) {
+        case 96: /* KEY_KPENTER */
             scancode = 0x1c;
+            is_extended = true;
             break;
-        case 41: /* Escape */
-            scancode = 0x01;
+        case 97: /* KEY_RIGHTCTRL */
+            scancode = 0x1d;
+            is_extended = true;
             break;
-        case 42: /* Backspace */
-            scancode = 0x0e;
-            break;
-        case 43: /* Tab */
-            scancode = 0x0f;
-            break;
-        case 44: /* Space */
-            scancode = 0x39;
-            break;
-        case 45: /* Minus */
-            scancode = 0x0c;
-            break;
-        case 46: /* Equals */
-            scancode = 0x0d;
-            break;
-        case 47: /* Left bracket */
-            scancode = 0x1a;
-            break;
-        case 48: /* Right bracket */
-            scancode = 0x1b;
-            break;
-        case 49: /* Backslash */
-        case 50: /* Non-US hash */
-            scancode = 0x2b;
-            break;
-        case 51: /* Semicolon */
-            scancode = 0x27;
-            break;
-        case 52: /* Apostrophe */
-            scancode = 0x28;
-            break;
-        case 53: /* Grave */
-            scancode = 0x29;
-            break;
-        case 54: /* Comma */
-            scancode = 0x33;
-            break;
-        case 55: /* Period */
-            scancode = 0x34;
-            break;
-        case 56: /* Slash */
+        case 98: /* KEY_KPSLASH */
             scancode = 0x35;
+            is_extended = true;
             break;
-        case 57: /* Caps Lock */
-            scancode = 0x3a;
-            break;
-        case 68: /* F11 */
-            scancode = 0x57;
-            break;
-        case 69: /* F12 */
-            scancode = 0x58;
-            break;
-        case 70: /* Print Screen */
+        case 99: /* KEY_SYSRQ (PrintScreen) */
             scancode = 0x37;
             is_extended = true;
             break;
-        case 71: /* Scroll Lock */
-            scancode = 0x46;
-            break;
-        case 73: /* Insert */
-            scancode = 0x52;
+        case 100: /* KEY_RIGHTALT */
+            scancode = 0x38;
             is_extended = true;
             break;
-        case 74: /* Home */
+        case 102: /* KEY_HOME */
             scancode = 0x47;
             is_extended = true;
             break;
-        case 75: /* Page Up */
-            scancode = 0x49;
-            is_extended = true;
-            break;
-        case 76: /* Delete */
-            scancode = 0x53;
-            is_extended = true;
-            break;
-        case 77: /* End */
-            scancode = 0x4f;
-            is_extended = true;
-            break;
-        case 78: /* Page Down */
-            scancode = 0x51;
-            is_extended = true;
-            break;
-        case 79: /* Right */
-            scancode = 0x4d;
-            is_extended = true;
-            break;
-        case 80: /* Left */
-            scancode = 0x4b;
-            is_extended = true;
-            break;
-        case 81: /* Down */
-            scancode = 0x50;
-            is_extended = true;
-            break;
-        case 82: /* Up */
+        case 103: /* KEY_UP */
             scancode = 0x48;
             is_extended = true;
             break;
-        case 83: /* Num Lock */
-            scancode = 0x45;
-            break;
-        case 84: /* Keypad divide */
-            scancode = 0x35;
+        case 104: /* KEY_PAGEUP */
+            scancode = 0x49;
             is_extended = true;
             break;
-        case 85: /* Keypad multiply */
-            scancode = 0x37;
-            break;
-        case 86: /* Keypad minus */
-            scancode = 0x4a;
-            break;
-        case 87: /* Keypad plus */
-            scancode = 0x4e;
-            break;
-        case 88: /* Keypad enter */
-            scancode = 0x1c;
+        case 105: /* KEY_LEFT */
+            scancode = 0x4b;
             is_extended = true;
             break;
-        case 99: /* Keypad period */
+        case 106: /* KEY_RIGHT */
+            scancode = 0x4d;
+            is_extended = true;
+            break;
+        case 107: /* KEY_END */
+            scancode = 0x4f;
+            is_extended = true;
+            break;
+        case 108: /* KEY_DOWN */
+            scancode = 0x50;
+            is_extended = true;
+            break;
+        case 109: /* KEY_PAGEDOWN */
+            scancode = 0x51;
+            is_extended = true;
+            break;
+        case 110: /* KEY_INSERT */
+            scancode = 0x52;
+            is_extended = true;
+            break;
+        case 111: /* KEY_DELETE */
             scancode = 0x53;
-            break;
-        case 101: /* Application/Menu */
-            scancode = 0x5d;
             is_extended = true;
             break;
-        case 224: /* Left Ctrl */
-            scancode = 0x1d;
-            break;
-        case 225: /* Left Shift */
-            scancode = 0x2a;
-            break;
-        case 226: /* Left Alt */
-            scancode = 0x38;
-            break;
-        case 227: /* Left GUI */
+        case 125: /* KEY_LEFTMETA */
             scancode = 0x5b;
             is_extended = true;
             break;
-        case 228: /* Right Ctrl */
-            scancode = 0x1d;
-            is_extended = true;
-            break;
-        case 229: /* Right Shift */
-            scancode = 0x36;
-            break;
-        case 230: /* Right Alt */
-            scancode = 0x38;
-            is_extended = true;
-            break;
-        case 231: /* Right GUI */
+        case 126: /* KEY_RIGHTMETA */
             scancode = 0x5c;
+            is_extended = true;
+            break;
+        case 127: /* KEY_COMPOSE (Menu) */
+            scancode = 0x5d;
             is_extended = true;
             break;
         default:
             return false;
         }
     }
-
     if (rdp_scancode) {
         *rdp_scancode = scancode;
     }
@@ -371,77 +232,4 @@ bool native_input_sdl_scancode_to_rdp(uint32_t sdl_scancode, uint8_t *rdp_scanco
         *extended = is_extended;
     }
     return true;
-}
-
-static bool native_input_decode_utf8(const unsigned char **cursor, uint32_t *codepoint) {
-    const unsigned char *p = *cursor;
-    uint32_t cp = 0;
-    size_t len = 0;
-
-    if (p[0] < 0x80) {
-        cp = p[0];
-        len = 1;
-    } else if ((p[0] & 0xe0) == 0xc0) {
-        cp = p[0] & 0x1f;
-        len = 2;
-        if (cp == 0) {
-            return false;
-        }
-    } else if ((p[0] & 0xf0) == 0xe0) {
-        cp = p[0] & 0x0f;
-        len = 3;
-    } else if ((p[0] & 0xf8) == 0xf0) {
-        cp = p[0] & 0x07;
-        len = 4;
-    } else {
-        return false;
-    }
-
-    for (size_t i = 1; i < len; i++) {
-        if ((p[i] & 0xc0) != 0x80) {
-            return false;
-        }
-        cp = (cp << 6) | (uint32_t)(p[i] & 0x3f);
-    }
-
-    if ((len == 2 && cp < 0x80) || (len == 3 && cp < 0x800) || (len == 4 && cp < 0x10000) ||
-        (cp >= 0xd800 && cp <= 0xdfff) || cp > 0x10ffff) {
-        return false;
-    }
-
-    *cursor = p + len;
-    *codepoint = cp;
-    return true;
-}
-
-static bool native_input_send_utf16_unit(NativeInput *input, uint16_t unit) {
-    bool sent = native_input_unicode(input, unit, true);
-    sent = native_input_unicode(input, unit, false) || sent;
-    return sent;
-}
-
-bool native_input_text_utf8(NativeInput *input, const char *utf8) {
-    if (!native_input_ready(input) || !utf8) {
-        return false;
-    }
-
-    bool sent = false;
-    const unsigned char *cursor = (const unsigned char *)utf8;
-    while (*cursor) {
-        uint32_t cp = 0;
-        const unsigned char *before = cursor;
-        if (!native_input_decode_utf8(&cursor, &cp)) {
-            cursor = before + 1;
-            continue;
-        }
-
-        if (cp <= 0xffff) {
-            sent = native_input_send_utf16_unit(input, (uint16_t)cp) || sent;
-        } else {
-            cp -= 0x10000;
-            sent = native_input_send_utf16_unit(input, (uint16_t)(0xd800 | (cp >> 10))) || sent;
-            sent = native_input_send_utf16_unit(input, (uint16_t)(0xdc00 | (cp & 0x3ff))) || sent;
-        }
-    }
-    return sent;
 }

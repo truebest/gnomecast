@@ -81,6 +81,35 @@ if(HELLOLG_WITH_SDL)
     target_include_directories(gnomecast-native PRIVATE ${SDL2_INCLUDE_DIRS})
     target_link_libraries(gnomecast-native PRIVATE ${SDL2_LIBRARIES})
   endif()
+
+  # Raw evdev mouse reader (webOS): reuse the proven evmouse.c from the commons submodule
+  # (it needs linux/input.h — present on the webOS toolchain and Linux hosts) plus our thin
+  # wrapper. Only built with SDL; commons_log_printf is provided by mouse_evdev.c. The mouse
+  # keeps an SDL fallback (the compositor pointer / Magic Remote), so a missing reader only
+  # degrades to that path — a warning, not a hard error.
+  set(HELLOLG_EVMOUSE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/commons/device/evmouse")
+  set(HELLOLG_COMMONS_LOGGING_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/commons/util/logging")
+  if(EXISTS "${HELLOLG_EVMOUSE_DIR}/evmouse.c")
+    target_sources(gnomecast-native PRIVATE src/mouse_evdev.c "${HELLOLG_EVMOUSE_DIR}/evmouse.c")
+    target_include_directories(gnomecast-native PRIVATE "${HELLOLG_EVMOUSE_DIR}" "${HELLOLG_COMMONS_LOGGING_DIR}")
+    target_compile_definitions(gnomecast-native PRIVATE HELLOLG_WITH_EVDEV_MOUSE=1)
+  else()
+    message(WARNING "commons evmouse source not found at ${HELLOLG_EVMOUSE_DIR}; the mouse will use the SDL fallback only")
+  endif()
+
+  # Raw evdev keyboard reader (webOS): self-contained /dev/input reader (no evmouse dep),
+  # needs only linux/input.h. Grabbing the USB keyboard below the compositor delivers raw
+  # scancodes for the full RDP desktop. Unlike the mouse there is NO SDL keyboard fallback, so
+  # the reader is mandatory for an SDL build: a missing linux/input.h would ship a package with
+  # no keyboard input at all, hence a hard error rather than a warning.
+  include(CheckIncludeFile)
+  check_include_file("linux/input.h" HELLOLG_HAVE_LINUX_INPUT_H)
+  if(HELLOLG_HAVE_LINUX_INPUT_H)
+    target_sources(gnomecast-native PRIVATE src/keyboard_evdev.c)
+    target_compile_definitions(gnomecast-native PRIVATE HELLOLG_WITH_EVDEV_KEYBOARD=1)
+  else()
+    message(FATAL_ERROR "linux/input.h not found: the evdev keyboard reader is required for an SDL build (there is no SDL keyboard fallback)")
+  endif()
 endif()
 
 if(HELLOLG_WITH_PRECONNECT_UI)

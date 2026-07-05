@@ -14,7 +14,6 @@ typedef enum FakeCallKind {
     FAKE_CALL_BUTTON,
     FAKE_CALL_WHEEL,
     FAKE_CALL_KEY,
-    FAKE_CALL_UNICODE,
     FAKE_CALL_SYNC,
 } FakeCallKind;
 
@@ -26,7 +25,6 @@ typedef struct FakeCall {
     uint8_t button;
     int16_t wheel_delta;
     uint8_t scancode;
-    uint16_t codepoint;
     bool down;
     bool extended;
     bool scroll_lock;
@@ -79,12 +77,6 @@ void rdp_send_key(RdpSession *session, uint8_t scancode, bool down, bool extende
     call->extended = extended;
 }
 
-void rdp_send_unicode(RdpSession *session, uint16_t codepoint, bool down) {
-    FakeCall *call = fake_record(FAKE_CALL_UNICODE, session);
-    call->codepoint = codepoint;
-    call->down = down;
-}
-
 void rdp_send_sync(RdpSession *session, bool scroll_lock, bool num_lock, bool caps_lock) {
     FakeCall *call = fake_record(FAKE_CALL_SYNC, session);
     call->scroll_lock = scroll_lock;
@@ -131,7 +123,6 @@ static void test_mapping_and_inactive_guards(void) {
     assert(!native_input_pointer_button(&input, 1, 1, NATIVE_INPUT_BUTTON_LEFT, true));
     assert(!native_input_pointer_wheel(&input, 1, 1, 120));
     assert(!native_input_key(&input, 0x1e, true, false));
-    assert(!native_input_unicode(&input, 0x0041, true));
     assert(fake_call_count == 0);
 }
 
@@ -148,9 +139,8 @@ static void test_active_sends_values(void) {
     assert(native_input_pointer_wheel(&input, -20, 2000, -120));
     assert(native_input_key(&input, 0x1e, true, false));
     assert(native_input_key(&input, 0x1d, false, true));
-    assert(native_input_unicode(&input, 0x00e9, true));
 
-    assert(fake_call_count == 6);
+    assert(fake_call_count == 5);
 
     assert(fake_calls[0].kind == FAKE_CALL_MOVE);
     assert(fake_calls[0].session == &session);
@@ -181,61 +171,6 @@ static void test_active_sends_values(void) {
     assert(fake_calls[4].scancode == 0x1d);
     assert(!fake_calls[4].down);
     assert(fake_calls[4].extended);
-
-    assert(fake_calls[5].kind == FAKE_CALL_UNICODE);
-    assert(fake_calls[5].session == &session);
-    assert(fake_calls[5].codepoint == 0x00e9);
-    assert(fake_calls[5].down);
-}
-
-static void assert_scancode(uint32_t sdl_scancode, uint8_t expected, bool expected_extended) {
-    uint8_t scancode = 0;
-    bool extended = false;
-    assert(native_input_sdl_scancode_to_rdp(sdl_scancode, &scancode, &extended));
-    assert(scancode == expected);
-    assert(extended == expected_extended);
-}
-
-static void test_keypad_scancode_mapping(void) {
-    /* SDL keypad scancodes run KP_1..KP_9 (89..97) then KP_0 (98). */
-    assert_scancode(89, 0x4f, false); /* KP_1 */
-    assert_scancode(90, 0x50, false); /* KP_2 */
-    assert_scancode(91, 0x51, false); /* KP_3 */
-    assert_scancode(92, 0x4b, false); /* KP_4 */
-    assert_scancode(93, 0x4c, false); /* KP_5 */
-    assert_scancode(94, 0x4d, false); /* KP_6 */
-    assert_scancode(95, 0x47, false); /* KP_7 */
-    assert_scancode(96, 0x48, false); /* KP_8 */
-    assert_scancode(97, 0x49, false); /* KP_9 */
-    assert_scancode(98, 0x52, false); /* KP_0 */
-    assert_scancode(99, 0x53, false); /* KP_period */
-    assert_scancode(83, 0x45, false); /* Num Lock */
-    assert_scancode(84, 0x35, true);  /* KP_divide */
-    assert_scancode(85, 0x37, false); /* KP_multiply */
-    assert_scancode(86, 0x4a, false); /* KP_minus */
-    assert_scancode(87, 0x4e, false); /* KP_plus */
-    assert_scancode(88, 0x1c, true);  /* KP_enter */
-}
-
-static void assert_unmapped(uint32_t sdl_scancode) {
-    uint8_t scancode = 0xa5;
-    bool extended = true;
-    assert(!native_input_sdl_scancode_to_rdp(sdl_scancode, &scancode, &extended));
-}
-
-static void test_webos_pseudo_keys_unmapped(void) {
-    /* LG's webOS SDL delivers TV/Magic Remote pseudo-keys as SDL scancodes in
-     * the 300..511 range: 484/485 are cursor show/hide (observed in live logs
-     * whenever the pointer visibility changes, as key-down-only events with
-     * sym=0), 486 is the remote red key, 480/481 channel up/down, 505 exit.
-     * None of these are keyboard input and none may ever be forwarded to the
-     * RDP server as a keyboard scancode. */
-    for (uint32_t sdl_scancode = 300; sdl_scancode < 512; sdl_scancode++) {
-        assert_unmapped(sdl_scancode);
-    }
-    assert_unmapped(484); /* SDL_WEBOS_SCANCODE_CURSOR_SHOW */
-    assert_unmapped(485); /* SDL_WEBOS_SCANCODE_CURSOR_HIDE */
-    assert_unmapped(486); /* SDL_WEBOS_SCANCODE_RED */
 }
 
 static void test_sync_locks(void) {
@@ -257,45 +192,74 @@ static void test_sync_locks(void) {
     assert(fake_calls[0].caps_lock);
 }
 
-static void test_motion_jump_filter(void) {
-    /* Coarse net: only deltas no physical device produces in one event. */
-    assert(!native_input_motion_is_jump(5, -3));
-    assert(!native_input_motion_is_jump(NATIVE_INPUT_JUMP_ALWAYS_PX, 0));
-    assert(native_input_motion_is_jump(NATIVE_INPUT_JUMP_ALWAYS_PX + 1, 0));
-    assert(native_input_motion_is_jump(-(NATIVE_INPUT_JUMP_ALWAYS_PX + 1), 12));
+static void test_linux_keycode_to_rdp(void) {
+    uint8_t scancode = 0xff;
+    bool extended = true;
 
-    /* Center-jump signature: large delta landing at the window center (1920x1080 -> 960,540). */
-    assert(native_input_motion_is_center_jump(960, 540, 300, -200, 1920, 1080));
-    assert(native_input_motion_is_center_jump(960 + NATIVE_INPUT_CENTER_TOLERANCE_PX, 540,
-                                              NATIVE_INPUT_CENTER_JUMP_MIN_PX, 0, 1920, 1080));
+    /* AT main block (Linux codes 1..88) is identity, not extended. */
+    struct {
+        uint32_t code;
+        uint8_t rdp;
+    } identity[] = {
+        {1, 0x01},  /* KEY_ESC */
+        {2, 0x02},  /* KEY_1 */
+        {28, 0x1c}, /* KEY_ENTER */
+        {30, 0x1e}, /* KEY_A */
+        {57, 0x39}, /* KEY_SPACE */
+        {59, 0x3b}, /* KEY_F1 */
+        {63, 0x3f}, /* KEY_F5 */
+        {76, 0x4c}, /* KEY_KP5 */
+        {86, 0x56}, /* KEY_102ND */
+        {87, 0x57}, /* KEY_F11 */
+        {88, 0x58}, /* KEY_F12 */
+    };
+    for (size_t i = 0; i < sizeof(identity) / sizeof(identity[0]); i++) {
+        scancode = 0xff;
+        extended = true;
+        assert(native_input_linux_keycode_to_rdp(identity[i].code, &scancode, &extended));
+        assert(scancode == identity[i].rdp);
+        assert(!extended);
+    }
 
-    /* A small final delta ending at the center is a legitimate glide, not a warp. */
-    assert(!native_input_motion_is_center_jump(960, 540, NATIVE_INPUT_CENTER_JUMP_MIN_PX - 1, 3,
-                                               1920, 1080));
-    /* A large delta landing away from the center is a legitimate fast move. */
-    assert(!native_input_motion_is_center_jump(700, 540, 300, 0, 1920, 1080));
-    /* Warp coalesced with concurrent movement: lands near (not at) the center with a
-     * delta no real per-event motion reaches. */
-    assert(native_input_motion_is_center_jump(960 + NATIVE_INPUT_CENTER_RADIUS_PX, 540,
-                                              NATIVE_INPUT_CENTER_RADIUS_JUMP_PX, 0, 1920, 1080));
-    assert(!native_input_motion_is_center_jump(960 + NATIVE_INPUT_CENTER_RADIUS_PX + 1, 540,
-                                               NATIVE_INPUT_CENTER_RADIUS_JUMP_PX, 0, 1920, 1080));
-    assert(!native_input_motion_is_center_jump(960 + NATIVE_INPUT_CENTER_RADIUS_PX, 540,
-                                               NATIVE_INPUT_CENTER_RADIUS_JUMP_PX - 1, 0, 1920,
-                                               1080));
-    /* Near-center but small delta stays a legitimate move (tolerance tier needs 40+). */
-    assert(!native_input_motion_is_center_jump(960, 540 + NATIVE_INPUT_CENTER_TOLERANCE_PX + 1,
-                                               NATIVE_INPUT_CENTER_JUMP_MIN_PX, 0, 1920, 1080));
-    /* Degenerate window sizes never match. */
-    assert(!native_input_motion_is_center_jump(0, 0, 300, 0, 0, 0));
+    /* E0-extended keys map via the explicit table. */
+    struct {
+        uint32_t code;
+        uint8_t rdp;
+    } ext[] = {
+        {96, 0x1c},  /* KEY_KPENTER */
+        {97, 0x1d},  /* KEY_RIGHTCTRL */
+        {98, 0x35},  /* KEY_KPSLASH */
+        {100, 0x38}, /* KEY_RIGHTALT */
+        {102, 0x47}, /* KEY_HOME */
+        {103, 0x48}, /* KEY_UP */
+        {105, 0x4b}, /* KEY_LEFT */
+        {106, 0x4d}, /* KEY_RIGHT */
+        {108, 0x50}, /* KEY_DOWN */
+        {110, 0x52}, /* KEY_INSERT */
+        {111, 0x53}, /* KEY_DELETE */
+        {125, 0x5b}, /* KEY_LEFTMETA */
+        {127, 0x5d}, /* KEY_COMPOSE (Menu) */
+    };
+    for (size_t i = 0; i < sizeof(ext) / sizeof(ext[0]); i++) {
+        scancode = 0xff;
+        extended = false;
+        assert(native_input_linux_keycode_to_rdp(ext[i].code, &scancode, &extended));
+        assert(scancode == ext[i].rdp);
+        assert(extended);
+    }
+
+    /* Codes with no RDP scancode: code 0, the extended-range gap (101 = KEY_LINEFEED,
+     * 119 = KEY_PAUSE), and media/consumer keys above the table. */
+    assert(!native_input_linux_keycode_to_rdp(0, &scancode, &extended));
+    assert(!native_input_linux_keycode_to_rdp(101, &scancode, &extended));
+    assert(!native_input_linux_keycode_to_rdp(119, &scancode, &extended));
+    assert(!native_input_linux_keycode_to_rdp(240, &scancode, &extended));
 }
 
 int main(void) {
     test_mapping_and_inactive_guards();
     test_active_sends_values();
-    test_keypad_scancode_mapping();
-    test_webos_pseudo_keys_unmapped();
     test_sync_locks();
-    test_motion_jump_filter();
+    test_linux_keycode_to_rdp();
     return 0;
 }

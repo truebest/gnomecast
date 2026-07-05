@@ -26,7 +26,7 @@ Example shape:
 ```
 
 The pre-connect UI saves the last successful Connect settings, including address,
-username, domain, password, FPS, and mouse mode, into the app writable SDL preferences directory.
+username, domain, password, and FPS, into the app writable SDL preferences directory.
 Those saved settings are loaded on the next start, and explicit webOS launch params or
 CLI flags override them. Set `HELLOLG_IGNORE_SAVED_CONFIG=1` for a one-off launch that
 ignores saved UI settings.
@@ -96,7 +96,7 @@ ARES_DEVICE=<tv-device> HELLOLG_NATIVE_CONFIG=native/config.local.json \
 `tools/deploy-native-webos.sh` installs the latest IPK, reads the host-side config file,
 and sends supported fields
 with `ares-launch --params` without printing the generated JSON. The native app opens a
-pre-connect UI where address, username, domain, password, and mouse mode can be edited before
+pre-connect UI where address, username, domain, and password can be edited before
 pressing Connect. The UI exposes a `30/60 FPS` selector. The local SDL graphics/UI surface is
 fixed at 1920x1080 (webOS always scales this virtual canvas to the panel; the video decoder
 plane runs at the server's real resolution independently, so a larger local surface has no
@@ -134,8 +134,9 @@ native executable and native `appinfo.json`; package verification rejects browse
   need per-tick presents and re-introduce the flicker above. Check the log for
   `[native-cursor] server cursor WxH ...` on connect; `[native-cursor] color cursor
   unavailable: ...` means the webOS SDL port refused color cursors and the client stays on
-  the default arrow. In relative-mouse (Magic Remote) mode the system cursor is hidden by
-  SDL, so server shapes only show with a real (absolute) mouse.
+  the default arrow. The mouse is read from grabbed `/dev/input` (evdev) and the cursor is
+  driven by warping the OS pointer to the logical position, so server shapes ride the real
+  pointer; visibility follows the server's pointer state alone.
 - Video track loads (`NDL_DirectMediaLoad(video=1 ...)`) but `LoadCallback
   STATE_UPDATE_LOADCOMPLETED/PLAYING` never follow while `[native-video] fed N AUs` keeps
   growing → the server is streaming at a resolution the TV's hardware pipeline cannot
@@ -149,11 +150,6 @@ native executable and native `appinfo.json`; package verification rejects browse
 - Decoder/render failures should surface as `DecoderError` and must not fall back to
   MSE, WebCodecs, RDCleanPath, or browser rendering.
 - Input issues: run `ctest --test-dir /tmp/gnomecast-native-build-tests -R input-sdl --output-on-failure`.
-- Known webOS platform limitation: the TV delivers no SDL event at all for keypad-5
-  (SDL scancode 93) or NumLock (83) from an attached keyboard — both are consumed at the
-  system level before the app (verified live: all neighbouring keypad keys arrive, those
-  two never do, with unmapped-key logging enabled). Not fixable client-side; use the
-  top-row 5. Other keyboards may behave differently.
 
 ## Current Status
 

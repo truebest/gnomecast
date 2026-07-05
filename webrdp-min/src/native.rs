@@ -894,6 +894,11 @@ struct NativeWorker {
         Option<Box<ironrdp_connector::connection_activation::ConnectionActivationSequence>>,
     next_pts90k: u64,
     frame_pts_step: u64,
+    // Input events drained off the channel by poll_stop while the worker is busy (notably
+    // mid-session Deactivate-Reactivate) and not yet dispatched. run_active clears this on
+    // entry so pre-connect events are discarded, but events buffered during reactivation
+    // survive to the next drain_input rather than being lost (a dropped release would stick).
+    pending_input: Vec<InputCommand>,
 }
 
 impl NativeWorker {
@@ -914,6 +919,7 @@ impl NativeWorker {
             reactivation: None,
             next_pts90k: 0,
             frame_pts_step: 90_000 / fps,
+            pending_input: Vec::new(),
         }
     }
 
@@ -949,9 +955,14 @@ impl NativeWorker {
         self.inbuf.clear();
         self.reactivation = None;
         self.next_pts90k = 0;
+        self.pending_input.clear();
         if let Ok(mut shared) = self.gfx.lock() {
             *shared = NativeGfxState::default();
         }
+        // A silent in-worker reconnect bypasses the C session-teardown path that restores
+        // the default cursor, so a pointer the old session left hidden or custom-shaped would
+        // leak into the new one until the server next changes it. Reset it to default+visible.
+        self.callbacks.pointer_state(RDP_POINTER_STATE_DEFAULT);
     }
 
     fn run_session(&mut self) -> Result<(), NativeError> {
@@ -1275,6 +1286,11 @@ impl NativeWorker {
         let mut active = ActiveStage::new(result);
         let mut image = DecodedImage::new(PixelFormat::RgbA32, desktop_w, desktop_h);
 
+        // Discard any input poll_stop buffered during the pre-connect phase; the C side does
+        // not send input until the session is active, so this is normally empty, and replaying
+        // stale pre-connect events into a fresh session would be wrong.
+        self.pending_input.clear();
+
         loop {
             if self.stop.load(Ordering::SeqCst) {
                 return Ok(());
@@ -1336,7 +1352,15 @@ impl NativeWorker {
                             }
                         }
                         ActiveStageOutput::PointerBitmap(pointer) => {
-                            self.callbacks.pointer_bitmap(&pointer);
+                            // A zero-dimension shape is IronRDP's decoded form of an
+                            // "invisible" server pointer (DecodedPointer::new_invisible); the
+                            // C side rejects empty bitmaps, so translate it to a hide request
+                            // rather than dropping it and leaving the cursor visible.
+                            if pointer.width == 0 || pointer.height == 0 {
+                                self.callbacks.pointer_state(RDP_POINTER_STATE_HIDDEN);
+                            } else {
+                                self.callbacks.pointer_bitmap(&pointer);
+                            }
                         }
                         ActiveStageOutput::PointerPosition { x, y } => {
                             self.callbacks.pointer_position(x, y);
@@ -1368,12 +1392,38 @@ impl NativeWorker {
         }
     }
 
+    fn dispatch_input(
+        &mut self,
+        tls: &mut rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
+        active: &mut ActiveStage,
+        image: &mut DecodedImage,
+        input: InputCommand,
+    ) -> Result<(), NativeError> {
+        let events = input.into_events();
+        let outputs = active
+            .process_fastpath_input(image, &events)
+            .map_err(|e| NativeError::protocol(format!("fast-path input: {e}")))?;
+        for output in outputs {
+            if let ActiveStageOutput::ResponseFrame(frame) = output {
+                self.write_all(tls, &frame, "fast-path input")?;
+            }
+        }
+        Ok(())
+    }
+
     fn drain_input(
         &mut self,
         tls: &mut rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
         active: &mut ActiveStage,
         image: &mut DecodedImage,
     ) -> Result<(), NativeError> {
+        // Replay anything poll_stop buffered while the worker was busy (e.g. during
+        // reactivation) before draining fresh events, preserving order.
+        if !self.pending_input.is_empty() {
+            for input in std::mem::take(&mut self.pending_input) {
+                self.dispatch_input(tls, active, image, input)?;
+            }
+        }
         loop {
             match self.rx.try_recv() {
                 Ok(WorkerCommand::Stop) => {
@@ -1381,15 +1431,7 @@ impl NativeWorker {
                     return Ok(());
                 }
                 Ok(WorkerCommand::Input(input)) => {
-                    let events = input.into_events();
-                    let outputs = active
-                        .process_fastpath_input(image, &events)
-                        .map_err(|e| NativeError::protocol(format!("fast-path input: {e}")))?;
-                    for output in outputs {
-                        if let ActiveStageOutput::ResponseFrame(frame) = output {
-                            self.write_all(tls, &frame, "fast-path input")?;
-                        }
-                    }
+                    self.dispatch_input(tls, active, image, input)?
                 }
                 Err(TryRecvError::Empty) => return Ok(()),
                 Err(TryRecvError::Disconnected) => {
@@ -1607,9 +1649,24 @@ impl NativeWorker {
                     self.stop.store(true, Ordering::SeqCst);
                     return true;
                 }
-                Ok(WorkerCommand::Input(_)) => {
-                    // Input is only meaningful once ActiveStage exists. Drop pre-active events so
-                    // the SDL thread never blocks while the protocol is still connecting.
+                Ok(WorkerCommand::Input(input)) => {
+                    // Draining keeps the SDL thread from blocking on a full channel while the
+                    // worker is busy. Buffer the events instead of dropping them: pre-connect
+                    // this buffer is cleared when run_active starts, but during an in-session
+                    // Deactivate-Reactivate ActiveStage still exists and a dropped button/key
+                    // release would stick — the next drain_input replays what is buffered here.
+                    // Consecutive pointer moves coalesce (idempotent) so a fast pointer cannot
+                    // grow the buffer without bound.
+                    match (self.pending_input.last_mut(), &input) {
+                        (
+                            Some(InputCommand::PointerMove { x, y }),
+                            InputCommand::PointerMove { x: nx, y: ny },
+                        ) => {
+                            *x = *nx;
+                            *y = *ny;
+                        }
+                        _ => self.pending_input.push(input),
+                    }
                 }
                 Err(TryRecvError::Empty) => return false,
                 Err(TryRecvError::Disconnected) => {
@@ -1682,7 +1739,20 @@ fn enqueue(session: *mut RdpSession, input: InputCommand) {
         return;
     };
     match session.tx.try_send(WorkerCommand::Input(input)) {
-        Ok(()) | Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {}
+        Ok(()) => {}
+        // The receiver is gone (worker stopped); nothing to deliver to.
+        Err(TrySendError::Disconnected(_)) => {}
+        Err(TrySendError::Full(cmd)) => {
+            // Pointer moves are idempotent — only the latest position matters — so dropping
+            // one under backpressure is correct and avoids a stale backlog. Every other
+            // event is state-changing: silently dropping a button-up / key-up would leave
+            // the server with a stuck button (phantom drag) or an auto-repeating key. Fall
+            // back to a blocking send for those; it is bounded — the worker either drains a
+            // slot or drops the receiver on stop / write-timeout, which unblocks with Err.
+            if !matches!(cmd, WorkerCommand::Input(InputCommand::PointerMove { .. })) {
+                let _ = session.tx.send(cmd);
+            }
+        }
     }
 }
 

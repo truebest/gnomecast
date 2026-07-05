@@ -26,6 +26,12 @@
 #endif
 
 #include "cursor_sdl.h"
+#if defined(HELLOLG_WITH_EVDEV_MOUSE) && HELLOLG_WITH_EVDEV_MOUSE
+#include "mouse_evdev.h"
+#endif
+#if defined(HELLOLG_WITH_EVDEV_KEYBOARD) && HELLOLG_WITH_EVDEV_KEYBOARD
+#include "keyboard_evdev.h"
+#endif
 #include "input_sdl.h"
 #include "rdp_ffi.h"
 #if defined(HELLOLG_WITH_PRECONNECT_UI) && HELLOLG_WITH_PRECONNECT_UI
@@ -68,9 +74,6 @@ typedef struct NativeConfig {
     uint16_t wheel_step;
     uint16_t wheel_scroll_divisor;
     uint16_t audio_prebuffer_ms;
-    bool relative_mouse;
-    /* Drop synthetic pointer jumps (webOS IME recenter warps); see input_sdl.h. */
-    bool jump_filter;
 } NativeConfig;
 
 typedef struct App {
@@ -93,6 +96,16 @@ typedef struct App {
     /* Server-driven cursor shapes/visibility; submitted from the RDP worker thread,
      * applied to the SDL cursor on the SDL thread (native_cursor_apply each loop tick). */
     NativeCursor cursor;
+#if defined(HELLOLG_WITH_EVDEV_MOUSE) && HELLOLG_WITH_EVDEV_MOUSE
+    /* Raw evdev mouse reader (active during streaming); its background thread posts events
+     * that the SDL loop drains. */
+    NativeMouseEvdev mouse_evdev;
+#endif
+#if defined(HELLOLG_WITH_EVDEV_KEYBOARD) && HELLOLG_WITH_EVDEV_KEYBOARD
+    /* Raw evdev keyboard reader (active during streaming); grabs the USB keyboard below the
+     * compositor so every scancode reaches RDP, and the SDL loop drains its queue. */
+    NativeKeyboardEvdev keyboard_evdev;
+#endif
     uint16_t desktop_width;
     uint16_t desktop_height;
     uint16_t target_fps;
@@ -111,15 +124,13 @@ typedef struct App {
     atomic_int terminal_state;
     bool interactive_ui;
 #if defined(HELLOLG_WITH_SDL) && HELLOLG_WITH_SDL
-    bool suppress_next_ascii_text;
-    uint32_t suppress_ascii_text_until;
     uint16_t wheel_step;
     uint16_t wheel_scroll_divisor;
     int wheel_accumulator;
-    /* Only ever written by the SDL thread (mouse motion/button handlers, and the
-     * pointer-clamp drain below), so plain last-writer-wins races with a second writer
-     * can't happen; atomic only for torn-access safety against the RDP worker thread's
-     * reads via native_send_scaled_wheel()/native_update_pointer_window_size(). */
+    /* Only ever written by the SDL thread (the evdev mouse drain and the pointer-clamp/warp
+     * drains below), so plain last-writer-wins races with a second writer can't happen;
+     * atomic only for torn-access safety against the RDP worker thread's reads via
+     * native_send_scaled_wheel()/native_update_pointer_window_size(). */
     atomic_int virtual_mouse_x;
     atomic_int virtual_mouse_y;
     /* Set by the RDP worker thread (on_desktop_size, on a RDPGFX_RESET_GRAPHICS_PDU) to ask
@@ -127,25 +138,32 @@ typedef struct App {
      * loop tick, keeping the SDL thread the sole writer of virtual_mouse_x/y. */
     atomic_bool pointer_clamp_pending;
     /* Server-initiated pointer warp (on_pointer_position, RDP worker thread) in desktop
-     * coordinates; the SDL thread warps the real mouse on its next tick so it stays the
-     * sole writer of virtual_mouse_x/y. */
+     * coordinates; the SDL thread repositions virtual_mouse_x/y and warps the real mouse on
+     * its next tick so it stays the sole writer of virtual_mouse_x/y. */
     atomic_bool pointer_warp_pending;
     atomic_uint pointer_warp_x;
     atomic_uint pointer_warp_y;
-    /* Recenter-jump protection (SDL thread only): the webOS compositor warps the pointer
-     * to the screen center around IME show/hide, which lands as one giant motion event
-     * at (or, coalesced with concurrent movement, near) the center — filtered by that
-     * signature (input_sdl.h). Our own SDL_WarpMouseInWindow echoes are recognized by
-     * their exact target coordinates, NOT by "next motion event": with a moving mouse,
-     * queued real events arrive before the echo and must still be filtered. */
-    int expect_warp_x;
-    int expect_warp_y;
-    uint32_t expect_warp_deadline; /* SDL ticks; 0 = no pending warp echo */
     atomic_uint render_width;
     atomic_uint render_height;
-    bool relative_mouse;
-    bool relative_mouse_active;
-    bool jump_filter;
+    /* SDL thread only. Set true on window FOCUS_LOST (a remote-invoked webOS overlay such as
+     * the TV menu steals focus without backgrounding the app); while set, the evdev grabs are
+     * released and the SDL pointer fallback is ignored so input drives the overlay, not RDP.
+     * Zero-initialised, i.e. focused. */
+    bool window_unfocused;
+    /* SDL thread only. Set on focus regain: a webOS overlay leaves the platform cursor hidden,
+     * and because we grab the mouse the compositor never sees the pointer activity that would
+     * auto-re-show it — and a bare visibility call at focus-gain (no pointer movement, e.g. the
+     * menu was closed with Esc) does not always take. So we also re-assert the cursor on the
+     * first real mouse movement after regaining focus, when the visibility call coincides with
+     * genuine activity. One-shot. */
+    bool cursor_reassert_pending;
+    /* SDL thread only. Which inputs we have forwarded a down for but not yet an up, so their
+     * releases can be flushed to the server before the evdev grab is dropped on focus loss —
+     * otherwise the up goes to the overlay, not RDP, leaving a stuck drag or auto-repeating
+     * key. held_mouse is indexed by NativeInputButton-1 (LEFT/RIGHT/MIDDLE); held_keys is a
+     * bitset over scancode | (extended ? 0x100 : 0). */
+    bool held_mouse[3];
+    uint8_t held_keys[64];
     /* Set (under video_lock) by RDP worker-thread callbacks that need to drop the RGBA
      * surface's SDL texture but don't own the renderer's thread; drained and actually
      * destroyed on the SDL thread in native_present_rgba_frame()/native_stop_rdp(). */
@@ -186,7 +204,6 @@ static void native_config_defaults(NativeConfig *config) {
     config->wheel_step = NATIVE_WHEEL_STEP_DEFAULT;
     config->wheel_scroll_divisor = NATIVE_WHEEL_SCROLL_DIVISOR_DEFAULT;
     config->audio_prebuffer_ms = NATIVE_AUDIO_PREBUFFER_MS_DEFAULT;
-    config->jump_filter = true;
 }
 
 static void native_prepare_webos_environment(void) {
@@ -226,7 +243,12 @@ static int native_prepare_sdl_runtime(void) {
 
     SDL_SetHint("SDL_WEBOS_ACCESS_POLICY_KEYS_BACK", "true");
     SDL_SetHint("SDL_WEBOS_ACCESS_POLICY_KEYS_EXIT", "true");
-    SDL_SetHint("SDL_WEBOS_CURSOR_SLEEP_TIME", "5000");
+    /* LSM's pointer auto-hide (mrcu standby) timer. moonlight-tv uses 5000ms because the
+     * game host draws its own cursor; for a remote desktop the pointer must not vanish —
+     * once LSM detaches it, motion and button events stop being delivered entirely and
+     * only wheel/keyboard input can re-summon it. Effectively disable the auto-hide;
+     * hide-while-typing still works via the explicit SDL_webOSCursorVisibility calls. */
+    SDL_SetHint("SDL_WEBOS_CURSOR_SLEEP_TIME", "86400000");
     SDL_SetHint("SDL_WEBOS_CURSOR_FREQUENCY", "60");
     SDL_SetHint("SDL_WEBOS_CURSOR_CALIBRATION_DISABLE", "true");
     SDL_SetHint("SDL_WEBOS_HIDAPI_IGNORE_BLUETOOTH_DEVICES", "0x057e/0x0000");
@@ -325,10 +347,15 @@ static int json_read_string(const char *json, const char *key, char *out, size_t
                 ch = '\t';
                 break;
             case 'u': {
+                /* Read the four hex digits left to right, stopping at the first non-hex
+                 * character. hex_value('\0') is negative, so a string ending inside the
+                 * escape (e.g. "\u" or "\u0") short-circuits before p[1..3] are touched —
+                 * argv-backed launch-parameter strings have no trailing slack bytes, so an
+                 * unconditional p[1..3] read there is out of bounds. */
                 int h0 = hex_value(p[0]);
-                int h1 = hex_value(p[1]);
-                int h2 = hex_value(p[2]);
-                int h3 = hex_value(p[3]);
+                int h1 = h0 < 0 ? -1 : hex_value(p[1]);
+                int h2 = h1 < 0 ? -1 : hex_value(p[2]);
+                int h3 = h2 < 0 ? -1 : hex_value(p[3]);
                 if (h0 != 0 || h1 != 0 || h2 < 0 || h3 < 0) {
                     return -1;
                 }
@@ -407,19 +434,6 @@ static bool apply_json_u16(const char *json, const char *key, uint16_t min_value
     return true;
 }
 
-static bool apply_json_bool(const char *json, const char *key, bool *dest) {
-    bool value = false;
-    int result = json_read_bool(json, key, &value);
-    if (result < 0) {
-        fprintf(stderr, "[native] invalid boolean value for config field %s\n", key);
-        return false;
-    }
-    if (result > 0) {
-        *dest = value;
-    }
-    return true;
-}
-
 static bool native_config_load_json(NativeConfig *config, const char *json) {
     if (!(apply_json_string(json, "host", config->host, sizeof(config->host)) &&
           apply_json_string(json, "username", config->username, sizeof(config->username)) &&
@@ -431,9 +445,7 @@ static bool native_config_load_json(NativeConfig *config, const char *json) {
           apply_json_u16(json, "fps", 1, 240, &config->fps) &&
           apply_json_u16(json, "wheelStep", 1, 120, &config->wheel_step) &&
           apply_json_u16(json, "wheelScrollDivisor", 1, 120, &config->wheel_scroll_divisor) &&
-          apply_json_u16(json, "audioPrebufferMs", 0, 1000, &config->audio_prebuffer_ms) &&
-          apply_json_bool(json, "relativeMouse", &config->relative_mouse) &&
-          apply_json_bool(json, "jumpFilter", &config->jump_filter))) {
+          apply_json_u16(json, "audioPrebufferMs", 0, 1000, &config->audio_prebuffer_ms))) {
         return false;
     }
     return true;
@@ -441,7 +453,7 @@ static bool native_config_load_json(NativeConfig *config, const char *json) {
 
 static bool native_config_json_has_rdp_key(const char *json) {
     static const char *keys[] = {"host", "username", "password", "domain", "port", "width", "height", "fps",
-                                 "wheelStep", "wheelScrollDivisor", "audioPrebufferMs", "relativeMouse", "jumpFilter"};
+                                 "wheelStep", "wheelScrollDivisor", "audioPrebufferMs"};
     for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
         if (json_find_value(json, keys[i])) {
             return true;
@@ -597,10 +609,9 @@ static bool native_config_save_json_file(const NativeConfig *config, const char 
               native_config_write_json_string(file, config->domain) &&
               fprintf(file,
                       ",\n  \"fps\": %u,\n  \"wheelStep\": %u,\n  "
-                      "\"wheelScrollDivisor\": %u,\n  \"audioPrebufferMs\": %u,\n  \"relativeMouse\": %s,\n  \"jumpFilter\": %s\n}\n",
+                      "\"wheelScrollDivisor\": %u,\n  \"audioPrebufferMs\": %u\n}\n",
                       (unsigned)config->fps, (unsigned)config->wheel_step, (unsigned)config->wheel_scroll_divisor,
-                      (unsigned)config->audio_prebuffer_ms, config->relative_mouse ? "true" : "false",
-                      config->jump_filter ? "true" : "false") >= 0;
+                      (unsigned)config->audio_prebuffer_ms) >= 0;
 
     if (fclose(file) != 0) {
         ok = false;
@@ -784,15 +795,6 @@ static bool arg_exists(int argc, char **argv, const char *name) {
     return arg_value(argc, argv, name, NULL) != NULL;
 }
 
-static bool arg_flag_exists(int argc, char **argv, const char *name) {
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], name) == 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
 static bool apply_cli_string(int argc, char **argv, const char *arg_name, char *dest, size_t cap, const char *field) {
     const char *value = arg_value(argc, argv, arg_name, NULL);
     if (!value) {
@@ -830,18 +832,6 @@ static bool apply_cli_u16(int argc, char **argv, const char *arg_name, uint16_t 
 }
 
 static bool native_config_apply_cli(NativeConfig *config, int argc, char **argv) {
-    if (arg_flag_exists(argc, argv, "--relative-mouse")) {
-        config->relative_mouse = true;
-    }
-    if (arg_flag_exists(argc, argv, "--absolute-mouse")) {
-        config->relative_mouse = false;
-    }
-    if (arg_flag_exists(argc, argv, "--jump-filter")) {
-        config->jump_filter = true;
-    }
-    if (arg_flag_exists(argc, argv, "--no-jump-filter")) {
-        config->jump_filter = false;
-    }
     if (!(apply_cli_string(argc, argv, "--host", config->host, sizeof(config->host), "host") &&
           apply_cli_string(argc, argv, "--user", config->username, sizeof(config->username), "username") &&
           apply_cli_string(argc, argv, "--username", config->username, sizeof(config->username), "username") &&
@@ -917,8 +907,6 @@ static void native_config_log_effective(const NativeConfig *config) {
             config->password[0] ? "set" : "missing", config->domain[0] ? "set" : "empty", (unsigned)config->width,
             (unsigned)config->height, (unsigned)config->fps, (unsigned)config->wheel_step,
             (unsigned)config->wheel_scroll_divisor, (unsigned)config->audio_prebuffer_ms);
-    fprintf(stderr, "[native] effective mouse mode=%s jumpFilter=%s\n",
-            config->relative_mouse ? "relative" : "absolute", config->jump_filter ? "on" : "off");
 }
 
 static const char *rdp_state_name(RdpState state) {
@@ -1366,6 +1354,14 @@ static void native_stop_rdp(App *app) {
     if (!app) {
         return;
     }
+#if defined(HELLOLG_WITH_EVDEV_MOUSE) && HELLOLG_WITH_EVDEV_MOUSE
+    /* Release the mouse grab so the preconnect UI (or the next session) gets SDL mouse. */
+    native_mouse_evdev_stop(&app->mouse_evdev);
+#endif
+#if defined(HELLOLG_WITH_EVDEV_KEYBOARD) && HELLOLG_WITH_EVDEV_KEYBOARD
+    /* Release the keyboard grab so the compositor/preconnect UI gets the USB keyboard back. */
+    native_keyboard_evdev_stop(&app->keyboard_evdev);
+#endif
     native_input_set_active(&app->input, false);
     native_input_set_session(&app->input, NULL);
     if (app->rdp) {
@@ -1410,10 +1406,6 @@ static bool native_start_rdp(App *app, const NativeConfig *native_config, const 
     app->password_for_redaction = native_config->password;
     uint16_t window_width = (uint16_t)atomic_load(&app->input.window_width);
     uint16_t window_height = (uint16_t)atomic_load(&app->input.window_height);
-#if defined(HELLOLG_WITH_SDL) && HELLOLG_WITH_SDL
-    app->relative_mouse = native_config->relative_mouse;
-    app->jump_filter = native_config->jump_filter;
-#endif
     atomic_store(&app->exit_code, 0);
     atomic_store(&app->session_failed, false);
     atomic_store(&app->terminal_state, (int)RDP_STATE_IDLE);
@@ -1580,40 +1572,8 @@ static void native_drain_pointer_clamp(App *app) {
     }
 }
 
-/* Register the target of an SDL_WarpMouseInWindow we are about to issue; only a motion
- * event landing on those exact coordinates is treated as its echo and skips the filter. */
-static void native_expect_warp_echo(App *app, int x, int y) {
-    app->expect_warp_x = x;
-    app->expect_warp_y = y;
-    app->expect_warp_deadline = SDL_GetTicks() + 250u;
-}
-
-static bool native_consume_warp_echo(App *app, int x, int y) {
-    if (app->expect_warp_deadline == 0) {
-        return false;
-    }
-    if (SDL_TICKS_PASSED(SDL_GetTicks(), app->expect_warp_deadline)) {
-        /* A warp to the current position produces no motion event; expire the marker. */
-        app->expect_warp_deadline = 0;
-        return false;
-    }
-    int dx = x - app->expect_warp_x;
-    int dy = y - app->expect_warp_y;
-    if (dx >= -NATIVE_INPUT_CENTER_TOLERANCE_PX && dx <= NATIVE_INPUT_CENTER_TOLERANCE_PX &&
-        dy >= -NATIVE_INPUT_CENTER_TOLERANCE_PX && dy <= NATIVE_INPUT_CENTER_TOLERANCE_PX) {
-        app->expect_warp_deadline = 0;
-        return true;
-    }
-    return false;
-}
-
 static void native_drain_pointer_warp(App *app, SDL_Window *window) {
     if (!app || !window || !atomic_exchange(&app->pointer_warp_pending, false)) {
-        return;
-    }
-    if (app->relative_mouse_active) {
-        /* The virtual mouse owns the position in relative mode; a warp of the real
-         * (hidden) pointer would only desync the accumulated deltas. */
         return;
     }
     uint16_t dw = (uint16_t)atomic_load(&app->input.desktop_width);
@@ -1624,21 +1584,12 @@ static void native_drain_pointer_warp(App *app, SDL_Window *window) {
     unsigned y = atomic_load(&app->pointer_warp_y);
     int wx = (dw != 0 && ww != 0) ? (int)((x * (unsigned)ww) / (unsigned)dw) : (int)x;
     int wy = (dh != 0 && wh != 0) ? (int)((y * (unsigned)wh) / (unsigned)dh) : (int)y;
-    /* The synthetic SDL_MOUSEMOTION from the warp updates virtual_mouse_x/y and echoes
-     * the position to the server through the regular pointer-move path. */
-    native_expect_warp_echo(app, wx, wy);
+    /* The mouse is read from grabbed evdev, so there is no SDL_MOUSEMOTION echo to update
+     * virtual_mouse_x/y after the warp. Set it to the warp target directly so the next
+     * relative delta integrates from here (otherwise the first move snaps the cursor back),
+     * then warp the real pointer so the server cursor on the platform plane follows. */
+    native_set_virtual_mouse_position(app, wx, wy);
     SDL_WarpMouseInWindow(window, wx, wy);
-}
-
-static void native_log_dropped_motion_jump(int dx, int dy, bool center) {
-    static unsigned log_count = 0;
-    if (log_count < 16) {
-        fprintf(stderr, "[native-input] dropped pointer jump dx=%d dy=%d center=%d\n", dx, dy,
-                center ? 1 : 0);
-    } else if (log_count == 16) {
-        fprintf(stderr, "[native-input] further pointer jump logs suppressed\n");
-    }
-    log_count++;
 }
 
 /* Apply pending server cursor shape/visibility on the SDL thread (cheap when idle). */
@@ -1677,32 +1628,6 @@ static bool native_init_render_state(App *app, SDL_Window *window, SDL_Renderer 
 
 static NativeInputButton native_button_from_sdl(uint8_t button);
 
-static void native_log_webos_cursor_visibility(bool visible, int result) {
-    static unsigned log_count = 0;
-    if (log_count < 16) {
-        if (result == 0) {
-            fprintf(stderr, "[native-input] webOS cursor visibility=%d\n", visible ? 1 : 0);
-        } else {
-            fprintf(stderr, "[native-input] SDL_webOSCursorVisibility(%d) failed: %s\n", visible ? 1 : 0, SDL_GetError());
-        }
-    } else if (log_count == 16) {
-        fprintf(stderr, "[native-input] further webOS cursor visibility logs suppressed\n");
-    }
-    log_count++;
-}
-
-static bool native_sdl_key_is_webos_cursor_event(const SDL_KeyboardEvent *event) {
-    if (!event) {
-        return false;
-    }
-#if HELLOLG_HAVE_SDL_WEBOS_CURSOR
-    return event->keysym.scancode == SDL_WEBOS_SCANCODE_CURSOR_SHOW ||
-           event->keysym.scancode == SDL_WEBOS_SCANCODE_CURSOR_HIDE;
-#else
-    return event->keysym.scancode == 484 || event->keysym.scancode == 485;
-#endif
-}
-
 static bool native_sdl_key_is_webos_red_event(const SDL_KeyboardEvent *event) {
     if (!event) {
         return false;
@@ -1733,25 +1658,6 @@ static int native_filter_webos_red_key(void *userdata, SDL_Event *event) {
         (void)native_handle_webos_red_key(app, &event->key);
     }
     return 0;
-}
-
-static void native_hide_webos_cursor_for_key(SDL_Window *window, const SDL_KeyboardEvent *event) {
-    if (!event || event->type != SDL_KEYDOWN || native_sdl_key_is_webos_cursor_event(event)) {
-        return;
-    }
-    if (window && SDL_IsScreenKeyboardShown(window)) {
-        return;
-    }
-#if HELLOLG_HAVE_SDL_WEBOS_CURSOR
-    int result = SDL_webOSCursorVisibility(SDL_FALSE);
-    native_log_webos_cursor_visibility(false, result);
-#else
-    static bool logged = false;
-    if (!logged) {
-        fprintf(stderr, "[native-input] SDL_webOSCursorVisibility is not available in this SDL build\n");
-        logged = true;
-    }
-#endif
 }
 
 static void native_send_scaled_wheel(App *app, int wheel_y) {
@@ -1807,21 +1713,6 @@ static void native_init_virtual_mouse_position(App *app) {
                                        (int)atomic_load(&app->input.window_height) / 2);
 }
 
-static void native_set_streaming_mouse_mode(App *app, bool enabled) {
-    if (!app) {
-        return;
-    }
-    SDL_bool relative = enabled && app->relative_mouse ? SDL_TRUE : SDL_FALSE;
-    app->relative_mouse_active = false;
-    if (SDL_SetRelativeMouseMode(relative) != 0) {
-        fprintf(stderr, "[native-input] SDL_SetRelativeMouseMode(%d) failed: %s\n", relative == SDL_TRUE ? 1 : 0,
-                SDL_GetError());
-    } else {
-        app->relative_mouse_active = relative == SDL_TRUE;
-        fprintf(stderr, "[native-input] mouse mode=%s\n", relative == SDL_TRUE ? "relative" : "absolute");
-    }
-}
-
 static NativeInputButton native_button_from_sdl(uint8_t button) {
     switch (button) {
     case SDL_BUTTON_LEFT:
@@ -1835,45 +1726,116 @@ static NativeInputButton native_button_from_sdl(uint8_t button) {
     }
 }
 
-static bool sdl_text_is_ascii_printable(const char *text) {
-    if (!text || !text[0]) {
-        return false;
+/* Track which mouse buttons / key scancodes we have sent a down for but not yet an up, so
+ * native_flush_held_inputs() can release them to the server before the evdev grab is dropped
+ * on focus loss. Called right after each forwarded button/key event (evdev drains and the SDL
+ * fallback). SDL thread only. */
+static void native_track_button(App *app, NativeInputButton button, bool down) {
+    if (app && button >= NATIVE_INPUT_BUTTON_LEFT && button <= NATIVE_INPUT_BUTTON_MIDDLE) {
+        app->held_mouse[button - 1] = down;
     }
-    for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
-        if (*p < 32 || *p > 126) {
-            return false;
+}
+
+static void native_track_key(App *app, uint8_t scancode, bool extended, bool down) {
+    if (!app) {
+        return;
+    }
+    unsigned idx = (unsigned)scancode | (extended ? 0x100u : 0u);
+    if (down) {
+        app->held_keys[idx / 8u] |= (uint8_t)(1u << (idx % 8u));
+    } else {
+        app->held_keys[idx / 8u] &= (uint8_t) ~(1u << (idx % 8u));
+    }
+}
+
+/* Send an up for every input still held down, so a focus loss mid-press does not strand the
+ * server in a drag or an auto-repeating key once we release the grab. Runs on the SDL thread
+ * while the session is still active (focus loss / background, not session teardown). */
+static void native_flush_held_inputs(App *app) {
+    if (!app) {
+        return;
+    }
+    int wx = atomic_load(&app->virtual_mouse_x);
+    int wy = atomic_load(&app->virtual_mouse_y);
+    for (int b = 0; b < 3; b++) {
+        if (app->held_mouse[b]) {
+            app->held_mouse[b] = false;
+            native_input_pointer_button(&app->input, wx, wy, (NativeInputButton)(b + 1), false);
         }
     }
-    return true;
+    for (unsigned idx = 0; idx < 512u; idx++) {
+        if (app->held_keys[idx / 8u] & (uint8_t)(1u << (idx % 8u))) {
+            app->held_keys[idx / 8u] &= (uint8_t) ~(1u << (idx % 8u));
+            native_input_key(&app->input, (uint8_t)(idx & 0xffu), false, (idx & 0x100u) != 0u);
+        }
+    }
 }
 
-static bool sdl_key_is_plain_printable(const SDL_KeyboardEvent *event) {
-    if (!event || event->type != SDL_KEYDOWN || (event->keysym.mod & (KMOD_CTRL | KMOD_ALT | KMOD_GUI)) != 0) {
-        return false;
+#if defined(HELLOLG_WITH_EVDEV_MOUSE) && HELLOLG_WITH_EVDEV_MOUSE
+/* SDL thread: apply queued raw-evdev mouse events. Relative motion is integrated into the
+ * logical pointer and sent as an absolute server position; buttons/wheel are sent at the
+ * current position. Because the mouse is grabbed, the compositor no longer moves the OS
+ * pointer, so we warp it to the logical position to make the server cursor (drawn on the
+ * platform cursor plane) follow. */
+static void native_drain_evdev_mouse(App *app, SDL_Window *window) {
+    if (!native_mouse_evdev_active(&app->mouse_evdev)) {
+        return;
     }
-    if (event->keysym.sym >= 32 && event->keysym.sym <= 126) {
-        return true;
+    bool moved = false;
+    NativeMouseEv ev;
+    while (native_mouse_evdev_pop(&app->mouse_evdev, &ev)) {
+        switch (ev.kind) {
+        case NATIVE_MOUSE_EV_MOTION:
+            native_set_virtual_mouse_position(app, atomic_load(&app->virtual_mouse_x) + ev.dx,
+                                              atomic_load(&app->virtual_mouse_y) + ev.dy);
+            native_input_pointer_move(&app->input, atomic_load(&app->virtual_mouse_x),
+                                      atomic_load(&app->virtual_mouse_y));
+            moved = true;
+            break;
+        case NATIVE_MOUSE_EV_BUTTON: {
+            NativeInputButton button = native_button_from_sdl(ev.sdl_button);
+            if (button != 0) {
+                native_input_pointer_button(&app->input, atomic_load(&app->virtual_mouse_x),
+                                            atomic_load(&app->virtual_mouse_y), button, ev.down);
+                native_track_button(app, button, ev.down);
+            }
+            break;
+        }
+        case NATIVE_MOUSE_EV_WHEEL:
+            if (ev.wheel_y != 0) {
+                native_send_scaled_wheel(app, ev.wheel_y);
+            }
+            break;
+        }
     }
-    /* Keypad keys also emit SDL_TEXTINPUT (with NumLock on) but their syms sit outside the
-     * ASCII range; their scancode already went to the server, so the duplicate text event
-     * must be suppressed the same way as for the main-block printables. */
-    return event->keysym.sym >= SDLK_KP_DIVIDE && event->keysym.sym <= SDLK_KP_PERIOD;
+    if (moved) {
+        if (app->cursor_reassert_pending) {
+            /* First real movement after regaining focus: re-show the cursor now that the
+             * visibility call coincides with genuine pointer activity (webOS ignored it at
+             * bare focus-gain, e.g. when the overlay was dismissed with Esc). */
+            native_cursor_reassert(&app->cursor);
+            app->cursor_reassert_pending = false;
+        }
+        if (window) {
+            int wx = atomic_load(&app->virtual_mouse_x);
+            int wy = atomic_load(&app->virtual_mouse_y);
+            SDL_WarpMouseInWindow(window, wx, wy);
+        }
+    }
 }
+#endif
 
-static void native_log_sdl_key_event(const SDL_KeyboardEvent *event, bool mapped, bool sent, uint8_t scancode, bool extended) {
-    /* Mapped keys are only logged for the first part of a session to keep logs
-     * quiet; unmapped keys are (almost) always logged because they are rare and
-     * are exactly the diagnostic signal needed to chase keys webOS delivers
-     * unexpectedly. Live logs showed the Magic Remote cursor show/hide
-     * pseudo-keys arrive here as unmapped scancodes 484/485, and keypad-5 with
-     * webOS-side NumLock off arrives not at all; keeping unmapped logging on
-     * for the whole session lets a live test correlate presses with events. */
+#if defined(HELLOLG_WITH_EVDEV_KEYBOARD) && HELLOLG_WITH_EVDEV_KEYBOARD
+static void native_log_evdev_key(uint16_t code, bool down, bool mapped, uint8_t scancode, bool extended, bool sent) {
+    /* Cap mapped-key logs to keep logs quiet, but keep logging unmapped codes (media/consumer
+     * keys the reader forwards but we can't translate) for the whole session so a live test
+     * can spot keys arriving at the wrong evdev node. */
     static unsigned mapped_log_count = 0;
     static unsigned unmapped_log_count = 0;
     if (mapped) {
         if (mapped_log_count >= 64) {
             if (mapped_log_count == 64) {
-                fprintf(stderr, "[native-input] further mapped key event logs suppressed (unmapped keys still logged)\n");
+                fprintf(stderr, "[native-input] further mapped evdev key logs suppressed (unmapped keys still logged)\n");
                 mapped_log_count++;
             }
             return;
@@ -1882,29 +1844,103 @@ static void native_log_sdl_key_event(const SDL_KeyboardEvent *event, bool mapped
     } else {
         if (unmapped_log_count >= 256) {
             if (unmapped_log_count == 256) {
-                fprintf(stderr, "[native-input] further unmapped key event logs suppressed\n");
+                fprintf(stderr, "[native-input] further unmapped evdev key logs suppressed\n");
                 unmapped_log_count++;
             }
             return;
         }
         unmapped_log_count++;
     }
-    fprintf(stderr,
-            "[native-input] key %s state=%u repeat=%u sdl_scancode=%d sym=%d mod=0x%x mapped=%d rdp=0x%02x ext=%d sent=%d\n",
-            event->type == SDL_KEYDOWN ? "down" : "up", (unsigned)event->state, (unsigned)event->repeat,
-            (int)event->keysym.scancode, (int)event->keysym.sym, (unsigned)event->keysym.mod, mapped ? 1 : 0,
-            (unsigned)scancode, extended ? 1 : 0, sent ? 1 : 0);
+    fprintf(stderr, "[native-input] evdev key %s code=%u mapped=%d rdp=0x%02x ext=%d sent=%d\n",
+            down ? "down" : "up", (unsigned)code, mapped ? 1 : 0, (unsigned)scancode, extended ? 1 : 0, sent ? 1 : 0);
 }
 
-static void native_log_sdl_text_event(const char *text, bool ascii_printable, bool suppressed, bool sent) {
-    static unsigned log_count = 0;
-    if (log_count < 16) {
-        fprintf(stderr, "[native-input] text bytes=%zu ascii=%d suppressed=%d sent=%d\n", text ? strlen(text) : 0u,
-                ascii_printable ? 1 : 0, suppressed ? 1 : 0, sent ? 1 : 0);
-    } else if (log_count == 16) {
-        fprintf(stderr, "[native-input] further text event logs suppressed\n");
+/* SDL thread: apply queued raw-evdev keyboard events. Each Linux keycode is translated to its
+ * RDP set-1 scancode (+E0 flag) and injected as a scancode key event; there is no unicode/IME
+ * path (the grabbed keyboard delivers physical scancodes only), so no TEXTINPUT suppression is
+ * needed. Unlike the SDL path, typing does NOT hide the pointer: with the mouse grabbed we
+ * own the cursor outright, so its visibility follows the RDP server's pointer state alone. A
+ * local hide-on-keypress would only fight that (and is what made the cursor vanish mid-typing
+ * before). */
+static void native_drain_evdev_keyboard(App *app) {
+    if (!native_keyboard_evdev_active(&app->keyboard_evdev)) {
+        return;
     }
-    log_count++;
+    NativeKeyboardEv ev;
+    while (native_keyboard_evdev_pop(&app->keyboard_evdev, &ev)) {
+        uint8_t rdp_scancode = 0;
+        bool extended = false;
+        if (!native_input_linux_keycode_to_rdp(ev.code, &rdp_scancode, &extended)) {
+            native_log_evdev_key(ev.code, ev.down, false, 0, false, false);
+            continue;
+        }
+        bool sent = native_input_key(&app->input, rdp_scancode, ev.down, extended);
+        native_track_key(app, rdp_scancode, extended, ev.down);
+        native_log_evdev_key(ev.code, ev.down, true, rdp_scancode, extended, sent);
+    }
+}
+#endif
+
+/* Start the evdev input readers when streaming becomes active. The mouse degrades to the SDL
+ * compositor-pointer path (Magic Remote) when no USB mouse is present, so a failed mouse grab
+ * is informational; a failed keyboard grab means NO keyboard input (there is no SDL keyboard
+ * fallback), so it is a loud warning. Returns true if the keyboard reader is active. */
+static bool native_start_streaming_input(App *app) {
+    if (!app) {
+        return false;
+    }
+#if defined(HELLOLG_WITH_EVDEV_MOUSE) && HELLOLG_WITH_EVDEV_MOUSE
+    if (!native_mouse_evdev_start(&app->mouse_evdev)) {
+        fprintf(stderr, "[native] no USB mouse to grab; using the compositor pointer (Magic Remote) via SDL\n");
+    }
+#endif
+#if defined(HELLOLG_WITH_EVDEV_KEYBOARD) && HELLOLG_WITH_EVDEV_KEYBOARD
+    if (!native_keyboard_evdev_start(&app->keyboard_evdev)) {
+        fprintf(stderr,
+                "[native] WARNING: no USB keyboard grabbed and there is no SDL keyboard fallback; this "
+                "session has no keyboard input until a USB keyboard is attached and the session restarts\n");
+        return false;
+    }
+    return true;
+#else
+    return false;
+#endif
+}
+
+/* Release the evdev grabs (mouse + keyboard). Safe when nothing is grabbed (idempotent). Used
+ * on focus loss / backgrounding: EVIOCGRAB is a GLOBAL capture, so a running-but-unfocused app
+ * must not keep holding it or the webOS home UI / TV overlay menus get no mouse or keyboard. */
+static void native_stop_streaming_input(App *app) {
+    if (!app) {
+        return;
+    }
+    /* Flush releases for anything held BEFORE dropping the grab: once the grab is gone the
+     * up-events go to the overlay, not RDP, and the server would keep the drag/key stuck. */
+    native_flush_held_inputs(app);
+#if defined(HELLOLG_WITH_EVDEV_MOUSE) && HELLOLG_WITH_EVDEV_MOUSE
+    native_mouse_evdev_stop(&app->mouse_evdev);
+#endif
+#if defined(HELLOLG_WITH_EVDEV_KEYBOARD) && HELLOLG_WITH_EVDEV_KEYBOARD
+    native_keyboard_evdev_stop(&app->keyboard_evdev);
+#endif
+}
+
+/* Re-acquire input after regaining focus / returning to foreground, but only on the streaming
+ * screen (the preconnect UI needs the SDL mouse, so we must not grab there). Besides re-grabbing,
+ * re-assert the server cursor and re-home the OS pointer: a webOS overlay leaves the platform
+ * pointer hidden behind our back, so without this the RDP cursor stays invisible until a big
+ * mouse sweep. */
+static void native_resume_streaming_input(App *app, SDL_Window *window) {
+    if (!app || atomic_load(&app->current_state) != (int)RDP_STATE_ACTIVE) {
+        return;
+    }
+    (void)native_start_streaming_input(app);
+    native_cursor_reassert(&app->cursor);
+    /* Also re-assert on the next real mouse movement — see cursor_reassert_pending. */
+    app->cursor_reassert_pending = true;
+    if (window) {
+        SDL_WarpMouseInWindow(window, atomic_load(&app->virtual_mouse_x), atomic_load(&app->virtual_mouse_y));
+    }
 }
 
 static void native_present_renderer_frame(App *app, SDL_Renderer *renderer, bool *logged) {
@@ -2005,15 +2041,19 @@ static void handle_sdl_event(App *app, SDL_Window *window, SDL_Renderer *rendere
         break;
     case SDL_APP_WILLENTERBACKGROUND:
         fprintf(stderr, "[native] SDL_APP_WILLENTERBACKGROUND; keeping native session running\n");
+        native_stop_streaming_input(app);
         break;
     case SDL_APP_DIDENTERBACKGROUND:
         fprintf(stderr, "[native] SDL_APP_DIDENTERBACKGROUND; keeping native session running\n");
+        native_stop_streaming_input(app); /* belt and suspenders */
         break;
     case SDL_APP_WILLENTERFOREGROUND:
         fprintf(stderr, "[native] SDL_APP_WILLENTERFOREGROUND\n");
         break;
     case SDL_APP_DIDENTERFOREGROUND:
         fprintf(stderr, "[native] SDL_APP_DIDENTERFOREGROUND\n");
+        app->window_unfocused = false;
+        native_resume_streaming_input(app, window);
         break;
     case SDL_WINDOWEVENT:
         if (event->window.event == SDL_WINDOWEVENT_CLOSE) {
@@ -2024,64 +2064,73 @@ static void handle_sdl_event(App *app, SDL_Window *window, SDL_Renderer *rendere
                     event->window.data2);
             (void)native_update_render_size(app, renderer);
             native_update_pointer_window_size(app);
-        } else if (event->window.event == SDL_WINDOWEVENT_FOCUS_GAINED || event->window.event == SDL_WINDOWEVENT_FOCUS_LOST ||
-                   event->window.event == SDL_WINDOWEVENT_SHOWN || event->window.event == SDL_WINDOWEVENT_HIDDEN ||
-                   event->window.event == SDL_WINDOWEVENT_EXPOSED) {
+        } else if (event->window.event == SDL_WINDOWEVENT_FOCUS_LOST || event->window.event == SDL_WINDOWEVENT_HIDDEN ||
+                   event->window.event == SDL_WINDOWEVENT_MINIMIZED) {
+            /* A remote-invoked webOS overlay (TV menu, notifications) steals input focus WITHOUT
+             * fully backgrounding the app, so SDL_APP_WILLENTERBACKGROUND never fires. Release
+             * the global evdev grab here too, otherwise the mouse/keyboard stay locked to us and
+             * are unusable in the overlay. Re-grab happens on FOCUS_GAINED below. */
+            fprintf(stderr, "[native] window lost focus (event %u); releasing input grab\n",
+                    (unsigned)event->window.event);
+            app->window_unfocused = true;
+            native_stop_streaming_input(app);
+        } else if (event->window.event == SDL_WINDOWEVENT_FOCUS_GAINED || event->window.event == SDL_WINDOWEVENT_RESTORED ||
+                   event->window.event == SDL_WINDOWEVENT_SHOWN) {
+            fprintf(stderr, "[native] window gained focus (event %u); re-grabbing input\n",
+                    (unsigned)event->window.event);
+            app->window_unfocused = false;
+            native_resume_streaming_input(app, window);
+        } else if (event->window.event == SDL_WINDOWEVENT_EXPOSED) {
             fprintf(stderr, "[native] SDL window lifecycle event %u\n", (unsigned)event->window.event);
         }
         break;
-    case SDL_MOUSEMOTION: {
-        if (!native_consume_warp_echo(app, event->motion.x, event->motion.y)) {
-            int dx;
-            int dy;
-            bool center_jump = false;
-            if (app->relative_mouse_active) {
-                dx = event->motion.xrel;
-                dy = event->motion.yrel;
-            } else {
-                dx = event->motion.x - atomic_load(&app->virtual_mouse_x);
-                dy = event->motion.y - atomic_load(&app->virtual_mouse_y);
-                center_jump = native_input_motion_is_center_jump(
-                    event->motion.x, event->motion.y, dx, dy,
-                    (uint16_t)atomic_load(&app->input.window_width),
-                    (uint16_t)atomic_load(&app->input.window_height));
-            }
-            if (app->jump_filter && (center_jump || native_input_motion_is_jump(dx, dy))) {
-                native_log_dropped_motion_jump(dx, dy, center_jump);
-                if (!app->relative_mouse_active) {
-                    /* The compositor really moved the OS pointer; put it back onto the
-                     * logical position so the jump never becomes visible. */
-                    int restore_x = atomic_load(&app->virtual_mouse_x);
-                    int restore_y = atomic_load(&app->virtual_mouse_y);
-                    native_expect_warp_echo(app, restore_x, restore_y);
-                    SDL_WarpMouseInWindow(window, restore_x, restore_y);
-                }
-                break;
-            }
+    case SDL_MOUSEMOTION:
+        if (app->window_unfocused) {
+            break; /* an overlay/menu has focus: the released mouse must not move the RDP cursor */
         }
-        if (app->relative_mouse_active) {
-            native_set_virtual_mouse_position(app, atomic_load(&app->virtual_mouse_x) + event->motion.xrel,
-                                              atomic_load(&app->virtual_mouse_y) + event->motion.yrel);
-            native_input_pointer_move(&app->input, atomic_load(&app->virtual_mouse_x), atomic_load(&app->virtual_mouse_y));
-        } else {
-            native_set_virtual_mouse_position(app, event->motion.x, event->motion.y);
-            native_input_pointer_move(&app->input, event->motion.x, event->motion.y);
+#if defined(HELLOLG_WITH_EVDEV_MOUSE) && HELLOLG_WITH_EVDEV_MOUSE
+        if (native_mouse_evdev_active(&app->mouse_evdev)) {
+            break; /* a grabbed USB mouse is read via evdev */
         }
+#endif
+        /* Fallback when no USB mouse was grabbed: SDL delivers the compositor's own pointer
+         * (Magic Remote, trackpad remote) in absolute window coordinates. */
+        if (app->cursor_reassert_pending) {
+            native_cursor_reassert(&app->cursor);
+            app->cursor_reassert_pending = false;
+        }
+        native_set_virtual_mouse_position(app, event->motion.x, event->motion.y);
+        native_input_pointer_move(&app->input, event->motion.x, event->motion.y);
         break;
-    }
     case SDL_MOUSEBUTTONDOWN:
     case SDL_MOUSEBUTTONUP: {
+        if (app->window_unfocused) {
+            break;
+        }
+#if defined(HELLOLG_WITH_EVDEV_MOUSE) && HELLOLG_WITH_EVDEV_MOUSE
+        if (native_mouse_evdev_active(&app->mouse_evdev)) {
+            break;
+        }
+#endif
         NativeInputButton button = native_button_from_sdl(event->button.button);
         if (button != 0) {
-            if (!app->relative_mouse_active) {
-                native_set_virtual_mouse_position(app, event->button.x, event->button.y);
-            }
-            native_input_pointer_button(&app->input, atomic_load(&app->virtual_mouse_x), atomic_load(&app->virtual_mouse_y),
-                                        button, event->type == SDL_MOUSEBUTTONDOWN);
+            native_set_virtual_mouse_position(app, event->button.x, event->button.y);
+            native_input_pointer_button(&app->input, atomic_load(&app->virtual_mouse_x),
+                                        atomic_load(&app->virtual_mouse_y), button,
+                                        event->type == SDL_MOUSEBUTTONDOWN);
+            native_track_button(app, button, event->type == SDL_MOUSEBUTTONDOWN);
         }
         break;
     }
     case SDL_MOUSEWHEEL: {
+        if (app->window_unfocused) {
+            break;
+        }
+#if defined(HELLOLG_WITH_EVDEV_MOUSE) && HELLOLG_WITH_EVDEV_MOUSE
+        if (native_mouse_evdev_active(&app->mouse_evdev)) {
+            break;
+        }
+#endif
         int wheel_y = event->wheel.y;
 #if SDL_VERSION_ATLEAST(2, 0, 4)
         if (event->wheel.direction == SDL_MOUSEWHEEL_FLIPPED) {
@@ -2092,42 +2141,15 @@ static void handle_sdl_event(App *app, SDL_Window *window, SDL_Renderer *rendere
         break;
     }
     case SDL_KEYDOWN:
-    case SDL_KEYUP: {
-        if (native_handle_webos_red_key(app, &event->key)) {
-            break;
-        }
-        native_hide_webos_cursor_for_key(window, &event->key);
-        uint8_t rdp_scancode = 0;
-        bool extended = false;
-        bool mapped = native_input_sdl_scancode_to_rdp((uint32_t)event->key.keysym.scancode, &rdp_scancode, &extended);
-        bool sent = false;
-        if (mapped) {
-            sent = native_input_key(&app->input, rdp_scancode, event->type == SDL_KEYDOWN, extended);
-            if (sent && sdl_key_is_plain_printable(&event->key)) {
-                app->suppress_next_ascii_text = true;
-                app->suppress_ascii_text_until = SDL_GetTicks() + 250u;
-            }
-        }
-        native_log_sdl_key_event(&event->key, mapped, sent, rdp_scancode, extended);
+    case SDL_KEYUP:
+        /* The USB keyboard is read from grabbed /dev/input (keyboard_evdev); there is no SDL
+         * keyboard path. The one key still taken from SDL is the webOS remote's red key
+         * (power/shutdown): it comes from the ungrabbed TV remote, not the grabbed keyboard.
+         *
+         * The mouse, by contrast, keeps an SDL fallback above: a grabbed USB mouse is read via
+         * evdev, but with no USB mouse SDL still delivers the compositor pointer (Magic Remote). */
+        native_handle_webos_red_key(app, &event->key);
         break;
-    }
-    case SDL_TEXTINPUT: {
-        bool ascii_printable = sdl_text_is_ascii_printable(event->text.text);
-        bool suppressed = false;
-        if (ascii_printable && app->suppress_next_ascii_text && SDL_TICKS_PASSED(SDL_GetTicks(), app->suppress_ascii_text_until)) {
-            app->suppress_next_ascii_text = false;
-        }
-        if (ascii_printable && app->suppress_next_ascii_text) {
-            app->suppress_next_ascii_text = false;
-            suppressed = true;
-        }
-        bool sent = false;
-        if (!suppressed) {
-            sent = native_input_text_utf8(&app->input, event->text.text);
-        }
-        native_log_sdl_text_event(event->text.text, ascii_printable, suppressed, sent);
-        break;
-    }
     default:
         break;
     }
@@ -2222,11 +2244,9 @@ static int native_run_app_loop(App *app, NativeConfig *config, const RdpCallback
     fprintf(stderr, "[native] SDL loop running at target %u fps\n", (unsigned)config->fps);
 
 #if defined(HELLOLG_WITH_PRECONNECT_UI) && HELLOLG_WITH_PRECONNECT_UI
-    native_set_streaming_mouse_mode(app, false);
     NativePreconnectUi *ui = native_preconnect_ui_create(window, renderer, config->host, config->port, config->username,
                                                         config->password, config->domain, config->fps,
-                                                        config->audio_prebuffer_ms, config->relative_mouse,
-                                                        config->jump_filter);
+                                                        config->audio_prebuffer_ms);
     if (!ui) {
         fprintf(stderr, "[native-ui] failed to create pre-connect UI\n");
         SDL_StopTextInput();
@@ -2241,12 +2261,27 @@ static int native_run_app_loop(App *app, NativeConfig *config, const RdpCallback
     bool present_logged = false;
     bool streaming_visible = false;
 
+#if defined(HELLOLG_WITH_EVDEV_KEYBOARD) && HELLOLG_WITH_EVDEV_KEYBOARD
+    /* The keyboard is read from grabbed /dev/input with no SDL fallback; warn on the visible
+     * preconnect screen if none is attached so it isn't discovered only after connecting. */
+    if (!native_keyboard_evdev_probe()) {
+        native_preconnect_ui_set_status(ui, "No USB keyboard detected — you can connect, but keyboard input needs one.",
+                                        true);
+    }
+#endif
+
     while (atomic_load(&app->running)) {
         int event_state = atomic_load(&app->current_state);
         if (app->rdp && event_state == (int)RDP_STATE_ACTIVE) {
             native_drain_pointer_clamp(app);
             native_drain_pointer_warp(app, window);
             native_cursor_tick(app);
+#if defined(HELLOLG_WITH_EVDEV_MOUSE) && HELLOLG_WITH_EVDEV_MOUSE
+            native_drain_evdev_mouse(app, window);
+#endif
+#if defined(HELLOLG_WITH_EVDEV_KEYBOARD) && HELLOLG_WITH_EVDEV_KEYBOARD
+            native_drain_evdev_keyboard(app);
+#endif
             SDL_Event event;
             while (SDL_PollEvent(&event)) {
                 handle_sdl_event(app, window, renderer, &event);
@@ -2265,7 +2300,6 @@ static int native_run_app_loop(App *app, NativeConfig *config, const RdpCallback
             }
             native_stop_rdp(app);
             atomic_store(&app->session_failed, false);
-            native_set_streaming_mouse_mode(app, false);
             native_cursor_reset(&app->cursor);
             streaming_visible = false;
             last_ui_state = -1;
@@ -2284,7 +2318,16 @@ static int native_run_app_loop(App *app, NativeConfig *config, const RdpCallback
         if (app->rdp && state == (int)RDP_STATE_ACTIVE && !streaming_visible) {
             (void)native_config_save_persisted(config);
             native_preconnect_ui_set_visible(ui, false);
-            native_set_streaming_mouse_mode(app, true);
+            app->window_unfocused = false; /* enter streaming focused, whatever fired during preconnect */
+            /* Grab input now that streaming has started; the preconnect UI needs the SDL mouse,
+             * so we don't grab earlier. */
+            if (!native_start_streaming_input(app)) {
+                /* No keyboard grabbed: note it on the (now hidden) preconnect status so it shows
+                 * if the session returns here. The loud log already covers diagnosis, and the
+                 * probe below warns before connecting. */
+                native_preconnect_ui_set_status(ui, "No USB keyboard detected — this session has no keyboard input.",
+                                                true);
+            }
             streaming_visible = true;
         }
 
@@ -2299,14 +2342,11 @@ static int native_run_app_loop(App *app, NativeConfig *config, const RdpCallback
         uint16_t requested_port = 0;
         uint16_t requested_fps = 0;
         uint16_t requested_audio_prebuffer_ms = 0;
-        bool requested_relative_mouse = false;
-        bool requested_jump_filter = true;
         if (!app->rdp &&
             native_preconnect_ui_take_connect(ui, requested_host, sizeof(requested_host), &requested_port,
                                              requested_username, sizeof(requested_username), requested_password,
                                              sizeof(requested_password), requested_domain, sizeof(requested_domain),
-                                             &requested_fps, &requested_audio_prebuffer_ms,
-                                             &requested_relative_mouse, &requested_jump_filter)) {
+                                             &requested_fps, &requested_audio_prebuffer_ms)) {
             if (!copy_config_string(config->host, sizeof(config->host), requested_host, "host")) {
                 native_preconnect_ui_set_status(ui, "Host value is too long.", true);
             } else if (!copy_config_string(config->username, sizeof(config->username), requested_username, "username")) {
@@ -2320,8 +2360,6 @@ static int native_run_app_loop(App *app, NativeConfig *config, const RdpCallback
                 config->fps = requested_fps;
                 config->audio_prebuffer_ms = requested_audio_prebuffer_ms;
                 native_config_apply_initial_desktop_hint(config);
-                config->relative_mouse = requested_relative_mouse;
-                config->jump_filter = requested_jump_filter;
                 char validation_message[128];
                 if (!native_config_validate_connect(config, validation_message, sizeof(validation_message))) {
                     native_preconnect_ui_set_status(ui, validation_message, true);
@@ -2343,7 +2381,6 @@ static int native_run_app_loop(App *app, NativeConfig *config, const RdpCallback
     }
 
     native_preconnect_ui_destroy(ui);
-    native_set_streaming_mouse_mode(app, false);
 #else
     bool present_logged = false;
     if (!native_start_rdp(app, config, callbacks)) {
@@ -2357,12 +2394,18 @@ static int native_run_app_loop(App *app, NativeConfig *config, const RdpCallback
         return exit_code ? exit_code : 2;
     }
     native_update_pointer_window_size(app);
-    native_set_streaming_mouse_mode(app, true);
+    (void)native_start_streaming_input(app);
 
     while (atomic_load(&app->running)) {
         native_drain_pointer_clamp(app);
         native_drain_pointer_warp(app, window);
         native_cursor_tick(app);
+#if defined(HELLOLG_WITH_EVDEV_MOUSE) && HELLOLG_WITH_EVDEV_MOUSE
+        native_drain_evdev_mouse(app, window);
+#endif
+#if defined(HELLOLG_WITH_EVDEV_KEYBOARD) && HELLOLG_WITH_EVDEV_KEYBOARD
+        native_drain_evdev_keyboard(app);
+#endif
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
             handle_sdl_event(app, window, renderer, &event);
@@ -2375,7 +2418,6 @@ static int native_run_app_loop(App *app, NativeConfig *config, const RdpCallback
         }
         SDL_Delay(delay_ms == 0 ? 1 : delay_ms);
     }
-    native_set_streaming_mouse_mode(app, false);
 #endif
 
     /* Free the SDL cursor object while the video subsystem is still up. */

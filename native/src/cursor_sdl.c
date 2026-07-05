@@ -6,6 +6,18 @@
 
 #include "rdp_ffi.h"
 
+#if defined(HELLOLG_WITH_SDL) && HELLOLG_WITH_SDL
+#if defined(__has_include)
+#if __has_include(<SDL_webOS.h>)
+#include <SDL_webOS.h>
+#define HELLOLG_CURSOR_HAVE_WEBOS_VISIBILITY 1
+#endif
+#endif
+#endif
+#ifndef HELLOLG_CURSOR_HAVE_WEBOS_VISIBILITY
+#define HELLOLG_CURSOR_HAVE_WEBOS_VISIBILITY 0
+#endif
+
 _Static_assert(NATIVE_CURSOR_HIDDEN == RDP_POINTER_STATE_HIDDEN,
                "NATIVE_CURSOR_HIDDEN must match the FFI constant");
 _Static_assert(NATIVE_CURSOR_DEFAULT == RDP_POINTER_STATE_DEFAULT,
@@ -19,6 +31,12 @@ void native_cursor_init(NativeCursor *cursor) {
     pthread_mutex_init(&cursor->lock, NULL);
     cursor->desired = NATIVE_CURSOR_DEFAULT;
     atomic_init(&cursor->generation, 0u);
+#if defined(HELLOLG_WITH_SDL) && HELLOLG_WITH_SDL
+    /* The platform pointer starts visible; without this the first server-driven hide would
+     * be skipped by the "already hidden" short-circuit and the pointer would stay on screen
+     * while the server considers it hidden. */
+    cursor->visible = true;
+#endif
 }
 
 void native_cursor_destroy(NativeCursor *cursor) {
@@ -207,7 +225,18 @@ static void native_cursor_log_state(uint32_t state) {
 }
 
 static void native_cursor_set_visible(NativeCursor *cursor, bool visible) {
+#if HELLOLG_CURSOR_HAVE_WEBOS_VISIBILITY
+    /* Never SDL_ShowCursor(SDL_DISABLE) on webOS: it stops pointer-event delivery
+     * entirely (verified live), so a server-driven hide (e.g. the remote browser hiding
+     * the pointer over a video) would become unrecoverable by mouse input — our moves
+     * would never reach the server and it would never re-show its cursor. The platform
+     * visibility call hides only the image; events keep flowing and the system re-shows
+     * the pointer on genuine activity, in step with the remote side doing the same. */
+    SDL_webOSCursorVisibility(visible ? SDL_TRUE : SDL_FALSE);
+    SDL_ShowCursor(SDL_ENABLE);
+#else
     SDL_ShowCursor(visible ? SDL_ENABLE : SDL_DISABLE);
+#endif
     cursor->visible = visible;
 }
 
@@ -257,11 +286,23 @@ static void native_cursor_apply_shape(NativeCursor *cursor, uint8_t *rgba, uint1
             fprintf(stderr, "[native-cursor] further cursor shape logs suppressed\n");
         }
         log_count++;
-    } else if (!cursor->color_cursor_unavailable) {
-        /* Color cursors are unproven on the webOS SDL port; degrade to the default arrow
-         * (previous behavior) and say so once — this line is the live probe. */
-        cursor->color_cursor_unavailable = true;
-        fprintf(stderr, "[native-cursor] color cursor unavailable: %s\n", SDL_GetError());
+    } else {
+        /* Color cursors are unproven on the webOS SDL port; degrade to the visible default
+         * arrow (the server draws no pointer of its own and considers it shown, so leaving
+         * it hidden would strand the user with no pointer). Probe line logged once. */
+        SDL_Cursor *system_default = SDL_GetDefaultCursor();
+        if (system_default) {
+            SDL_SetCursor(system_default);
+        }
+        if (cursor->cursor) {
+            SDL_FreeCursor(cursor->cursor);
+            cursor->cursor = NULL;
+        }
+        native_cursor_set_visible(cursor, true);
+        if (!cursor->color_cursor_unavailable) {
+            cursor->color_cursor_unavailable = true;
+            fprintf(stderr, "[native-cursor] color cursor unavailable: %s\n", SDL_GetError());
+        }
     }
     if (surface) {
         SDL_FreeSurface(surface);
@@ -289,21 +330,26 @@ void native_cursor_apply(NativeCursor *cursor, uint16_t desktop_w, uint16_t desk
     pthread_mutex_unlock(&cursor->lock);
     cursor->applied_generation = generation;
 
+    /* Each case asserts the platform state unconditionally rather than short-circuiting on
+     * cursor->visible: that flag can be stale (the webOS compositor auto-hides/shows the
+     * pointer on idle/activity behind our back), so a guard there would skip a genuinely-needed
+     * re-hide or re-show. The SDL calls are idempotent and only run when the server actually
+     * changed the pointer. */
     switch (desired) {
     case NATIVE_CURSOR_SHAPE:
         if (rgba) {
             native_cursor_apply_shape(cursor, rgba, width, height, hot_x, hot_y, desktop_w,
                                       desktop_h, window_w, window_h);
-        } else if (!cursor->visible) {
+        } else {
             /* Shape already applied earlier (e.g. hidden -> cached shape again). */
             native_cursor_set_visible(cursor, true);
         }
         break;
     case NATIVE_CURSOR_HIDDEN:
         if (cursor->visible) {
-            native_cursor_set_visible(cursor, false);
             native_cursor_log_state(NATIVE_CURSOR_HIDDEN);
         }
+        native_cursor_set_visible(cursor, false);
         break;
     case NATIVE_CURSOR_DEFAULT:
     default: {
@@ -344,6 +390,30 @@ void native_cursor_reset(NativeCursor *cursor) {
         cursor->cursor = NULL;
     }
     native_cursor_set_visible(cursor, true);
+}
+
+void native_cursor_reassert(NativeCursor *cursor) {
+    if (!cursor) {
+        return;
+    }
+    /* Re-apply the last server-driven pointer state after a webOS overlay (TV menu) hid the
+     * platform pointer behind our back: unlike native_cursor_apply this ignores the
+     * generation gate, and unlike the old typing-hide recovery it does not skip when we think
+     * the cursor is already visible (the platform state is out of sync after the overlay). A
+     * server-requested hide is still honoured. */
+    if (cursor->desired == NATIVE_CURSOR_HIDDEN) {
+        native_cursor_set_visible(cursor, false);
+        return;
+    }
+    native_cursor_set_visible(cursor, true);
+    if (cursor->cursor) {
+        SDL_SetCursor(cursor->cursor);
+    } else {
+        SDL_Cursor *system_default = SDL_GetDefaultCursor();
+        if (system_default) {
+            SDL_SetCursor(system_default);
+        }
+    }
 }
 
 #endif /* HELLOLG_WITH_SDL */
