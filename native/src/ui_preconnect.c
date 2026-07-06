@@ -8,13 +8,27 @@
 #include "draw/sdl/lv_draw_sdl.h"
 #include "lvgl.h"
 
-#define UI_HOST_MAX 512u
+#define UI_HOST_MAX 256u
+#define UI_USERNAME_MAX 256u
+#define UI_DOMAIN_MAX 256u
+/* Keep the UI password limit aligned with NativeConfig's 512-byte string storage. */
+#define UI_PASSWORD_TEXT_MAX 511u
+#define UI_PASSWORD_MAX (UI_PASSWORD_TEXT_MAX + 1u)
 #define UI_PORT_MAX 8u
 #define UI_ENDPOINT_MAX (UI_HOST_MAX + UI_PORT_MAX + 4u)
 #define UI_WIDE_FIELD_WIDTH LV_DPX(420)
 #define UI_COMPACT_FIELD_WIDTH LV_DPX(202)
 #define UI_CONNECT_BUTTON_WIDTH LV_DPX(180)
 #define UI_FORM_KEY_EVENT (LV_EVENT_KEY | LV_EVENT_PREPROCESS)
+/* LVGL consumes one key state per read; text input is represented as press+release per char.
+ * Keep one extra ring slot empty, so capacity is UI_KEY_QUEUE_CAP - 1. */
+#define UI_KEY_QUEUE_TEXT_MAX UI_PASSWORD_TEXT_MAX
+#define UI_KEY_QUEUE_CAP (2u * UI_KEY_QUEUE_TEXT_MAX + 1u)
+
+_Static_assert(UI_KEY_QUEUE_CAP - 1u >= 2u * (UI_USERNAME_MAX - 1u), "key queue must hold username paste");
+_Static_assert(UI_KEY_QUEUE_CAP - 1u >= 2u * (UI_DOMAIN_MAX - 1u), "key queue must hold domain paste");
+_Static_assert(UI_KEY_QUEUE_CAP - 1u >= 2u * (UI_ENDPOINT_MAX - 1u), "key queue must hold endpoint paste");
+_Static_assert(UI_KEY_QUEUE_CAP - 1u >= 2u * UI_PASSWORD_TEXT_MAX, "key queue must hold password paste");
 
 static const uint16_t UI_FPS_OPTIONS[] = {30, 60};
 /* Audio jitter prebuffer slider bounds (milliseconds); 0 disables buffering. Trades
@@ -23,14 +37,19 @@ static const uint16_t UI_FPS_OPTIONS[] = {30, 60};
 #define UI_AUDIO_BUFFER_MAX_MS 300
 #define UI_AUDIO_BUFFER_STEP_MS 10
 
+typedef struct NativePreconnectQueuedKey {
+    lv_indev_state_t state;
+    uint32_t key;
+} NativePreconnectQueuedKey;
+
 typedef struct NativePreconnectKeyDriver {
     lv_indev_drv_t base;
     lv_indev_state_t state;
     uint32_t key;
-    char text[SDL_TEXTINPUTEVENT_TEXT_SIZE];
-    size_t text_len;
-    size_t text_pos;
-    bool text_key_down;
+    NativePreconnectQueuedKey queue[UI_KEY_QUEUE_CAP];
+    unsigned head;
+    unsigned tail;
+    bool overflow_logged;
 } NativePreconnectKeyDriver;
 
 struct NativePreconnectUi {
@@ -87,9 +106,9 @@ struct NativePreconnectUi {
     uint16_t current_fps;
     uint16_t selected_fps;
     char requested_host[UI_HOST_MAX];
-    char requested_username[UI_HOST_MAX];
-    char requested_domain[UI_HOST_MAX];
-    char requested_password[UI_HOST_MAX];
+    char requested_username[UI_USERNAME_MAX];
+    char requested_domain[UI_DOMAIN_MAX];
+    char requested_password[UI_PASSWORD_MAX];
     uint16_t requested_port;
     uint16_t requested_fps;
     uint16_t selected_audio_buffer;
@@ -513,7 +532,7 @@ static void ui_build(NativePreconnectUi *ui, const char *host, uint16_t port, co
     lv_obj_add_style(ui->username_input, &ui->input_cursor_style, LV_PART_CURSOR | LV_STATE_FOCUSED);
     lv_obj_set_size(ui->username_input, UI_WIDE_FIELD_WIDTH, LV_DPX(52));
     lv_textarea_set_one_line(ui->username_input, true);
-    lv_textarea_set_max_length(ui->username_input, UI_HOST_MAX - 1);
+    lv_textarea_set_max_length(ui->username_input, UI_USERNAME_MAX - 1);
     lv_textarea_set_placeholder_text(ui->username_input, "username");
     lv_textarea_set_text(ui->username_input, username ? username : "");
     lv_textarea_set_cursor_pos(ui->username_input, LV_TEXTAREA_CURSOR_LAST);
@@ -528,7 +547,7 @@ static void ui_build(NativePreconnectUi *ui, const char *host, uint16_t port, co
     lv_obj_add_style(ui->domain_input, &ui->input_cursor_style, LV_PART_CURSOR | LV_STATE_FOCUSED);
     lv_obj_set_size(ui->domain_input, UI_WIDE_FIELD_WIDTH, LV_DPX(52));
     lv_textarea_set_one_line(ui->domain_input, true);
-    lv_textarea_set_max_length(ui->domain_input, UI_HOST_MAX - 1);
+    lv_textarea_set_max_length(ui->domain_input, UI_DOMAIN_MAX - 1);
     lv_textarea_set_placeholder_text(ui->domain_input, "optional");
     lv_textarea_set_text(ui->domain_input, domain ? domain : "");
     lv_textarea_set_cursor_pos(ui->domain_input, LV_TEXTAREA_CURSOR_LAST);
@@ -543,7 +562,7 @@ static void ui_build(NativePreconnectUi *ui, const char *host, uint16_t port, co
     lv_obj_add_style(ui->password_input, &ui->input_cursor_style, LV_PART_CURSOR | LV_STATE_FOCUSED);
     lv_obj_set_size(ui->password_input, UI_WIDE_FIELD_WIDTH, LV_DPX(52));
     lv_textarea_set_one_line(ui->password_input, true);
-    lv_textarea_set_max_length(ui->password_input, UI_HOST_MAX - 1);
+    lv_textarea_set_max_length(ui->password_input, UI_PASSWORD_TEXT_MAX);
     lv_textarea_set_password_mode(ui->password_input, true);
     lv_textarea_set_placeholder_text(ui->password_input, "password");
     lv_textarea_set_text(ui->password_input, password ? password : "");
@@ -1126,17 +1145,129 @@ static bool ui_text_key_from_sdl(const SDL_KeyboardEvent *event, uint32_t *key) 
     }
 }
 
+static bool ui_key_queue_empty(const NativePreconnectKeyDriver *state) {
+    return state->head == state->tail;
+}
+
+static void ui_key_queue_clear(NativePreconnectKeyDriver *state) {
+    state->head = 0;
+    state->tail = 0;
+    state->overflow_logged = false;
+}
+
+static void ui_key_enqueue(NativePreconnectKeyDriver *state, uint32_t key, lv_indev_state_t key_state) {
+    unsigned next_tail = (state->tail + 1u) % UI_KEY_QUEUE_CAP;
+    if (next_tail == state->head) {
+        if (!state->overflow_logged) {
+            fprintf(stderr, "[native-ui] pre-connect key queue overflow; dropping oldest input event\n");
+            state->overflow_logged = true;
+        }
+        state->head = (state->head + 1u) % UI_KEY_QUEUE_CAP;
+    }
+    state->queue[state->tail].key = key;
+    state->queue[state->tail].state = key_state;
+    state->tail = next_tail;
+}
+
+static bool ui_key_dequeue(NativePreconnectKeyDriver *state, NativePreconnectQueuedKey *event) {
+    if (ui_key_queue_empty(state)) {
+        return false;
+    }
+    *event = state->queue[state->head];
+    state->head = (state->head + 1u) % UI_KEY_QUEUE_CAP;
+    if (ui_key_queue_empty(state)) {
+        state->overflow_logged = false;
+    }
+    return true;
+}
+
+static void ui_key_enqueue_tap(NativePreconnectKeyDriver *state, uint32_t key) {
+    ui_key_enqueue(state, key, LV_INDEV_STATE_PRESSED);
+    ui_key_enqueue(state, key, LV_INDEV_STATE_RELEASED);
+}
+
+static size_t ui_utf8_char_len(unsigned char first) {
+    if ((first & 0x80u) == 0) {
+        return 1;
+    }
+    if ((first & 0xe0u) == 0xc0u) {
+        return 2;
+    }
+    if ((first & 0xf0u) == 0xe0u) {
+        return 3;
+    }
+    if ((first & 0xf8u) == 0xf0u) {
+        return 4;
+    }
+    return 1;
+}
+
+static void ui_key_enqueue_text(NativePreconnectKeyDriver *state, const char *text) {
+    if (!text) {
+        return;
+    }
+    size_t len = strlen(text);
+    for (size_t i = 0; i < len;) {
+        size_t char_len = ui_utf8_char_len((unsigned char)text[i]);
+        if (char_len > len - i) {
+            char_len = 1;
+        }
+        uint32_t key = 0;
+        memcpy(&key, text + i, char_len);
+        ui_key_enqueue_tap(state, key);
+        i += char_len;
+    }
+}
+
+static bool ui_event_batch_has_textinput(const SDL_Event *events, int count) {
+    for (int i = 0; i < count; i++) {
+        if (events[i].type == SDL_TEXTINPUT) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void ui_key_drain_sdl_events(NativePreconnectKeyDriver *state) {
+    SDL_Event events[64];
+    for (;;) {
+        int count = SDL_PeepEvents(events, (int)(sizeof(events) / sizeof(events[0])), SDL_GETEVENT, SDL_KEYDOWN,
+                                   SDL_TEXTINPUT);
+        if (count <= 0) {
+            break;
+        }
+
+        bool text_input_pending = ui_event_batch_has_textinput(events, count) || SDL_HasEvent(SDL_TEXTINPUT);
+        for (int i = 0; i < count; i++) {
+            uint32_t key = 0;
+            switch (events[i].type) {
+            case SDL_TEXTINPUT:
+                ui_key_enqueue_text(state, events[i].text.text);
+                break;
+            case SDL_KEYDOWN:
+            case SDL_KEYUP:
+                if (ui_key_from_sdl(&events[i].key, &key)) {
+                    ui_key_enqueue(state, key,
+                                   events[i].type == SDL_KEYDOWN ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED);
+                } else if (events[i].type == SDL_KEYDOWN && !text_input_pending &&
+                           ui_text_key_from_sdl(&events[i].key, &key)) {
+                    ui_key_enqueue_tap(state, key);
+                }
+                break;
+            default:
+                break;
+            }
+        }
+    }
+}
+
 static void ui_key_read(lv_indev_drv_t *drv, lv_indev_data_t *data) {
     NativePreconnectUi *ui = (NativePreconnectUi *)drv->user_data;
     NativePreconnectKeyDriver *state = (NativePreconnectKeyDriver *)drv;
-    SDL_Event event;
 
     if (ui->connecting) {
-        while (SDL_PeepEvents(&event, 1, SDL_GETEVENT, SDL_KEYDOWN, SDL_TEXTINPUT) > 0) {
-        }
-        state->text_len = 0;
-        state->text_pos = 0;
-        state->text_key_down = false;
+        SDL_FlushEvents(SDL_KEYDOWN, SDL_TEXTINPUT);
+        ui_key_queue_clear(state);
         state->state = LV_INDEV_STATE_RELEASED;
         data->key = state->key;
         data->state = state->state;
@@ -1144,43 +1275,17 @@ static void ui_key_read(lv_indev_drv_t *drv, lv_indev_data_t *data) {
         return;
     }
 
-    if (state->text_key_down) {
-        state->text_key_down = false;
-        state->state = LV_INDEV_STATE_RELEASED;
-        data->continue_reading = state->text_pos < state->text_len;
-    } else if (state->text_pos < state->text_len) {
-        state->key = (unsigned char)state->text[state->text_pos++];
-        state->state = LV_INDEV_STATE_PRESSED;
-        state->text_key_down = true;
-        data->continue_reading = true;
-    } else if (SDL_PeepEvents(&event, 1, SDL_GETEVENT, SDL_KEYDOWN, SDL_KEYUP) > 0) {
-        state->text_key_down = false;
-        if (ui_key_from_sdl(&event.key, &state->key)) {
-            state->state = event.type == SDL_KEYDOWN ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
-        } else if (event.type == SDL_KEYDOWN && !SDL_HasEvent(SDL_TEXTINPUT) && ui_text_key_from_sdl(&event.key, &state->key)) {
-            state->state = LV_INDEV_STATE_PRESSED;
-        } else {
-            state->state = LV_INDEV_STATE_RELEASED;
-        }
-        data->continue_reading = true;
-    } else if (SDL_PeepEvents(&event, 1, SDL_GETEVENT, SDL_TEXTINPUT, SDL_TEXTINPUT) > 0) {
-        size_t len = strlen(event.text.text);
-        if (len >= sizeof(state->text)) {
-            len = sizeof(state->text) - 1;
-        }
-        memcpy(state->text, event.text.text, len);
-        state->text[len] = '\0';
-        state->text_len = len;
-        state->text_pos = 0;
-        state->text_key_down = false;
-        state->state = LV_INDEV_STATE_RELEASED;
-        data->continue_reading = len > 0;
-    } else {
-        data->continue_reading = false;
+    ui_key_drain_sdl_events(state);
+
+    NativePreconnectQueuedKey event;
+    if (ui_key_dequeue(state, &event)) {
+        state->key = event.key;
+        state->state = event.state;
     }
 
     data->key = state->key;
     data->state = state->state;
+    data->continue_reading = !ui_key_queue_empty(state);
 }
 
 static void ui_input_changed(lv_event_t *event) {

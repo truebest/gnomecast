@@ -4,7 +4,7 @@
 # ("--privileged=true is not allowed"), and rebuilding the toolchain image every run
 # wasted minutes anyway. Rebuild + push with tools/push-build-image.sh after changing
 # the Dockerfile, then bump the tag here.
-image: cubicattache/gnomecast-webos-build:20260703
+image: cubicattache/gnomecast-webos-build:20260705
 
 clone:
   depth: full

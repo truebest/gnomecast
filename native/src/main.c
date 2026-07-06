@@ -11,6 +11,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <poll.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 #if defined(HELLOLG_WITH_SDL) && HELLOLG_WITH_SDL
 #include <SDL.h>
@@ -26,11 +30,12 @@
 #endif
 
 #include "cursor_sdl.h"
-#if defined(HELLOLG_WITH_EVDEV_MOUSE) && HELLOLG_WITH_EVDEV_MOUSE
-#include "mouse_evdev.h"
-#endif
-#if defined(HELLOLG_WITH_EVDEV_KEYBOARD) && HELLOLG_WITH_EVDEV_KEYBOARD
-#include "keyboard_evdev.h"
+#if (defined(HELLOLG_WITH_EVDEV_MOUSE) && HELLOLG_WITH_EVDEV_MOUSE) || \
+    (defined(HELLOLG_WITH_EVDEV_KEYBOARD) && HELLOLG_WITH_EVDEV_KEYBOARD)
+#define HELLOLG_WITH_EVDEV_INPUT 1
+#include "input_evdev.h"
+#else
+#define HELLOLG_WITH_EVDEV_INPUT 0
 #endif
 #include "input_sdl.h"
 #include "rdp_ffi.h"
@@ -46,6 +51,7 @@ typedef void NativePreconnectUi;
 
 #define NATIVE_RDP_INITIAL_DESKTOP_WIDTH 1920u
 #define NATIVE_RDP_INITIAL_DESKTOP_HEIGHT 1080u
+#define NATIVE_APP_ID "com.truebest.gnomecast.native"
 /* webOS always renders the app's graphics/UI plane on a virtual ~1920x1080 logical canvas
  * that the platform scales to the panel; the video decoder plane is independent and can run
  * at the panel's true native resolution regardless of this. There is no benefit to a locally
@@ -58,6 +64,7 @@ typedef void NativePreconnectUi;
 #define NATIVE_CONFIG_STRING_MAX 512u
 #define NATIVE_PERSISTED_CONFIG_FILENAME "settings.json"
 #define NATIVE_PERSISTED_CONFIG_PATH_MAX 1024u
+#define NATIVE_PERSISTED_CONFIG_MAX_CANDIDATES 8u
 #define NATIVE_WHEEL_STEP_DEFAULT 60
 #define NATIVE_AUDIO_PREBUFFER_MS_DEFAULT 100
 #define NATIVE_WHEEL_SCROLL_DIVISOR_DEFAULT 1
@@ -96,15 +103,10 @@ typedef struct App {
     /* Server-driven cursor shapes/visibility; submitted from the RDP worker thread,
      * applied to the SDL cursor on the SDL thread (native_cursor_apply each loop tick). */
     NativeCursor cursor;
-#if defined(HELLOLG_WITH_EVDEV_MOUSE) && HELLOLG_WITH_EVDEV_MOUSE
-    /* Raw evdev mouse reader (active during streaming); its background thread posts events
-     * that the SDL loop drains. */
-    NativeMouseEvdev mouse_evdev;
-#endif
-#if defined(HELLOLG_WITH_EVDEV_KEYBOARD) && HELLOLG_WITH_EVDEV_KEYBOARD
-    /* Raw evdev keyboard reader (active during streaming); grabs the USB keyboard below the
-     * compositor so every scancode reaches RDP, and the SDL loop drains its queue. */
-    NativeKeyboardEvdev keyboard_evdev;
+#if HELLOLG_WITH_EVDEV_INPUT
+    /* Raw evdev mouse+keyboard reader (active during streaming); one background thread polls
+     * grabbed /dev/input devices and wakes the SDL loop through eventfd. */
+    NativeEvdevInput evdev_input;
 #endif
     uint16_t desktop_width;
     uint16_t desktop_height;
@@ -598,9 +600,11 @@ static bool native_config_save_json_file(const NativeConfig *config, const char 
 
     FILE *file = fopen(temp_path, "wb");
     if (!file) {
-        fprintf(stderr, "[native] failed to open persisted config for write: %s\n", strerror(errno));
+        fprintf(stderr, "[native] failed to open persisted config temp file %s for write: %s\n", temp_path,
+                strerror(errno));
         return false;
     }
+    (void)chmod(temp_path, S_IRUSR | S_IWUSR);
 
     bool ok = fprintf(file, "{\n  \"host\": ") >= 0 && native_config_write_json_string(file, config->host) &&
               fprintf(file, ",\n  \"port\": %u,\n  \"username\": ", (unsigned)config->port) >= 0 &&
@@ -632,20 +636,232 @@ static bool native_config_save_json_file(const NativeConfig *config, const char 
 }
 
 #if defined(HELLOLG_WITH_SDL) && HELLOLG_WITH_SDL
-static bool native_config_get_persisted_path(char *path, size_t cap) {
-    char *pref_path = SDL_GetPrefPath("truebest", "gnomecast");
-    if (!pref_path) {
-        fprintf(stderr, "[native] failed to resolve SDL pref path: %s\n", SDL_GetError());
+static bool native_config_join_path(char *path, size_t cap, const char *dir, const char *name) {
+    if (!path || cap == 0 || !dir || !dir[0] || !name || !name[0]) {
+        return false;
+    }
+    size_t len = strlen(dir);
+    const char *sep = dir[len - 1u] == '/' ? "" : "/";
+    int n = snprintf(path, cap, "%s%s%s", dir, sep, name);
+    return n > 0 && (size_t)n < cap;
+}
+
+static bool native_config_copy_path(char *dest, size_t cap, const char *src) {
+    if (!dest || cap == 0 || !src || !src[0]) {
+        return false;
+    }
+    size_t len = strlen(src);
+    if (len >= cap) {
+        return false;
+    }
+    memcpy(dest, src, len + 1u);
+    return true;
+}
+
+static bool native_config_parent_dir(const char *path, char *dir, size_t cap) {
+    if (!path || !path[0] || !dir || cap == 0) {
+        return false;
+    }
+    const char *slash = strrchr(path, '/');
+    if (!slash) {
+        return native_config_copy_path(dir, cap, ".");
+    }
+    size_t len = slash == path ? 1u : (size_t)(slash - path);
+    if (len == 0 || len >= cap) {
+        return false;
+    }
+    memcpy(dir, path, len);
+    dir[len] = '\0';
+    return true;
+}
+
+static bool native_config_mkdir_p(const char *dir) {
+    if (!dir || !dir[0]) {
+        errno = EINVAL;
+        return false;
+    }
+    if (strcmp(dir, ".") == 0 || strcmp(dir, "/") == 0) {
+        return true;
+    }
+
+    char tmp[NATIVE_PERSISTED_CONFIG_PATH_MAX];
+    if (!native_config_copy_path(tmp, sizeof(tmp), dir)) {
+        errno = ENAMETOOLONG;
         return false;
     }
 
-    int n = snprintf(path, cap, "%s%s", pref_path, NATIVE_PERSISTED_CONFIG_FILENAME);
-    SDL_free(pref_path);
-    if (n <= 0 || (size_t)n >= cap) {
-        fprintf(stderr, "[native] persisted config path is too long\n");
+    size_t len = strlen(tmp);
+    while (len > 1 && tmp[len - 1u] == '/') {
+        tmp[--len] = '\0';
+    }
+
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p != '/') {
+            continue;
+        }
+        *p = '\0';
+        if (mkdir(tmp, 0700) != 0 && errno != EEXIST) {
+            *p = '/';
+            return false;
+        }
+        *p = '/';
+    }
+
+    if (mkdir(tmp, 0700) != 0 && errno != EEXIST) {
+        return false;
+    }
+    struct stat st;
+    if (stat(tmp, &st) != 0) {
+        return false;
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        errno = ENOTDIR;
         return false;
     }
     return true;
+}
+
+static bool native_config_dir_writable(const char *dir) {
+    if (!native_config_mkdir_p(dir)) {
+        return false;
+    }
+
+    char test_path[NATIVE_PERSISTED_CONFIG_PATH_MAX];
+    char test_name[64];
+    (void)snprintf(test_name, sizeof(test_name), ".write-test-%lu.tmp", (unsigned long)getpid());
+    if (!native_config_join_path(test_path, sizeof(test_path), dir, test_name)) {
+        errno = ENAMETOOLONG;
+        return false;
+    }
+
+    FILE *file = fopen(test_path, "wb");
+    if (!file) {
+        return false;
+    }
+    bool ok = fputc('\n', file) != EOF;
+    if (fclose(file) != 0) {
+        ok = false;
+    }
+    if (remove(test_path) != 0) {
+        ok = false;
+    }
+    return ok;
+}
+
+typedef struct NativeConfigPathCandidates {
+    char paths[NATIVE_PERSISTED_CONFIG_MAX_CANDIDATES][NATIVE_PERSISTED_CONFIG_PATH_MAX];
+    size_t count;
+} NativeConfigPathCandidates;
+
+static bool native_config_add_candidate_path(NativeConfigPathCandidates *candidates, const char *path) {
+    if (!candidates || !path || !path[0]) {
+        return false;
+    }
+    for (size_t i = 0; i < candidates->count; i++) {
+        if (strcmp(candidates->paths[i], path) == 0) {
+            return true;
+        }
+    }
+    if (candidates->count >= NATIVE_PERSISTED_CONFIG_MAX_CANDIDATES) {
+        return false;
+    }
+    if (!native_config_copy_path(candidates->paths[candidates->count], sizeof(candidates->paths[candidates->count]),
+                                 path)) {
+        fprintf(stderr, "[native] persisted config path is too long\n");
+        return false;
+    }
+    candidates->count++;
+    return true;
+}
+
+static bool native_config_add_candidate_dir(NativeConfigPathCandidates *candidates, const char *dir) {
+    if (!dir || !dir[0]) {
+        return false;
+    }
+    char path[NATIVE_PERSISTED_CONFIG_PATH_MAX];
+    if (!native_config_join_path(path, sizeof(path), dir, NATIVE_PERSISTED_CONFIG_FILENAME)) {
+        fprintf(stderr, "[native] persisted config path is too long\n");
+        return false;
+    }
+    return native_config_add_candidate_path(candidates, path);
+}
+
+static bool native_config_add_candidate_app_dir(NativeConfigPathCandidates *candidates, const char *fmt,
+                                                const char *appid) {
+    char dir[NATIVE_PERSISTED_CONFIG_PATH_MAX];
+    int n = snprintf(dir, sizeof(dir), fmt, appid);
+    if (n <= 0 || (size_t)n >= sizeof(dir)) {
+        return false;
+    }
+    return native_config_add_candidate_dir(candidates, dir);
+}
+
+static void native_config_collect_persisted_candidates(NativeConfigPathCandidates *candidates) {
+    memset(candidates, 0, sizeof(*candidates));
+
+    (void)native_config_add_candidate_path(candidates, getenv("HELLOLG_NATIVE_SETTINGS_PATH"));
+    (void)native_config_add_candidate_dir(candidates, getenv("HELLOLG_NATIVE_SETTINGS_DIR"));
+
+    char *pref_path = SDL_GetPrefPath("truebest", "gnomecast");
+    if (pref_path) {
+        (void)native_config_add_candidate_dir(candidates, pref_path);
+        SDL_free(pref_path);
+    } else {
+        fprintf(stderr, "[native] failed to resolve SDL pref path: %s\n", SDL_GetError());
+    }
+
+    const char *appid = getenv("APPID");
+    if (!appid || !appid[0]) {
+        appid = NATIVE_APP_ID;
+    }
+
+    (void)native_config_add_candidate_app_dir(candidates, "/var/luna/preferences/%s", appid);
+    (void)native_config_add_candidate_app_dir(candidates, "/media/developer/apps/usr/palm/data/%s", appid);
+    (void)native_config_add_candidate_app_dir(candidates, "/media/internal/%s", appid);
+    (void)native_config_add_candidate_app_dir(candidates, "/var/run/%s", appid);
+
+    char fallback_dir[NATIVE_PERSISTED_CONFIG_PATH_MAX];
+    int n = snprintf(fallback_dir, sizeof(fallback_dir), "/tmp/%s-%lu", appid, (unsigned long)geteuid());
+    if (n > 0 && (size_t)n < sizeof(fallback_dir)) {
+        (void)native_config_add_candidate_dir(candidates, fallback_dir);
+    }
+}
+
+static bool native_config_persisted_path_writable(const char *path) {
+    char dir[NATIVE_PERSISTED_CONFIG_PATH_MAX];
+    return native_config_parent_dir(path, dir, sizeof(dir)) && native_config_dir_writable(dir);
+}
+
+static bool native_config_find_persisted_save_candidate(const NativeConfigPathCandidates *candidates, size_t *index) {
+    if (!candidates || !index) {
+        return false;
+    }
+    for (size_t i = 0; i < candidates->count; i++) {
+        if (!native_config_persisted_path_writable(candidates->paths[i])) {
+            continue;
+        }
+        *index = i;
+        return true;
+    }
+    return false;
+}
+
+static bool native_config_get_persisted_save_path(char *path, size_t cap) {
+    NativeConfigPathCandidates candidates;
+    native_config_collect_persisted_candidates(&candidates);
+
+    size_t index = 0;
+    if (native_config_find_persisted_save_candidate(&candidates, &index)) {
+        if (!native_config_copy_path(path, cap, candidates.paths[index])) {
+            fprintf(stderr, "[native] persisted config path is too long\n");
+            return false;
+        }
+        fprintf(stderr, "[native] using persisted config path: %s\n", path);
+        return true;
+    }
+
+    fprintf(stderr, "[native] no writable persisted config directory found\n");
+    return false;
 }
 
 static bool native_config_load_persisted(NativeConfig *config, bool force_ignore) {
@@ -655,24 +871,49 @@ static bool native_config_load_persisted(NativeConfig *config, bool force_ignore
         return true;
     }
 
-    char path[NATIVE_PERSISTED_CONFIG_PATH_MAX];
-    if (!native_config_get_persisted_path(path, sizeof(path))) {
-        fprintf(stderr, "[native] ignored persisted config because the SDL pref path is unavailable\n");
-        return true;
+    NativeConfigPathCandidates candidates;
+    native_config_collect_persisted_candidates(&candidates);
+    size_t save_index = 0;
+    bool have_save_candidate = native_config_find_persisted_save_candidate(&candidates, &save_index);
+    if (have_save_candidate) {
+        FILE *file = fopen(candidates.paths[save_index], "rb");
+        if (file) {
+            fclose(file);
+
+            NativeConfig loaded = *config;
+            if (!native_config_load_file_internal(&loaded, candidates.paths[save_index], false, false)) {
+                fprintf(stderr, "[native] ignored invalid persisted config: %s\n", candidates.paths[save_index]);
+                return true;
+            }
+            *config = loaded;
+            return true;
+        }
     }
 
-    NativeConfig loaded = *config;
-    if (!native_config_load_file_internal(&loaded, path, false, false)) {
-        fprintf(stderr, "[native] ignored invalid persisted config: %s\n", path);
+    for (size_t i = 0; i < candidates.count; i++) {
+        if (have_save_candidate && i == save_index) {
+            continue;
+        }
+        FILE *file = fopen(candidates.paths[i], "rb");
+        if (!file) {
+            continue;
+        }
+        fclose(file);
+
+        NativeConfig loaded = *config;
+        if (!native_config_load_file_internal(&loaded, candidates.paths[i], false, false)) {
+            fprintf(stderr, "[native] ignored invalid persisted config: %s\n", candidates.paths[i]);
+            return true;
+        }
+        *config = loaded;
         return true;
     }
-    *config = loaded;
     return true;
 }
 
 static bool native_config_save_persisted(const NativeConfig *config) {
     char path[NATIVE_PERSISTED_CONFIG_PATH_MAX];
-    if (!native_config_get_persisted_path(path, sizeof(path))) {
+    if (!native_config_get_persisted_save_path(path, sizeof(path))) {
         return false;
     }
     return native_config_save_json_file(config, path);
@@ -1354,13 +1595,9 @@ static void native_stop_rdp(App *app) {
     if (!app) {
         return;
     }
-#if defined(HELLOLG_WITH_EVDEV_MOUSE) && HELLOLG_WITH_EVDEV_MOUSE
-    /* Release the mouse grab so the preconnect UI (or the next session) gets SDL mouse. */
-    native_mouse_evdev_stop(&app->mouse_evdev);
-#endif
-#if defined(HELLOLG_WITH_EVDEV_KEYBOARD) && HELLOLG_WITH_EVDEV_KEYBOARD
-    /* Release the keyboard grab so the compositor/preconnect UI gets the USB keyboard back. */
-    native_keyboard_evdev_stop(&app->keyboard_evdev);
+#if HELLOLG_WITH_EVDEV_INPUT
+    /* Release the global evdev grab so the compositor/preconnect UI gets USB input back. */
+    native_evdev_input_stop(&app->evdev_input);
 #endif
     native_input_set_active(&app->input, false);
     native_input_set_session(&app->input, NULL);
@@ -1771,43 +2008,69 @@ static void native_flush_held_inputs(App *app) {
     }
 }
 
-#if defined(HELLOLG_WITH_EVDEV_MOUSE) && HELLOLG_WITH_EVDEV_MOUSE
+#if HELLOLG_WITH_EVDEV_INPUT
+#define NATIVE_EVDEV_MOUSE_BATCH 64u
+#define NATIVE_EVDEV_KEYBOARD_BATCH 64u
+
+static void native_flush_pending_evdev_motion(App *app, int *pending_dx, int *pending_dy, bool *moved) {
+    if (!app || !pending_dx || !pending_dy || (*pending_dx == 0 && *pending_dy == 0)) {
+        return;
+    }
+    native_set_virtual_mouse_position(app, atomic_load(&app->virtual_mouse_x) + *pending_dx,
+                                      atomic_load(&app->virtual_mouse_y) + *pending_dy);
+    native_input_pointer_move(&app->input, atomic_load(&app->virtual_mouse_x), atomic_load(&app->virtual_mouse_y));
+    *pending_dx = 0;
+    *pending_dy = 0;
+    if (moved) {
+        *moved = true;
+    }
+}
+
 /* SDL thread: apply queued raw-evdev mouse events. Relative motion is integrated into the
  * logical pointer and sent as an absolute server position; buttons/wheel are sent at the
  * current position. Because the mouse is grabbed, the compositor no longer moves the OS
  * pointer, so we warp it to the logical position to make the server cursor (drawn on the
  * platform cursor plane) follow. */
 static void native_drain_evdev_mouse(App *app, SDL_Window *window) {
-    if (!native_mouse_evdev_active(&app->mouse_evdev)) {
+    if (!native_evdev_input_mouse_active(&app->evdev_input)) {
         return;
     }
     bool moved = false;
-    NativeMouseEv ev;
-    while (native_mouse_evdev_pop(&app->mouse_evdev, &ev)) {
-        switch (ev.kind) {
-        case NATIVE_MOUSE_EV_MOTION:
-            native_set_virtual_mouse_position(app, atomic_load(&app->virtual_mouse_x) + ev.dx,
-                                              atomic_load(&app->virtual_mouse_y) + ev.dy);
-            native_input_pointer_move(&app->input, atomic_load(&app->virtual_mouse_x),
-                                      atomic_load(&app->virtual_mouse_y));
-            moved = true;
-            break;
-        case NATIVE_MOUSE_EV_BUTTON: {
-            NativeInputButton button = native_button_from_sdl(ev.sdl_button);
-            if (button != 0) {
-                native_input_pointer_button(&app->input, atomic_load(&app->virtual_mouse_x),
-                                            atomic_load(&app->virtual_mouse_y), button, ev.down);
-                native_track_button(app, button, ev.down);
-            }
+    int pending_dx = 0;
+    int pending_dy = 0;
+    NativeMouseEv events[NATIVE_EVDEV_MOUSE_BATCH];
+    for (;;) {
+        size_t count = native_evdev_input_pop_mouse_batch(&app->evdev_input, events, NATIVE_EVDEV_MOUSE_BATCH);
+        if (count == 0) {
             break;
         }
-        case NATIVE_MOUSE_EV_WHEEL:
-            if (ev.wheel_y != 0) {
-                native_send_scaled_wheel(app, ev.wheel_y);
+        for (size_t i = 0; i < count; i++) {
+            NativeMouseEv *ev = &events[i];
+            switch (ev->kind) {
+            case NATIVE_MOUSE_EV_MOTION:
+                pending_dx += ev->dx;
+                pending_dy += ev->dy;
+                break;
+            case NATIVE_MOUSE_EV_BUTTON: {
+                native_flush_pending_evdev_motion(app, &pending_dx, &pending_dy, &moved);
+                NativeInputButton button = native_button_from_sdl(ev->sdl_button);
+                if (button != 0) {
+                    native_input_pointer_button(&app->input, atomic_load(&app->virtual_mouse_x),
+                                                atomic_load(&app->virtual_mouse_y), button, ev->down);
+                    native_track_button(app, button, ev->down);
+                }
+                break;
             }
-            break;
+            case NATIVE_MOUSE_EV_WHEEL:
+                native_flush_pending_evdev_motion(app, &pending_dx, &pending_dy, &moved);
+                if (ev->wheel_y != 0) {
+                    native_send_scaled_wheel(app, ev->wheel_y);
+                }
+                break;
+            }
         }
     }
+    native_flush_pending_evdev_motion(app, &pending_dx, &pending_dy, &moved);
     if (moved) {
         if (app->cursor_reassert_pending) {
             /* First real movement after regaining focus: re-show the cursor now that the
@@ -1823,36 +2086,18 @@ static void native_drain_evdev_mouse(App *app, SDL_Window *window) {
         }
     }
 }
-#endif
 
-#if defined(HELLOLG_WITH_EVDEV_KEYBOARD) && HELLOLG_WITH_EVDEV_KEYBOARD
-static void native_log_evdev_key(uint16_t code, bool down, bool mapped, uint8_t scancode, bool extended, bool sent) {
-    /* Cap mapped-key logs to keep logs quiet, but keep logging unmapped codes (media/consumer
-     * keys the reader forwards but we can't translate) for the whole session so a live test
-     * can spot keys arriving at the wrong evdev node. */
-    static unsigned mapped_log_count = 0;
+static void native_log_unmapped_evdev_key(uint16_t code, bool down) {
     static unsigned unmapped_log_count = 0;
-    if (mapped) {
-        if (mapped_log_count >= 64) {
-            if (mapped_log_count == 64) {
-                fprintf(stderr, "[native-input] further mapped evdev key logs suppressed (unmapped keys still logged)\n");
-                mapped_log_count++;
-            }
-            return;
+    if (unmapped_log_count >= 256) {
+        if (unmapped_log_count == 256) {
+            fprintf(stderr, "[native-input] further unmapped evdev key logs suppressed\n");
+            unmapped_log_count++;
         }
-        mapped_log_count++;
-    } else {
-        if (unmapped_log_count >= 256) {
-            if (unmapped_log_count == 256) {
-                fprintf(stderr, "[native-input] further unmapped evdev key logs suppressed\n");
-                unmapped_log_count++;
-            }
-            return;
-        }
-        unmapped_log_count++;
+        return;
     }
-    fprintf(stderr, "[native-input] evdev key %s code=%u mapped=%d rdp=0x%02x ext=%d sent=%d\n",
-            down ? "down" : "up", (unsigned)code, mapped ? 1 : 0, (unsigned)scancode, extended ? 1 : 0, sent ? 1 : 0);
+    unmapped_log_count++;
+    fprintf(stderr, "[native-input] unmapped evdev key %s code=%u\n", down ? "down" : "up", (unsigned)code);
 }
 
 /* SDL thread: apply queued raw-evdev keyboard events. Each Linux keycode is translated to its
@@ -1863,23 +2108,58 @@ static void native_log_evdev_key(uint16_t code, bool down, bool mapped, uint8_t 
  * local hide-on-keypress would only fight that (and is what made the cursor vanish mid-typing
  * before). */
 static void native_drain_evdev_keyboard(App *app) {
-    if (!native_keyboard_evdev_active(&app->keyboard_evdev)) {
+    if (!native_evdev_input_keyboard_active(&app->evdev_input)) {
         return;
     }
-    NativeKeyboardEv ev;
-    while (native_keyboard_evdev_pop(&app->keyboard_evdev, &ev)) {
-        uint8_t rdp_scancode = 0;
-        bool extended = false;
-        if (!native_input_linux_keycode_to_rdp(ev.code, &rdp_scancode, &extended)) {
-            native_log_evdev_key(ev.code, ev.down, false, 0, false, false);
-            continue;
+    NativeKeyboardEv events[NATIVE_EVDEV_KEYBOARD_BATCH];
+    for (;;) {
+        size_t count =
+            native_evdev_input_pop_keyboard_batch(&app->evdev_input, events, NATIVE_EVDEV_KEYBOARD_BATCH);
+        if (count == 0) {
+            break;
         }
-        bool sent = native_input_key(&app->input, rdp_scancode, ev.down, extended);
-        native_track_key(app, rdp_scancode, extended, ev.down);
-        native_log_evdev_key(ev.code, ev.down, true, rdp_scancode, extended, sent);
+        for (size_t i = 0; i < count; i++) {
+            uint8_t rdp_scancode = 0;
+            bool extended = false;
+            if (!native_input_linux_keycode_to_rdp(events[i].code, &rdp_scancode, &extended)) {
+                native_log_unmapped_evdev_key(events[i].code, events[i].down);
+                continue;
+            }
+            bool sent = native_input_key(&app->input, rdp_scancode, events[i].down, extended);
+            if (sent) {
+                native_track_key(app, rdp_scancode, extended, events[i].down);
+            }
+        }
     }
 }
 #endif
+
+static void native_wait_for_loop_tick(App *app, uint32_t delay_ms) {
+    int timeout_ms = (int)(delay_ms == 0 ? 1 : delay_ms);
+#if HELLOLG_WITH_EVDEV_INPUT
+    int wake_fd = app ? native_evdev_input_wake_fd(&app->evdev_input) : -1;
+    if (wake_fd >= 0) {
+        struct pollfd pfd;
+        pfd.fd = wake_fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        int ret;
+        do {
+            ret = poll(&pfd, 1, timeout_ms);
+        } while (ret < 0 && errno == EINTR);
+        if (ret > 0 && (pfd.revents & POLLIN)) {
+            native_evdev_input_clear_wake(&app->evdev_input);
+            return;
+        }
+        if (ret == 0) {
+            return;
+        }
+    }
+#else
+    (void)app;
+#endif
+    SDL_Delay((Uint32)timeout_ms);
+}
 
 /* Start the evdev input readers when streaming becomes active. The mouse degrades to the SDL
  * compositor-pointer path (Magic Remote) when no USB mouse is present, so a failed mouse grab
@@ -1889,13 +2169,16 @@ static bool native_start_streaming_input(App *app) {
     if (!app) {
         return false;
     }
-#if defined(HELLOLG_WITH_EVDEV_MOUSE) && HELLOLG_WITH_EVDEV_MOUSE
-    if (!native_mouse_evdev_start(&app->mouse_evdev)) {
+#if HELLOLG_WITH_EVDEV_INPUT
+    if (!native_evdev_input_start(&app->evdev_input)) {
+        fprintf(stderr,
+                "[native] WARNING: no USB mouse/keyboard grabbed; using SDL mouse fallback and no keyboard input\n");
+        return false;
+    }
+    if (!native_evdev_input_mouse_active(&app->evdev_input)) {
         fprintf(stderr, "[native] no USB mouse to grab; using the compositor pointer (Magic Remote) via SDL\n");
     }
-#endif
-#if defined(HELLOLG_WITH_EVDEV_KEYBOARD) && HELLOLG_WITH_EVDEV_KEYBOARD
-    if (!native_keyboard_evdev_start(&app->keyboard_evdev)) {
+    if (!native_evdev_input_keyboard_active(&app->evdev_input)) {
         fprintf(stderr,
                 "[native] WARNING: no USB keyboard grabbed and there is no SDL keyboard fallback; this "
                 "session has no keyboard input until a USB keyboard is attached and the session restarts\n");
@@ -1917,11 +2200,8 @@ static void native_stop_streaming_input(App *app) {
     /* Flush releases for anything held BEFORE dropping the grab: once the grab is gone the
      * up-events go to the overlay, not RDP, and the server would keep the drag/key stuck. */
     native_flush_held_inputs(app);
-#if defined(HELLOLG_WITH_EVDEV_MOUSE) && HELLOLG_WITH_EVDEV_MOUSE
-    native_mouse_evdev_stop(&app->mouse_evdev);
-#endif
-#if defined(HELLOLG_WITH_EVDEV_KEYBOARD) && HELLOLG_WITH_EVDEV_KEYBOARD
-    native_keyboard_evdev_stop(&app->keyboard_evdev);
+#if HELLOLG_WITH_EVDEV_INPUT
+    native_evdev_input_stop(&app->evdev_input);
 #endif
 }
 
@@ -2088,8 +2368,8 @@ static void handle_sdl_event(App *app, SDL_Window *window, SDL_Renderer *rendere
         if (app->window_unfocused) {
             break; /* an overlay/menu has focus: the released mouse must not move the RDP cursor */
         }
-#if defined(HELLOLG_WITH_EVDEV_MOUSE) && HELLOLG_WITH_EVDEV_MOUSE
-        if (native_mouse_evdev_active(&app->mouse_evdev)) {
+#if HELLOLG_WITH_EVDEV_INPUT
+        if (native_evdev_input_mouse_active(&app->evdev_input)) {
             break; /* a grabbed USB mouse is read via evdev */
         }
 #endif
@@ -2107,8 +2387,8 @@ static void handle_sdl_event(App *app, SDL_Window *window, SDL_Renderer *rendere
         if (app->window_unfocused) {
             break;
         }
-#if defined(HELLOLG_WITH_EVDEV_MOUSE) && HELLOLG_WITH_EVDEV_MOUSE
-        if (native_mouse_evdev_active(&app->mouse_evdev)) {
+#if HELLOLG_WITH_EVDEV_INPUT
+        if (native_evdev_input_mouse_active(&app->evdev_input)) {
             break;
         }
 #endif
@@ -2126,8 +2406,8 @@ static void handle_sdl_event(App *app, SDL_Window *window, SDL_Renderer *rendere
         if (app->window_unfocused) {
             break;
         }
-#if defined(HELLOLG_WITH_EVDEV_MOUSE) && HELLOLG_WITH_EVDEV_MOUSE
-        if (native_mouse_evdev_active(&app->mouse_evdev)) {
+#if HELLOLG_WITH_EVDEV_INPUT
+        if (native_evdev_input_mouse_active(&app->evdev_input)) {
             break;
         }
 #endif
@@ -2142,7 +2422,7 @@ static void handle_sdl_event(App *app, SDL_Window *window, SDL_Renderer *rendere
     }
     case SDL_KEYDOWN:
     case SDL_KEYUP:
-        /* The USB keyboard is read from grabbed /dev/input (keyboard_evdev); there is no SDL
+        /* The USB keyboard is read from grabbed /dev/input (input_evdev); there is no SDL
          * keyboard path. The one key still taken from SDL is the webOS remote's red key
          * (power/shutdown): it comes from the ungrabbed TV remote, not the grabbed keyboard.
          *
@@ -2261,10 +2541,10 @@ static int native_run_app_loop(App *app, NativeConfig *config, const RdpCallback
     bool present_logged = false;
     bool streaming_visible = false;
 
-#if defined(HELLOLG_WITH_EVDEV_KEYBOARD) && HELLOLG_WITH_EVDEV_KEYBOARD
+#if HELLOLG_WITH_EVDEV_INPUT
     /* The keyboard is read from grabbed /dev/input with no SDL fallback; warn on the visible
      * preconnect screen if none is attached so it isn't discovered only after connecting. */
-    if (!native_keyboard_evdev_probe()) {
+    if (!native_evdev_input_probe_keyboard()) {
         native_preconnect_ui_set_status(ui, "No USB keyboard detected — you can connect, but keyboard input needs one.",
                                         true);
     }
@@ -2276,10 +2556,8 @@ static int native_run_app_loop(App *app, NativeConfig *config, const RdpCallback
             native_drain_pointer_clamp(app);
             native_drain_pointer_warp(app, window);
             native_cursor_tick(app);
-#if defined(HELLOLG_WITH_EVDEV_MOUSE) && HELLOLG_WITH_EVDEV_MOUSE
+#if HELLOLG_WITH_EVDEV_INPUT
             native_drain_evdev_mouse(app, window);
-#endif
-#if defined(HELLOLG_WITH_EVDEV_KEYBOARD) && HELLOLG_WITH_EVDEV_KEYBOARD
             native_drain_evdev_keyboard(app);
 #endif
             SDL_Event event;
@@ -2377,7 +2655,7 @@ static int native_run_app_loop(App *app, NativeConfig *config, const RdpCallback
         }
 
         native_preconnect_ui_tick(ui);
-        SDL_Delay(delay_ms == 0 ? 1 : delay_ms);
+        native_wait_for_loop_tick(app, delay_ms);
     }
 
     native_preconnect_ui_destroy(ui);
@@ -2400,10 +2678,8 @@ static int native_run_app_loop(App *app, NativeConfig *config, const RdpCallback
         native_drain_pointer_clamp(app);
         native_drain_pointer_warp(app, window);
         native_cursor_tick(app);
-#if defined(HELLOLG_WITH_EVDEV_MOUSE) && HELLOLG_WITH_EVDEV_MOUSE
+#if HELLOLG_WITH_EVDEV_INPUT
         native_drain_evdev_mouse(app, window);
-#endif
-#if defined(HELLOLG_WITH_EVDEV_KEYBOARD) && HELLOLG_WITH_EVDEV_KEYBOARD
         native_drain_evdev_keyboard(app);
 #endif
         SDL_Event event;
@@ -2416,7 +2692,7 @@ static int native_run_app_loop(App *app, NativeConfig *config, const RdpCallback
         } else {
             native_present_surface_frame(window, &present_logged);
         }
-        SDL_Delay(delay_ms == 0 ? 1 : delay_ms);
+        native_wait_for_loop_tick(app, delay_ms);
     }
 #endif
 

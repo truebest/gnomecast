@@ -82,34 +82,31 @@ if(HELLOLG_WITH_SDL)
     target_link_libraries(gnomecast-native PRIVATE ${SDL2_LIBRARIES})
   endif()
 
-  # Raw evdev mouse reader (webOS): reuse the proven evmouse.c from the commons submodule
-  # (it needs linux/input.h — present on the webOS toolchain and Linux hosts) plus our thin
-  # wrapper. Only built with SDL; commons_log_printf is provided by mouse_evdev.c. The mouse
-  # keeps an SDL fallback (the compositor pointer / Magic Remote), so a missing reader only
-  # degrades to that path — a warning, not a hard error.
-  set(HELLOLG_EVMOUSE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/commons/device/evmouse")
-  set(HELLOLG_COMMONS_LOGGING_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/commons/util/logging")
-  if(EXISTS "${HELLOLG_EVMOUSE_DIR}/evmouse.c")
-    target_sources(gnomecast-native PRIVATE src/mouse_evdev.c "${HELLOLG_EVMOUSE_DIR}/evmouse.c")
-    target_include_directories(gnomecast-native PRIVATE "${HELLOLG_EVMOUSE_DIR}" "${HELLOLG_COMMONS_LOGGING_DIR}")
-    target_compile_definitions(gnomecast-native PRIVATE HELLOLG_WITH_EVDEV_MOUSE=1)
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(LIBEVDEV REQUIRED IMPORTED_TARGET libevdev)
+  if(HELLOLG_TARGET_WEBOS)
+    find_library(HELLOLG_LIBEVDEV_STATIC_LIBRARY NAMES libevdev.a PATHS ${LIBEVDEV_LIBRARY_DIRS} NO_DEFAULT_PATH)
+    if(NOT HELLOLG_LIBEVDEV_STATIC_LIBRARY)
+      message(FATAL_ERROR "webOS SDL builds require static libevdev.a in the target sysroot")
+    endif()
+    target_include_directories(gnomecast-native PRIVATE ${LIBEVDEV_INCLUDE_DIRS})
+    target_link_libraries(gnomecast-native PRIVATE "${HELLOLG_LIBEVDEV_STATIC_LIBRARY}" rt)
+  elseif(TARGET PkgConfig::LIBEVDEV)
+    target_link_libraries(gnomecast-native PRIVATE PkgConfig::LIBEVDEV)
   else()
-    message(WARNING "commons evmouse source not found at ${HELLOLG_EVMOUSE_DIR}; the mouse will use the SDL fallback only")
+    target_include_directories(gnomecast-native PRIVATE ${LIBEVDEV_INCLUDE_DIRS})
+    target_link_libraries(gnomecast-native PRIVATE ${LIBEVDEV_LIBRARIES})
   endif()
+  message(STATUS "Using libevdev for native mouse/keyboard readers")
 
-  # Raw evdev keyboard reader (webOS): self-contained /dev/input reader (no evmouse dep),
-  # needs only linux/input.h. Grabbing the USB keyboard below the compositor delivers raw
-  # scancodes for the full RDP desktop. Unlike the mouse there is NO SDL keyboard fallback, so
-  # the reader is mandatory for an SDL build: a missing linux/input.h would ship a package with
-  # no keyboard input at all, hence a hard error rather than a warning.
   include(CheckIncludeFile)
   check_include_file("linux/input.h" HELLOLG_HAVE_LINUX_INPUT_H)
-  if(HELLOLG_HAVE_LINUX_INPUT_H)
-    target_sources(gnomecast-native PRIVATE src/keyboard_evdev.c)
-    target_compile_definitions(gnomecast-native PRIVATE HELLOLG_WITH_EVDEV_KEYBOARD=1)
-  else()
-    message(FATAL_ERROR "linux/input.h not found: the evdev keyboard reader is required for an SDL build (there is no SDL keyboard fallback)")
+  if(NOT HELLOLG_HAVE_LINUX_INPUT_H)
+    message(FATAL_ERROR "linux/input.h not found: libevdev input readers require Linux input event codes")
   endif()
+
+  target_sources(gnomecast-native PRIVATE src/input_evdev.c)
+  target_compile_definitions(gnomecast-native PRIVATE HELLOLG_WITH_EVDEV_MOUSE=1 HELLOLG_WITH_EVDEV_KEYBOARD=1)
 endif()
 
 if(HELLOLG_WITH_PRECONNECT_UI)
@@ -200,6 +197,9 @@ if(EXISTS "${HELLOLG_COMMONS_SOURCE_DIR}/LICENSE")
 endif()
 if(EXISTS "${HELLOLG_LVGL_SOURCE_DIR}/LICENCE.txt")
   install(FILES "${HELLOLG_LVGL_SOURCE_DIR}/LICENCE.txt" DESTINATION licenses RENAME lvgl-MIT.txt)
+endif()
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/libevdev-COPYING")
+  install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/libevdev-COPYING" DESTINATION licenses RENAME libevdev-COPYING.txt)
 endif()
 
 set(HELLOLG_NATIVE_STAGE_DIR "${CMAKE_BINARY_DIR}/webos-stage" CACHE PATH "Staging directory for native webOS packaging")

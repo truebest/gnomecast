@@ -44,6 +44,15 @@ and browser WASM bundle were removed and are not runtime dependencies of the nat
 - License: MIT; see `third_party/lvgl/LICENCE.txt`
 - Native usage: SDL-rendered pre-connect GUI for host/port entry before native RDP startup.
 
+## libevdev
+
+- Source: https://www.freedesktop.org/software/libevdev/libevdev-1.13.6.tar.xz
+- Version: 1.13.6
+- SHA-256: `73f215eccbd8233f414737ac06bca2687e67c44b97d2d7576091aa9718551110`
+- License: MIT, with the bundled Linux input header GPL-2.0 notice recorded in
+  `third_party/libevdev-COPYING`
+- Native usage: statically linked into webOS builds for grabbed USB mouse/keyboard evdev input.
+
 ## Moonlight reference boundary
 
 [Moonlight TV](https://github.com/mariotaku/moonlight-tv) (GPL-3.0) was used as a

@@ -14,6 +14,9 @@ ARG NODE_VERSION=20.20.2
 ARG WEBOS_CLI_VERSION=3.2.4
 ARG WEBOS_TOOLCHAIN_URL=https://github.com/openlgtv/buildroot-nc4/releases/latest/download/arm-webos-linux-gnueabi_sdk-buildroot-x86_64.tar.gz
 ARG WEBOS_TOOLCHAIN_DIR=/opt/arm-webos-linux-gnueabi_sdk-buildroot
+ARG LIBEVDEV_VERSION=1.13.6
+ARG LIBEVDEV_SHA256=73f215eccbd8233f414737ac06bca2687e67c44b97d2d7576091aa9718551110
+ARG LIBEVDEV_URL=https://www.freedesktop.org/software/libevdev/libevdev-${LIBEVDEV_VERSION}.tar.xz
 
 ENV CARGO_HOME=/opt/cargo \
     RUSTUP_HOME=/opt/rustup \
@@ -73,6 +76,32 @@ RUN set -eux; \
     rm -f "${WEBOS_TOOLCHAIN_DIR}/bin/cmake" "${WEBOS_TOOLCHAIN_DIR}/bin/ctest" "${WEBOS_TOOLCHAIN_DIR}/bin/cpack"; \
     cmake --version | head -n 1; \
     "${WEBOS_TOOLCHAIN_DIR}/bin/arm-webos-linux-gnueabi-gcc" --version | head -n 1
+
+RUN set -eux; \
+    sysroot="${WEBOS_TOOLCHAIN_DIR}/arm-webos-linux-gnueabi/sysroot"; \
+    curl -fL --retry 3 -o /tmp/libevdev.tar.xz "${LIBEVDEV_URL}"; \
+    echo "${LIBEVDEV_SHA256}  /tmp/libevdev.tar.xz" | sha256sum -c -; \
+    mkdir -p /tmp/libevdev-src /tmp/libevdev-build; \
+    tar -xJf /tmp/libevdev.tar.xz -C /tmp/libevdev-src --strip-components=1; \
+    cd /tmp/libevdev-build; \
+    CC="${WEBOS_TOOLCHAIN_DIR}/bin/arm-webos-linux-gnueabi-gcc" \
+      AR="${WEBOS_TOOLCHAIN_DIR}/bin/arm-webos-linux-gnueabi-ar" \
+      RANLIB="${WEBOS_TOOLCHAIN_DIR}/bin/arm-webos-linux-gnueabi-ranlib" \
+      STRIP="${WEBOS_TOOLCHAIN_DIR}/bin/arm-webos-linux-gnueabi-strip" \
+      CFLAGS="-Os" \
+      /tmp/libevdev-src/configure \
+        --host=arm-webos-linux-gnueabi \
+        --prefix=/usr \
+        --disable-shared \
+        --enable-static; \
+    make -C libevdev -j"$(nproc)"; \
+    make -C libevdev install DESTDIR="${sysroot}"; \
+    mkdir -p "${sysroot}/usr/lib/pkgconfig"; \
+    cp libevdev.pc "${sysroot}/usr/lib/pkgconfig/libevdev.pc"; \
+    "${WEBOS_TOOLCHAIN_DIR}/bin/pkg-config" --modversion libevdev; \
+    test -f "${sysroot}/usr/lib/libevdev.a"; \
+    test -f "${sysroot}/usr/include/libevdev-1.0/libevdev/libevdev.h"; \
+    rm -rf /tmp/libevdev.tar.xz /tmp/libevdev-src /tmp/libevdev-build
 
 WORKDIR /workspace
 

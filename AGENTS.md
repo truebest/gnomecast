@@ -27,7 +27,7 @@ and the webOS buildroot toolchain + `ares` CLI for packaging.
 ## Key paths
 
 - `native/src/main.c` — webOS lifecycle, config, RDP callbacks, SDL event loop, presentation.
-- `native/src/mouse_evdev.c`, `native/src/keyboard_evdev.c` — raw `/dev/input` readers (grabbed).
+- `native/src/input_evdev.c` / `.h` — unified raw `/dev/input` mouse+keyboard reader (grabbed).
 - `native/src/input_sdl.c` / `.h` — RDP fast-path input: window↔desktop coordinate mapping and
   the Linux-keycode / SDL-scancode → RDP scancode maps.
 - `native/src/cursor_sdl.c` / `.h` — server-driven cursor on the platform cursor plane.

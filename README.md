@@ -74,8 +74,8 @@ cost on both ends.
 
 ## Layout
 
-- `native/` — C11/CMake shell: webOS lifecycle, raw evdev input readers
-  (`mouse_evdev.c`/`keyboard_evdev.c`, with an SDL pointer fallback) and SDL presentation, the
+- `native/` — C11/CMake shell: webOS lifecycle, raw evdev mouse+keyboard reader
+  (`input_evdev.c`, with an SDL pointer fallback) and SDL presentation, the
   shared ss4s media player (`media_ss4s.c`) with its video (`video_ss4s.c`) and audio
   (`audio_ss4s.c`) tracks, RemoteFX RGBA presentation, pre-connect UI, package targets.
 - `webrdp-min/` — Rust static library implementing the RDP client (direct TCP + TLS +
