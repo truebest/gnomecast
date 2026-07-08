@@ -26,6 +26,11 @@ if(HELLOLG_C_COMPILER_NAME MATCHES "arm-webos-linux-gnueabi-.*" OR CMAKE_C_COMPI
   set(HELLOLG_TARGET_WEBOS ON)
 endif()
 
+# Default ON only for product (webOS) builds: ExternalOPUS downloads the libopus source
+# tarball at build time, which would break the documented offline host smoke build.
+# Host test runs opt in with -DHELLOLG_WITH_OPUS=ON to cover the audio-opus ctest.
+option(HELLOLG_WITH_OPUS "Decode rdpsnd Opus streams in-process for the audio mixer" ${HELLOLG_TARGET_WEBOS})
+
 if(HELLOLG_TARGET_WEBOS)
   if(NOT HELLOLG_LINK_RDP_FFI)
     message(FATAL_ERROR "webOS product builds require HELLOLG_LINK_RDP_FFI=ON")
@@ -40,13 +45,18 @@ endif()
 
 add_executable(gnomecast-native
   src/main.c
+  src/config_paths.c
+  src/settings_json.c
   src/media_ss4s.c
   src/video_rgba_sdl.c
   src/video_ss4s.c
   src/audio_ss4s.c
+  src/audio_mixer.c
+  src/audio_opus.c
   src/h264_annexb.c
   src/input_sdl.c
   src/cursor_sdl.c
+  src/ui_mixer.c
 )
 
 find_package(Threads REQUIRED)
@@ -59,7 +69,25 @@ target_compile_definitions(gnomecast-native PRIVATE
   $<$<BOOL:${HELLOLG_WITH_PRECONNECT_UI}>:HELLOLG_WITH_PRECONNECT_UI=1>
 )
 
-target_link_libraries(gnomecast-native PRIVATE Threads::Threads)
+# libm: the volume overlay's meter math (log10f) lives in SDL builds, but linking m
+# unconditionally is harmless and keeps the host build in sync.
+target_link_libraries(gnomecast-native PRIVATE Threads::Threads m)
+
+if(HELLOLG_WITH_OPUS)
+  # Reuses ss4s's recipe: builds libopus 1.4 from source under the active toolchain.
+  # Placed BEFORE the ss4s subdirectory so its ndl-webos5 module (opus-fix shim) picks up
+  # the same OPUS_FOUND/OPUS_LIBRARIES instead of creating a second ext_opus target.
+  list(APPEND CMAKE_MODULE_PATH "${HELLOLG_SS4S_SOURCE_DIR}/cmake")
+  include(ExternalOPUS)
+  target_compile_definitions(gnomecast-native PRIVATE HELLOLG_WITH_OPUS=1)
+  target_include_directories(gnomecast-native SYSTEM PRIVATE ${OPUS_INCLUDE_DIRS})
+  target_link_libraries(gnomecast-native PRIVATE ${OPUS_LIBRARIES})
+  ExternalProject_Get_Property(ext_opus INSTALL_DIR)
+  set_property(TARGET gnomecast-native APPEND PROPERTY BUILD_RPATH "${INSTALL_DIR}/lib")
+  # Ship our own copy: webOS carries a system libopus.so.0, but do not depend on it.
+  install(DIRECTORY "${INSTALL_DIR}/lib/" DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    FILES_MATCHING PATTERN "libopus.so*")
+endif()
 
 if(HELLOLG_LINK_RDP_FFI)
   if(NOT DEFINED RDP_FFI_LIB)
@@ -259,4 +287,40 @@ if(BUILD_TESTING)
   target_include_directories(test-cursor-sdl PRIVATE include)
   target_link_libraries(test-cursor-sdl PRIVATE Threads::Threads)
   add_test(NAME cursor-sdl COMMAND test-cursor-sdl)
+
+  add_executable(test-config-paths
+    tests/test_config_paths.c
+    src/config_paths.c
+  )
+  target_include_directories(test-config-paths PRIVATE include)
+  add_test(NAME config-paths COMMAND test-config-paths)
+
+  add_executable(test-settings-json
+    tests/test_settings_json.c
+    src/settings_json.c
+    src/config_paths.c
+  )
+  target_include_directories(test-settings-json PRIVATE include)
+  add_test(NAME settings-json COMMAND test-settings-json)
+
+  add_executable(test-audio-mixer
+    tests/test_audio_mixer.c
+    src/audio_mixer.c
+  )
+  target_include_directories(test-audio-mixer PRIVATE include)
+  target_link_libraries(test-audio-mixer PRIVATE Threads::Threads)
+  add_test(NAME audio-mixer COMMAND test-audio-mixer)
+
+  if(HELLOLG_WITH_OPUS)
+    add_executable(test-audio-opus
+      tests/test_audio_opus.c
+      src/audio_opus.c
+    )
+    target_compile_definitions(test-audio-opus PRIVATE HELLOLG_WITH_OPUS=1)
+    target_include_directories(test-audio-opus PRIVATE include)
+    target_include_directories(test-audio-opus SYSTEM PRIVATE ${OPUS_INCLUDE_DIRS})
+    target_link_libraries(test-audio-opus PRIVATE ${OPUS_LIBRARIES} m)
+    set_property(TARGET test-audio-opus APPEND PROPERTY BUILD_RPATH "${INSTALL_DIR}/lib")
+    add_test(NAME audio-opus COMMAND test-audio-opus)
+  endif()
 endif()

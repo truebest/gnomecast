@@ -24,6 +24,8 @@ _Static_assert(sizeof(((RdpConfig *)0)->port) == sizeof(uint16_t), "RdpConfig.po
 _Static_assert(sizeof(((RdpConfig *)0)->width) == sizeof(uint16_t), "RdpConfig.width must stay uint16_t");
 _Static_assert(sizeof(((RdpConfig *)0)->height) == sizeof(uint16_t), "RdpConfig.height must stay uint16_t");
 _Static_assert(sizeof(((RdpConfig *)0)->fps) == sizeof(uint16_t), "RdpConfig.fps must stay uint16_t");
+_Static_assert(sizeof(((RdpConfig *)0)->prefer_pcm_audio) == sizeof(uint8_t),
+               "RdpConfig.prefer_pcm_audio must stay uint8_t");
 _Static_assert(sizeof(((RdpCallbacks *)0)->ctx) == sizeof(void *), "RdpCallbacks.ctx must be a pointer");
 
 #if UINTPTR_MAX == UINT64_MAX
@@ -35,6 +37,7 @@ _Static_assert(offsetof(RdpConfig, domain) == 32, "RdpConfig.domain offset chang
 _Static_assert(offsetof(RdpConfig, width) == 40, "RdpConfig.width offset changed");
 _Static_assert(offsetof(RdpConfig, height) == 42, "RdpConfig.height offset changed");
 _Static_assert(offsetof(RdpConfig, fps) == 44, "RdpConfig.fps offset changed");
+_Static_assert(offsetof(RdpConfig, prefer_pcm_audio) == 46, "RdpConfig.prefer_pcm_audio offset changed");
 _Static_assert(sizeof(RdpConfig) == 48, "RdpConfig size changed");
 
 _Static_assert(offsetof(RdpCallbacks, ctx) == 0, "RdpCallbacks.ctx offset changed");
@@ -58,6 +61,7 @@ _Static_assert(offsetof(RdpConfig, domain) == 16, "RdpConfig.domain offset chang
 _Static_assert(offsetof(RdpConfig, width) == 20, "RdpConfig.width offset changed");
 _Static_assert(offsetof(RdpConfig, height) == 22, "RdpConfig.height offset changed");
 _Static_assert(offsetof(RdpConfig, fps) == 24, "RdpConfig.fps offset changed");
+_Static_assert(offsetof(RdpConfig, prefer_pcm_audio) == 26, "RdpConfig.prefer_pcm_audio offset changed");
 _Static_assert(sizeof(RdpConfig) == 28, "RdpConfig size changed");
 
 _Static_assert(offsetof(RdpCallbacks, ctx) == 0, "RdpCallbacks.ctx offset changed");

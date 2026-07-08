@@ -37,11 +37,15 @@ use ironrdp_egfx::pdu::{
 use ironrdp_graphics::image_processing::PixelFormat;
 use ironrdp_graphics::pointer::DecodedPointer;
 use ironrdp_pdu::gcc::KeyboardType;
+use ironrdp_pdu::geometry::InclusiveRectangle;
 use ironrdp_pdu::geometry::Rectangle as _;
 use ironrdp_pdu::input::fast_path::{FastPathInputEvent, KeyboardFlags, SynchronizeFlags};
 use ironrdp_pdu::input::mouse::{MousePdu, PointerFlags};
 use ironrdp_pdu::rdp::capability_sets::MajorPlatformType;
 use ironrdp_pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
+use ironrdp_pdu::rdp::headers::ShareDataPdu;
+use ironrdp_pdu::rdp::refresh_rectangle::RefreshRectanglePdu;
+use ironrdp_pdu::rdp::suppress_output::SuppressOutputPdu;
 use ironrdp_pdu::PduResult;
 use ironrdp_rdpsnd::pdu as sndpdu;
 use ironrdp_session::image::DecodedImage;
@@ -89,6 +93,9 @@ pub struct RdpConfig {
     pub width: u16,
     pub height: u16,
     pub fps: u16,
+    /// Non-zero: advertise only PCM to rdpsnd for a lossless stream (grd would otherwise
+    /// pick Opus when both are offered). Fits in the struct's tail padding on both ABIs.
+    pub prefer_pcm_audio: u8,
 }
 
 #[repr(C)]
@@ -138,6 +145,7 @@ struct NativeConfig {
     width: u16,
     height: u16,
     fps: u16,
+    prefer_pcm_audio: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -292,6 +300,19 @@ impl NativeError {
 enum WorkerCommand {
     Stop,
     Input(InputCommand),
+    Control(ControlCommand),
+}
+
+/// Session-level (non-input) client requests, dispatched on the x224/DVC channels rather
+/// than the fast-path input channel. Added for multi-session video switching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlCommand {
+    /// TS_SUPPRESS_OUTPUT_PDU: `allow_display=false` asks the server to stop sending
+    /// graphics (audio DVCs keep flowing), `true` resumes them.
+    SuppressOutput { allow_display: bool },
+    /// Ask the server for a fresh full frame / keyframe so a hardware decoder that lost
+    /// its state (the shared webOS pipeline reloads on every track close) can resync.
+    RequestRefresh,
 }
 
 #[derive(Debug)]
@@ -673,6 +694,9 @@ struct RdpsndDvcHandler {
     client_formats: Vec<sndpdu::AudioFormat>,
     /// (codec, sample_rate, channels) last delivered through on_audio_format.
     last_format: Option<(u32, u32, u16)>,
+    /// audioCodec=pcm setting: drop Opus from the client format list so the server has
+    /// to send lossless PCM (grd prefers Opus whenever the client offers it).
+    prefer_pcm: bool,
     bad_format_logged: bool,
     legacy_wave_logged: bool,
 }
@@ -680,12 +704,13 @@ struct RdpsndDvcHandler {
 impl_as_any!(RdpsndDvcHandler);
 
 impl RdpsndDvcHandler {
-    fn new(callbacks: CallbackSink) -> Self {
+    fn new(callbacks: CallbackSink, prefer_pcm: bool) -> Self {
         Self {
             callbacks,
             stopped: false,
             client_formats: Vec::new(),
             last_format: None,
+            prefer_pcm,
             bad_format_logged: false,
             legacy_wave_logged: false,
         }
@@ -721,11 +746,36 @@ impl RdpsndDvcHandler {
         let server_count = pdu.formats.len();
         // Echo back the server's own AudioFormat structs for the entries we can play, so
         // auxiliary fields (avg bytes/sec, block align) always match what it advertised.
-        let formats: Vec<sndpdu::AudioFormat> = pdu
+        let mut formats: Vec<sndpdu::AudioFormat> = pdu
             .formats
             .into_iter()
             .filter(|format| Self::rdp_audio_codec_for(format).is_some())
             .collect();
+        // Both Opus and PCM are playable: the C side decodes Opus in-process (libopus)
+        // before mixing, so the bandwidth-friendly codec wins whenever the server offers
+        // it (gnome-remote-desktop picks by its own preference — AAC > Opus > PCM — among
+        // the formats the CLIENT listed, i.e. Opus at ~96kbps instead of ~1.4Mbps PCM).
+        // audioCodec=pcm inverts that: list PCM alone so the stream stays lossless. If
+        // the server offers no PCM at all, keep the full playable list — degraded audio
+        // beats silence.
+        if self.prefer_pcm {
+            let pcm_only: Vec<sndpdu::AudioFormat> = formats
+                .iter()
+                .filter(|format| {
+                    Self::rdp_audio_codec_for(format) == Some(RDP_AUDIO_CODEC_PCM_S16LE)
+                })
+                .cloned()
+                .collect();
+            if pcm_only.is_empty() {
+                self.callbacks.log(
+                    "audio: PCM requested but the server offers no playable PCM; \
+                     keeping the default format list"
+                        .to_owned(),
+                );
+            } else {
+                formats = pcm_only;
+            }
+        }
         if formats.is_empty() {
             self.callbacks.log(format!(
                 "audio: server offered {server_count} formats but none are playable; audio stays disabled"
@@ -899,6 +949,14 @@ struct NativeWorker {
     // entry so pre-connect events are discarded, but events buffered during reactivation
     // survive to the next drain_input rather than being lost (a dropped release would stick).
     pending_input: Vec<InputCommand>,
+    // Control commands buffered the same way (suppress-output toggles coalesce to the last
+    // one; refresh requests dedupe to one).
+    pending_control: Vec<ControlCommand>,
+    // Last suppress-output state the client commanded. Every fresh RDP connection starts
+    // server-side with display updates ALLOWED, so the silent in-worker reconnect (run's
+    // ultimatum retry) must re-assert a commanded suppression or a backgrounded session
+    // would silently resume streaming full-rate video nobody displays.
+    suppress_display_latched: bool,
 }
 
 impl NativeWorker {
@@ -920,6 +978,8 @@ impl NativeWorker {
             next_pts90k: 0,
             frame_pts_step: 90_000 / fps,
             pending_input: Vec::new(),
+            pending_control: Vec::new(),
+            suppress_display_latched: false,
         }
     }
 
@@ -956,6 +1016,17 @@ impl NativeWorker {
         self.reactivation = None;
         self.next_pts90k = 0;
         self.pending_input.clear();
+        // A suppress/resume queued while the failed session was still handshaking is the
+        // newest commanded state and must survive the retry: fold it into the latch
+        // (run_active re-asserts a latched suppression on the fresh connection; a fresh
+        // connection already starts with display allowed for the resume case). Queued
+        // refreshes belong to the OLD encode session — reconnecting yields a new IDR
+        // anyway — so those simply drop.
+        for control in self.pending_control.drain(..) {
+            if let ControlCommand::SuppressOutput { allow_display } = control {
+                self.suppress_display_latched = !allow_display;
+            }
+        }
         if let Ok(mut shared) = self.gfx.lock() {
             *shared = NativeGfxState::default();
         }
@@ -1104,7 +1175,10 @@ impl NativeWorker {
                 }),
                 None,
             ))
-            .with_dynamic_channel(RdpsndDvcHandler::new(self.callbacks))
+            .with_dynamic_channel(RdpsndDvcHandler::new(
+                self.callbacks,
+                self.config.prefer_pcm_audio,
+            ))
             .with_dynamic_channel(make_display_control(
                 self.config.width,
                 self.config.height,
@@ -1291,6 +1365,20 @@ impl NativeWorker {
         // stale pre-connect events into a fresh session would be wrong.
         self.pending_input.clear();
 
+        // Re-assert a commanded suppression on this fresh connection (see the latch field)
+        // — unless ANY suppress toggle is already pending: a queued resume (the user
+        // switched to this session mid-reconnect) is newer intent and must not be
+        // overridden by the stale latch.
+        let suppress_toggle_pending = self
+            .pending_control
+            .iter()
+            .any(|c| matches!(c, ControlCommand::SuppressOutput { .. }));
+        if self.suppress_display_latched && !suppress_toggle_pending {
+            self.pending_control.push(ControlCommand::SuppressOutput {
+                allow_display: false,
+            });
+        }
+
         loop {
             if self.stop.load(Ordering::SeqCst) {
                 return Ok(());
@@ -1419,6 +1507,11 @@ impl NativeWorker {
     ) -> Result<(), NativeError> {
         // Replay anything poll_stop buffered while the worker was busy (e.g. during
         // reactivation) before draining fresh events, preserving order.
+        if !self.pending_control.is_empty() {
+            for control in std::mem::take(&mut self.pending_control) {
+                self.dispatch_control(tls, active, image, control)?;
+            }
+        }
         if !self.pending_input.is_empty() {
             for input in std::mem::take(&mut self.pending_input) {
                 self.dispatch_input(tls, active, image, input)?;
@@ -1433,6 +1526,9 @@ impl NativeWorker {
                 Ok(WorkerCommand::Input(input)) => {
                     self.dispatch_input(tls, active, image, input)?
                 }
+                Ok(WorkerCommand::Control(control)) => {
+                    self.dispatch_control(tls, active, image, control)?
+                }
                 Err(TryRecvError::Empty) => return Ok(()),
                 Err(TryRecvError::Disconnected) => {
                     self.stop.store(true, Ordering::SeqCst);
@@ -1440,6 +1536,103 @@ impl NativeWorker {
                 }
             }
         }
+    }
+
+    /// Sends one session-control request on the live connection. Failures here are
+    /// connection failures (the encode paths are infallible for valid state), so they
+    /// propagate like any other write error.
+    fn dispatch_control(
+        &mut self,
+        tls: &mut rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
+        active: &mut ActiveStage,
+        image: &mut DecodedImage,
+        control: ControlCommand,
+    ) -> Result<(), NativeError> {
+        let full_rect = InclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: image.width().saturating_sub(1),
+            bottom: image.height().saturating_sub(1),
+        };
+        match control {
+            ControlCommand::SuppressOutput { allow_display } => {
+                self.suppress_display_latched = !allow_display;
+                let pdu = ShareDataPdu::SuppressOutput(SuppressOutputPdu {
+                    // Per MS-RDPBCGR the desktop rectangle is present exactly when display
+                    // updates are re-allowed.
+                    desktop_rect: allow_display.then_some(full_rect),
+                });
+                let mut buf = WriteBuf::new();
+                active
+                    .encode_static(&mut buf, pdu)
+                    .map_err(|e| NativeError::protocol(format!("suppress output encode: {e}")))?;
+                self.write_all(tls, buf.filled(), "suppress output")?;
+                self.callbacks.log(format!(
+                    "display updates {} by client request",
+                    if allow_display {
+                        "resumed"
+                    } else {
+                        "suppressed"
+                    }
+                ));
+            }
+            ControlCommand::RequestRefresh => {
+                // gnome-remote-desktop disables TS_REFRESH_RECT_PDU (FreeRDP_RefreshRect =
+                // FALSE) and does not force a keyframe when suppressed output resumes, but
+                // it tears down and recreates its encode sessions on EVERY Display Control
+                // monitor-layout submission — even a byte-identical one — ending in a
+                // RESET_GRAPHICS and a fresh IDR. So re-submit the current layout over the
+                // Display Control DVC (when the server opened it; mirror-mode grd does
+                // not), and also send a full-screen Refresh Rect for servers that honor
+                // the classic path.
+                let layout_messages = {
+                    let (width, height) = MonitorLayoutEntry::adjust_display_size(
+                        u32::from(image.width()),
+                        u32::from(image.height()),
+                    );
+                    match active.get_dvc::<DisplayControlClient>() {
+                        Some(dvc) => match (
+                            dvc.channel_id(),
+                            dvc.channel_processor_downcast_ref::<DisplayControlClient>(),
+                        ) {
+                            (Some(channel_id), Some(client)) if client.ready() => client
+                                .encode_single_primary_monitor(
+                                    channel_id, width, height, None, None,
+                                )
+                                .map_err(|e| {
+                                    NativeError::protocol(format!("refresh layout encode: {e}"))
+                                })
+                                .map(Some)?,
+                            _ => None,
+                        },
+                        None => None,
+                    }
+                };
+                if let Some(messages) = layout_messages {
+                    let frame = active.encode_dvc_messages(messages).map_err(|e| {
+                        NativeError::protocol(format!("refresh layout DVC encode: {e}"))
+                    })?;
+                    self.write_all(tls, &frame, "refresh monitor layout")?;
+                    self.callbacks
+                        .log("refresh requested: re-submitted monitor layout for a fresh keyframe");
+                } else {
+                    self.callbacks.log(
+                        "refresh requested but the display-control channel is unavailable; \
+                         relying on Refresh Rect only",
+                    );
+                }
+
+                let pdu = ShareDataPdu::RefreshRectangle(RefreshRectanglePdu {
+                    areas_to_refresh: vec![full_rect],
+                });
+                let mut buf = WriteBuf::new();
+                active
+                    .encode_static(&mut buf, pdu)
+                    .map_err(|e| NativeError::protocol(format!("refresh rect encode: {e}")))?;
+                self.write_all(tls, buf.filled(), "refresh rect")?;
+            }
+        }
+        Ok(())
     }
 
     fn drive_reactivation(
@@ -1668,6 +1861,25 @@ impl NativeWorker {
                         _ => self.pending_input.push(input),
                     }
                 }
+                Ok(WorkerCommand::Control(control)) => {
+                    // Only the final suppress-output state matters, and one queued refresh
+                    // is as good as many; keep the buffer minimal.
+                    match control {
+                        ControlCommand::SuppressOutput { .. } => {
+                            self.pending_control
+                                .retain(|c| !matches!(c, ControlCommand::SuppressOutput { .. }));
+                            self.pending_control.push(control);
+                        }
+                        ControlCommand::RequestRefresh => {
+                            if !self
+                                .pending_control
+                                .contains(&ControlCommand::RequestRefresh)
+                            {
+                                self.pending_control.push(control);
+                            }
+                        }
+                    }
+                }
                 Err(TryRecvError::Empty) => return false,
                 Err(TryRecvError::Disconnected) => {
                     self.stop.store(true, Ordering::SeqCst);
@@ -1712,6 +1924,7 @@ unsafe fn copy_config(config: *const RdpConfig) -> Result<NativeConfig, &'static
         width: config.width.max(1),
         height: config.height.max(1),
         fps: config.fps.max(1),
+        prefer_pcm_audio: config.prefer_pcm_audio != 0,
     })
 }
 
@@ -1734,11 +1947,11 @@ fn worker_main(
     worker.callbacks.emit_state(RdpState::Stopped, "stopped");
 }
 
-fn enqueue(session: *mut RdpSession, input: InputCommand) {
+fn enqueue_command(session: *mut RdpSession, command: WorkerCommand) {
     let Some(session) = (unsafe { session.as_ref() }) else {
         return;
     };
-    match session.tx.try_send(WorkerCommand::Input(input)) {
+    match session.tx.try_send(command) {
         Ok(()) => {}
         // The receiver is gone (worker stopped); nothing to deliver to.
         Err(TrySendError::Disconnected(_)) => {}
@@ -1746,7 +1959,8 @@ fn enqueue(session: *mut RdpSession, input: InputCommand) {
             // Pointer moves are idempotent — only the latest position matters — so dropping
             // one under backpressure is correct and avoids a stale backlog. Every other
             // event is state-changing: silently dropping a button-up / key-up would leave
-            // the server with a stuck button (phantom drag) or an auto-repeating key. Fall
+            // the server with a stuck button (phantom drag) or an auto-repeating key, and a
+            // dropped suppress-output toggle would blank or waste the wrong session. Fall
             // back to a blocking send for those; it is bounded — the worker either drains a
             // slot or drops the receiver on stop / write-timeout, which unblocks with Err.
             if !matches!(cmd, WorkerCommand::Input(InputCommand::PointerMove { .. })) {
@@ -1754,6 +1968,10 @@ fn enqueue(session: *mut RdpSession, input: InputCommand) {
             }
         }
     }
+}
+
+fn enqueue(session: *mut RdpSession, input: InputCommand) {
+    enqueue_command(session, WorkerCommand::Input(input));
 }
 
 fn random_array<const N: usize>() -> Result<[u8; N], NativeError> {
@@ -1977,6 +2195,30 @@ pub extern "C" fn rdp_send_unicode(session: *mut RdpSession, codepoint: u16, dow
     enqueue(session, InputCommand::Unicode { codepoint, down });
 }
 
+/// Toggle server display updates for this session (TS_SUPPRESS_OUTPUT_PDU).
+/// `allow_display=false` pauses graphics (rdpsnd audio keeps flowing on its DVC);
+/// `true` resumes them. Note: gnome-remote-desktop resumes with a delta frame, not a
+/// keyframe — pair with `rdp_request_refresh` when the local decoder lost its state.
+#[no_mangle]
+pub extern "C" fn rdp_set_suppress_output(session: *mut RdpSession, allow_display: bool) {
+    enqueue_command(
+        session,
+        WorkerCommand::Control(ControlCommand::SuppressOutput { allow_display }),
+    );
+}
+
+/// Ask the server for a fresh full frame / keyframe: re-submits the current monitor
+/// layout on the Display Control DVC (forces gnome-remote-desktop to recreate its encode
+/// session → RESET_GRAPHICS + IDR) and sends a full-screen Refresh Rect for servers that
+/// honor the classic path.
+#[no_mangle]
+pub extern "C" fn rdp_request_refresh(session: *mut RdpSession) {
+    enqueue_command(
+        session,
+        WorkerCommand::Control(ControlCommand::RequestRefresh),
+    );
+}
+
 #[no_mangle]
 pub extern "C" fn rdp_send_sync(
     session: *mut RdpSession,
@@ -2024,6 +2266,59 @@ mod tests {
     }
 
     #[test]
+    fn retry_folds_pending_suppress_into_latch() {
+        let (_tx, rx) = std::sync::mpsc::sync_channel::<WorkerCommand>(4);
+        let callbacks = RdpCallbacks {
+            ctx: core::ptr::null_mut(),
+            on_state: None,
+            on_log: None,
+            on_desktop_size: None,
+            on_video_au: None,
+            on_bitmap_update: None,
+            on_audio_format: None,
+            on_audio_data: None,
+            on_pointer_bitmap: None,
+            on_pointer_position: None,
+            on_pointer_state: None,
+        };
+        let config = NativeConfig {
+            host: "test".to_owned(),
+            port: 3389,
+            username: String::new(),
+            password: String::new(),
+            domain: String::new(),
+            width: 1,
+            height: 1,
+            fps: 30,
+            prefer_pcm_audio: false,
+        };
+        let mut worker = NativeWorker::new(
+            config,
+            CallbackSink::new(callbacks),
+            rx,
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        // A suppress queued during the failed session survives the retry as the latch;
+        // the stale refresh drops (a fresh connection starts with an IDR anyway).
+        worker.pending_control.push(ControlCommand::SuppressOutput {
+            allow_display: false,
+        });
+        worker.pending_control.push(ControlCommand::RequestRefresh);
+        worker.reset_session_state();
+        assert!(worker.suppress_display_latched);
+        assert!(worker.pending_control.is_empty());
+
+        // A queued resume is newer intent and must clear a stale latched suppression.
+        worker.pending_control.push(ControlCommand::SuppressOutput {
+            allow_display: true,
+        });
+        worker.reset_session_state();
+        assert!(!worker.suppress_display_latched);
+        assert!(worker.pending_control.is_empty());
+    }
+
+    #[test]
     fn ffi_struct_layout_is_c_compatible() {
         assert_eq!(align_of::<RdpConfig>(), align_of::<*const c_char>());
         assert_eq!(offset_of!(RdpConfig, host), 0);
@@ -2032,6 +2327,11 @@ mod tests {
         assert!(offset_of!(RdpConfig, password) > offset_of!(RdpConfig, username));
         assert!(offset_of!(RdpConfig, domain) > offset_of!(RdpConfig, password));
         assert!(offset_of!(RdpConfig, width) > offset_of!(RdpConfig, domain));
+        assert!(offset_of!(RdpConfig, prefer_pcm_audio) > offset_of!(RdpConfig, fps));
+        // prefer_pcm_audio must sit inside the old tail padding: same struct size as the
+        // C header's _Static_asserts (48 on 64-bit, 28 on 32-bit) — host + padded port +
+        // three more pointers, then 8 bytes of u16s/u8/tail padding.
+        assert_eq!(size_of::<RdpConfig>(), 5 * size_of::<*const c_char>() + 8);
         assert_eq!(
             align_of::<RdpCallbacks>(),
             align_of::<*mut core::ffi::c_void>()
@@ -2490,7 +2790,7 @@ mod tests {
             on_pointer_position: None,
             on_pointer_state: None,
         };
-        RdpsndDvcHandler::new(CallbackSink::new(callbacks))
+        RdpsndDvcHandler::new(CallbackSink::new(callbacks), false)
     }
 
     /// The three formats gnome-remote-desktop advertises, in its order.
@@ -2554,6 +2854,46 @@ mod tests {
     }
 
     #[test]
+    fn rdpsnd_prefer_pcm_drops_opus_from_client_list() {
+        let capture = Mutex::new(AudioCapture::default());
+        let mut handler = audio_test_handler(&capture);
+        handler.prefer_pcm = true;
+
+        let payload = encode_server_pdu(sndpdu::ServerAudioOutputPdu::AudioFormat(
+            sndpdu::ServerAudioFormatPdu {
+                version: sndpdu::Version::V8,
+                formats: grd_server_formats(),
+            },
+        ));
+        let replies = handler.process(0, &payload).expect("process");
+        match decode_reply(&replies[0]) {
+            sndpdu::ClientAudioOutputPdu::AudioFormat(pdu) => {
+                // Only the PCM entry survives, so grd cannot pick Opus.
+                assert_eq!(pdu.formats, grd_server_formats()[2..].to_vec());
+            }
+            other => panic!("expected AudioFormat reply, got {other:?}"),
+        }
+
+        // A server with no PCM keeps the playable list instead of going silent.
+        let mut handler = audio_test_handler(&capture);
+        handler.prefer_pcm = true;
+        let opus_only = vec![grd_server_formats()[1].clone()];
+        let payload = encode_server_pdu(sndpdu::ServerAudioOutputPdu::AudioFormat(
+            sndpdu::ServerAudioFormatPdu {
+                version: sndpdu::Version::V8,
+                formats: opus_only.clone(),
+            },
+        ));
+        let replies = handler.process(0, &payload).expect("process");
+        match decode_reply(&replies[0]) {
+            sndpdu::ClientAudioOutputPdu::AudioFormat(pdu) => {
+                assert_eq!(pdu.formats, opus_only);
+            }
+            other => panic!("expected AudioFormat reply, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn rdpsnd_negotiation_filters_grd_formats() {
         let capture = Mutex::new(AudioCapture::default());
         let mut handler = audio_test_handler(&capture);
@@ -2570,7 +2910,8 @@ mod tests {
         match decode_reply(&replies[0]) {
             sndpdu::ClientAudioOutputPdu::AudioFormat(pdu) => {
                 // AAC must be filtered out (the TV cannot play it and the server would
-                // otherwise prefer it); the OPUS and PCM entries are echoed verbatim.
+                // otherwise prefer it); the OPUS and PCM entries are echoed verbatim —
+                // Opus decodes in-process for the mixer, PCM is the fallback.
                 assert_eq!(pdu.formats, grd_server_formats()[1..].to_vec());
                 assert_eq!(pdu.version, sndpdu::Version::V8);
                 assert!(pdu.flags.contains(sndpdu::AudioFormatFlags::ALIVE));
@@ -2589,6 +2930,26 @@ mod tests {
         }
         // Negotiation alone must not touch the C callbacks.
         assert!(capture.lock().unwrap().formats.is_empty());
+    }
+
+    #[test]
+    fn rdpsnd_negotiation_falls_back_to_opus_without_pcm() {
+        let capture = Mutex::new(AudioCapture::default());
+        let mut handler = audio_test_handler(&capture);
+
+        let payload = encode_server_pdu(sndpdu::ServerAudioOutputPdu::AudioFormat(
+            sndpdu::ServerAudioFormatPdu {
+                version: sndpdu::Version::V8,
+                formats: grd_server_formats()[..2].to_vec(), // AAC + OPUS, no PCM
+            },
+        ));
+        let replies = handler.process(0, &payload).expect("process");
+        match decode_reply(&replies[0]) {
+            sndpdu::ClientAudioOutputPdu::AudioFormat(pdu) => {
+                assert_eq!(pdu.formats, grd_server_formats()[1..2].to_vec());
+            }
+            other => panic!("expected AudioFormat reply, got {other:?}"),
+        }
     }
 
     #[test]

@@ -77,3 +77,12 @@ void rdp_send_sync(RdpSession *session, bool scroll_lock, bool num_lock, bool ca
     (void)num_lock;
     (void)caps_lock;
 }
+
+void rdp_set_suppress_output(RdpSession *session, bool allow_display) {
+    (void)session;
+    (void)allow_display;
+}
+
+void rdp_request_refresh(RdpSession *session) {
+    (void)session;
+}

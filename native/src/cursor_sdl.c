@@ -224,7 +224,7 @@ static void native_cursor_log_state(uint32_t state) {
     log_count++;
 }
 
-static void native_cursor_set_visible(NativeCursor *cursor, bool visible) {
+static void native_cursor_platform_show(bool visible) {
 #if HELLOLG_CURSOR_HAVE_WEBOS_VISIBILITY
     /* Never SDL_ShowCursor(SDL_DISABLE) on webOS: it stops pointer-event delivery
      * entirely (verified live), so a server-driven hide (e.g. the remote browser hiding
@@ -237,7 +237,19 @@ static void native_cursor_set_visible(NativeCursor *cursor, bool visible) {
 #else
     SDL_ShowCursor(visible ? SDL_ENABLE : SDL_DISABLE);
 #endif
+}
+
+static void native_cursor_set_visible(NativeCursor *cursor, bool visible) {
+    native_cursor_platform_show(visible);
     cursor->visible = visible;
+}
+
+void native_cursor_show_default(void) {
+    SDL_Cursor *system_default = SDL_GetDefaultCursor();
+    if (system_default) {
+        SDL_SetCursor(system_default);
+    }
+    native_cursor_platform_show(true);
 }
 
 static void native_cursor_apply_shape(NativeCursor *cursor, uint8_t *rgba, uint16_t width,

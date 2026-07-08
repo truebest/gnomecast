@@ -234,7 +234,7 @@ Three additional blockers surfaced on the real TV↔grd pair, all fixed:
    grd estimates render latency purely from the client's WaveConfirm `wTimeStamp` (grd
    sends its waves with timestamp 0, our confirms echo it, and grd skips zero values —
    its 300 ms drop logic never fires for us). Fix: `native_audio_feed` fronts a
-   configurable jitter prebuffer (`audioPrebufferMs`, default 100, 0 disables) — it
+   configurable jitter prebuffer (`audioPrebufferMs`, default 60, 0 disables) — it
    accumulates that much audio before the first hardware feed and re-arms after source
    pauses, so playback always carries a safety margin at the cost of the same added audio
    latency; arrival gaps above 60 ms are logged as evidence for future tuning.

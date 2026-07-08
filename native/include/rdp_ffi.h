@@ -37,6 +37,9 @@ typedef struct RdpConfig {
     uint16_t width;
     uint16_t height;
     uint16_t fps;
+    /* Non-zero: advertise only PCM to rdpsnd for a lossless stream (grd would otherwise
+     * pick Opus when both are offered). Fits in RdpConfig's tail padding on both ABIs. */
+    uint8_t prefer_pcm_audio;
 } RdpConfig;
 
 typedef struct RdpCallbacks {
@@ -80,6 +83,15 @@ void rdp_send_key(RdpSession *session, uint8_t scancode, bool down, bool extende
 void rdp_send_unicode(RdpSession *session, uint16_t codepoint, bool down);
 /* Absolute toggle-key state (TS_FP_SYNC_EVENT); the server resets its lock state to match. */
 void rdp_send_sync(RdpSession *session, bool scroll_lock, bool num_lock, bool caps_lock);
+/* Toggle server display updates (TS_SUPPRESS_OUTPUT_PDU): allow_display=false pauses the
+ * graphics stream while rdpsnd audio keeps flowing (background multi-RDP session);
+ * true resumes it. gnome-remote-desktop resumes with a delta frame, not a keyframe —
+ * pair with rdp_request_refresh when the local decoder lost its state. */
+void rdp_set_suppress_output(RdpSession *session, bool allow_display);
+/* Ask the server for a fresh full frame/keyframe: re-submits the monitor layout on the
+ * Display Control DVC (forces gnome-remote-desktop to rebuild its encode session ->
+ * RESET_GRAPHICS + IDR) and sends a classic full-screen Refresh Rect. */
+void rdp_request_refresh(RdpSession *session);
 
 #ifdef __cplusplus
 }

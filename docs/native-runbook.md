@@ -5,12 +5,66 @@ back to a web app, JavaScript service, MSE, WebCodecs, RDCleanPath, or browser r
 AVC420/H.264 is preferred through ss4s/NDL/SMP; RemoteFX is supported only as a native
 Rust/IronRDP decode path with RGBA updates presented by SDL.
 
+## Multi-RDP Sessions (red/green/yellow/blue)
+
+The app can hold up to four simultaneous RDP sessions to different servers, mapped to
+the TV remote's color buttons in the remote's own order: red, green, yellow, blue
+(slot ids 0..3):
+
+- **Any color button** → "go to that session's screen": the live stream when the slot is
+  connected, its session configurator (pre-connect form) otherwise. The app starts on
+  the green configurator. Connect always connects the slot whose configurator is on
+  screen. Exiting is left to webOS itself (EXIT/home button -> system close, delivered
+  to the app as SDL_QUIT/SDL_APP_TERMINATING).
+- Switching to a connected slot moves the VIDEO plane and — KVM-style — the keyboard and
+  mouse to it; a colored square in the top-right corner confirms the active slot for
+  ~1.5s. Navigating to a configurator leaves the previous session running backgrounded
+  (graphics suppressed server-side, audio still in the mix).
+- **Audio is mixed from ALL connected sessions** — a backgrounded session keeps playing
+  its sound. The client advertises Opus 48k + PCM; gnome-remote-desktop prefers Opus
+  (~96kbps per session instead of ~1.4Mbps raw), each session decodes it in-process via
+  libopus on its own worker thread, and the native mixer sums the PCM (per-source jitter
+  prebuffer = `audioPrebufferMs`, saturating sum, ring capacity = the latency cap,
+  ~1.4s). PCM-only servers keep working unchanged; builds with `HELLOLG_WITH_OPUS=OFF`
+  mute Opus sessions with a log.
+- **Audio quality** is a global setting (`audioCodec`, also a pre-connect UI dropdown and
+  the `--audio-codec` CLI flag): `auto` (default) lets the server pick Opus; `pcm` offers
+  the server PCM only, trading ~1.4Mbps per session for a lossless stream. It applies to
+  connections made after the change. Note grd's PCM is 44.1kHz while Opus decodes at
+  48kHz — with no resampler the mix runs at one rate, so sessions negotiated under the
+  OTHER preference stay muted until they reconnect.
+- A backgrounded session's graphics are paused server-side via TS_SUPPRESS_OUTPUT_PDU.
+  Because grd resumes with a delta frame and rejects Refresh Rect, switching back forces
+  a fresh IDR by re-submitting the Display Control monitor layout (grd rebuilds its
+  encode session on every layout PDU, even an identical one → RESET_GRAPHICS + IDR). If
+  no decodable frame arrives within 4s of a switch (e.g. grd mirror mode has no Display
+  Control channel), the client reconnects that session once — a fresh connection always
+  starts with an IDR.
+- **Re-pressing the ACTIVE slot's color button** (while its stream is on screen) opens the
+  volume mixer: a semi-transparent panel with one fader channel per slot. Each channel is
+  an L/R pair of LIVE volume-meter columns (post-fader peak, instant attack / 30 dB/s
+  release, gradient anchored to the scale) with one white knob across both and a dBFS
+  scale: -60 at the bottom stop (= full mute) up to an unmarked +6 dB headroom above the
+  0 line. Up/down move the selected fader 3 dB per press (applied to the live mix
+  immediately); left/right — or another slot's color button — change the selection; the
+  active slot's button, OK, or Back closes it, and it auto-hides after ~6s without input.
+  While it is open the pointer belongs to the SYSTEM (the evdev grab is released and the
+  plain arrow shown): click a fader to jump/drag it, click a channel elsewhere to select
+  it, scroll the wheel for 3 dB steps, click outside the panel to close. No mouse or
+  keyboard input reaches the RDP session while the panel is up; the grab and the
+  session's cursor shape come back when it closes. Levels are per launch (not persisted), survive reconnects
+  and codec re-pins, and disconnected slots show dimmed knobs whose level applies once
+  they connect. On the RemoteFX RGBA fallback path the overlay cannot be drawn over the
+  stream, so the button keeps its old badge-flash behavior there.
+- If the ACTIVE session drops while another one is alive, video auto-switches to a
+  survivor; if none is left, the pre-connect UI returns.
+
 ## Local Config
 
 Local native config lives at `native/config.local.json`. It is gitignored and may contain
 passwords. Do not commit it or paste it into logs.
 
-Example shape:
+Example shape (legacy flat form, applies to the green slot):
 
 ```json
 {
@@ -25,10 +79,32 @@ Example shape:
 }
 ```
 
-The pre-connect UI saves the last successful Connect settings, including address,
-username, domain, password, and FPS, into the app writable SDL preferences directory.
-Those saved settings are loaded on the next start, and explicit webOS launch params or
-CLI flags override them. Set `HELLOLG_IGNORE_SAVED_CONFIG=1` for a one-off launch that
+Both slots can be configured with the v2 shape (this is also what the app persists):
+
+```json
+{
+  "sessions": [
+    { "slot": "green", "host": "192.0.2.10", "port": 3389, "username": "u", "password": "...", "domain": "", "fps": 60 },
+    { "slot": "yellow", "host": "192.0.2.11", "port": 3389, "username": "u", "password": "...", "domain": "", "fps": 60 }
+  ],
+  "wheelStep": 60,
+  "wheelScrollDivisor": 1,
+  "audioPrebufferMs": 60,
+  "audioCodec": "auto"
+}
+```
+
+The pre-connect UI saves the settings of ALL slots on a successful Connect, including
+address, username, domain, password, and FPS. The save path is resolved from a candidate
+list (each rejection is logged with its reason); on the TV the winner is the in-app
+`<approot>/settings/<euid>/settings.json` — the IPK ships `settings/` mode 01777 because
+the install tree is root-owned, and the app creates a private 0700 subdir inside (same
+trust model as /tmp). Verified on device: this survives app restarts, package
+reinstalls AND TV power cycles; `/media/developer/temp/<appid>-<euid>` is the next
+candidate (persistent ext4), and the tmpfs `/tmp/<appid>-<euid>` fallback is last —
+loading scans the same priority order, so settings migrate upward on the next save.
+Explicit webOS launch params or CLI flags override loaded settings (flat launch/CLI keys
+target the green slot). Set `HELLOLG_IGNORE_SAVED_CONFIG=1` for a one-off launch that
 ignores saved UI settings.
 
 ## Local Build And Test
@@ -38,14 +114,19 @@ Targeted local loop:
 ```sh
 cc -fsyntax-only -Inative/include \
   native/src/main.c native/src/media_ss4s.c native/src/video_ss4s.c \
-  native/src/audio_ss4s.c native/src/video_rgba_sdl.c \
+  native/src/audio_ss4s.c native/src/audio_mixer.c native/src/audio_opus.c \
+  native/src/video_rgba_sdl.c \
   native/src/h264_annexb.c native/src/input_sdl.c native/src/cursor_sdl.c \
-  native/src/rdp_ffi_stub.c
+  native/src/rdp_ffi_stub.c native/src/config_paths.c native/src/settings_json.c
 cargo test --manifest-path webrdp-min/Cargo.toml --features native native::tests::
 cmake -S native -B /tmp/gnomecast-native-build-tests
 cmake --build /tmp/gnomecast-native-build-tests
 ctest --test-dir /tmp/gnomecast-native-build-tests --output-on-failure
 ```
+
+Add `-DHELLOLG_WITH_OPUS=ON` to the configure step to include the `audio-opus` test; the
+flag is off by default on host builds (ExternalOPUS downloads the libopus source tarball)
+and on only for webOS cross-builds.
 
 Build and link the native shell against the real Rust static library:
 
@@ -171,11 +252,19 @@ Implemented:
 - Live fullscreen GNOME desktop through the ss4s/NDL/SMP hardware plane, TV-verified
   (`ndl-webos5`/AVC420), including correct behavior when the server's real EGFX surface
   resolution differs from the negotiated MCS/GCC desktop size.
+- Multi-RDP: four session slots (red/green/yellow/blue, remote-button order)
+  with color-button screen navigation (stream when connected, configurator when not),
+  KVM-style input switching, mixed PCM audio from all connected sessions,
+  suppress-output backgrounding, Display-Control-based keyframe refresh with a
+  reconnect watchdog, v2 persisted settings with legacy fallback.
 
 Not yet implemented or not yet TV-verified:
 
 - Native RemoteFX/bitmap fallback path against a server without H.264.
 - Live fullscreen RemoteFX-only/native RGBA presentation on TV.
+- Multi-RDP on-device verification: color-button scancodes during streaming, switch
+  latency, simultaneous audio mix, RSS with two sessions, background session surviving a
+  switch (Phase 0 device checks from the multi-RDP plan).
 
 ## Third-Party Provenance
 

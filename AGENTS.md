@@ -36,6 +36,8 @@ and the webOS buildroot toolchain + `ares` CLI for packaging.
 - `native/src/h264_annexb.c` — AVC length-prefixed H.264 → Annex-B conversion.
 - `native/src/video_rgba_sdl.c` — RemoteFX/bitmap RGBA surface.
 - `native/src/ui_preconnect.c` — on-TV LVGL pre-connect settings screen.
+- `native/src/ui_mixer.c` / `.h` — the volume-mixer overlay: dBFS faders + live L/R meters
+  (LVGL screen on the preconnect display, plus a raw-SDL fallback and the dB gain model).
 - `native/include/rdp_ffi.h` — the C↔Rust ABI contract.
 - `webrdp-min/src/native.rs` — Rust native worker / C ABI implementation.
 - `native/CMakeLists.txt` — native target, options, CTests, webOS package.
@@ -53,12 +55,18 @@ Local checks before committing native changes (these mirror CI):
 ```sh
 cc -fsyntax-only -Inative/include \
   native/src/main.c native/src/media_ss4s.c native/src/video_ss4s.c \
-  native/src/audio_ss4s.c native/src/video_rgba_sdl.c native/src/h264_annexb.c \
-  native/src/input_sdl.c native/src/cursor_sdl.c native/src/rdp_ffi_stub.c
+  native/src/audio_ss4s.c native/src/audio_mixer.c native/src/audio_opus.c \
+  native/src/video_rgba_sdl.c \
+  native/src/h264_annexb.c native/src/input_sdl.c native/src/cursor_sdl.c native/src/ui_mixer.c \
+  native/src/rdp_ffi_stub.c native/src/config_paths.c native/src/settings_json.c
 cargo test --manifest-path webrdp-min/Cargo.toml --features native --locked native::tests::
 cmake -S native -B /tmp/gnomecast-native-build && cmake --build /tmp/gnomecast-native-build
 ctest --test-dir /tmp/gnomecast-native-build --output-on-failure
 ```
+
+Add `-DHELLOLG_WITH_OPUS=ON` to the cmake configure to also run the `audio-opus` ctest;
+it is off by default on host builds because ExternalOPUS downloads the libopus tarball
+(needs network), and defaults to ON only for webOS cross-builds.
 
 The host CMake/ctest build above is SDL-off, so it does not compile `main.c`/`ui_preconnect.c`
 or the evdev readers — only the full webOS cross-build (`HELLOLG_WITH_SDL=ON`) does. Cross-build,

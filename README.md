@@ -63,14 +63,34 @@ cost on both ends.
   open that channel, so their (virtual) display must be set to a standard resolution
   server-side — and note that a headless server's display can revert to its odd default
   after a service restart.
-- **AVC444 is not negotiated** — the client advertises AVC420 (4:2:0) only. Servers
-  without a usable H.264 encoder fall back to software RemoteFX rendering (slower, and
-  rendered on the ~1080p UI plane rather than the native-resolution video plane).
+- **AVC444 is not negotiated** — the client advertises AVC420 (4:2:0) only (see
+  "Chroma subsampling" below). Servers without a usable H.264 encoder fall back to
+  software RemoteFX rendering (slower, and rendered on the ~1080p UI plane rather than
+  the native-resolution video plane).
 - **EGFX surface-composition operations are ignored** (SolidFill, SurfaceToSurface,
   CacheToSurface). Harmless with gnome-remote-desktop — it sends SurfaceToSurface during
   routine AVC420 sessions and the picture is complete since the video plane carries full
   frames — but a server that relied on them for the software RemoteFX path would show
   stale regions.
+
+### Chroma subsampling: why there is no AVC444 mode
+
+The client negotiates AVC420 (H.264 4:2:0) only. This is a platform ceiling,
+not a missing feature:
+
+- RDP's AVC444 is not a single 4:4:4 stream. Per MS-RDPEGFX it is *two*
+  AVC420 bitstreams (a luma frame plus an auxiliary frame carrying the packed
+  chroma samples) that the client must decode independently and recombine in
+  the pixel domain. webOS media pipelines (NDL/SMP) feed the elementary
+  stream straight to the hardware video plane and never expose decoded frames
+  to the application, so the recombination step has nowhere to run.
+- Native 4:4:4 profiles are absent from TV decoder silicon in *every* codec:
+  webOS 23/24 decoders implement H.264 BP/MP/HP, HEVC Main/Main10 and
+  AV1 Main only — no Hi444PP, no HEVC RExt, no AV1 High.
+- Decoding the AVC444 stream pair in software would forfeit the hardware
+  video plane and cannot sustain 4K on TV SoCs.
+
+The same ceiling applies to any ss4s-based client.
 
 ## Layout
 

@@ -21,7 +21,6 @@ and browser WASM bundle were removed and are not runtime dependencies of the nat
 - Path: `third_party/ss4s` (git submodule)
 - Upstream: https://github.com/mariotaku/ss4s.git
 - Pinned commit: `60d980a22055acd5393079870737dd35683e8ea7`
-- Pin selected to match Moonlight TV: https://github.com/mariotaku/moonlight-tv (`third_party/ss4s`)
 - License: GNU Lesser General Public License v3.0; see `third_party/ss4s/LICENSE`
 - Native usage: decoder/module abstraction for webOS NDL/directmedia and SMP hardware video paths.
 - MVP policy: dummy/software ss4s backends are disabled by the native CMake configuration.
@@ -31,7 +30,6 @@ and browser WASM bundle were removed and are not runtime dependencies of the nat
 - Path: `third_party/commons` (git submodule)
 - Upstream: https://github.com/mariotaku/commons-c.git
 - Pinned commit: `e09c6f38ea592e33cdc12d1f1dce509087905d73`
-- Pin selected to match Moonlight TV: https://github.com/mariotaku/moonlight-tv (`third_party/commons`)
 - License: MIT; see `third_party/commons/LICENSE`
 - Native usage: pinned companion utility library for future ss4s/native integration helpers.
 
@@ -40,7 +38,6 @@ and browser WASM bundle were removed and are not runtime dependencies of the nat
 - Path: `third_party/lvgl` (git submodule)
 - Upstream: https://github.com/mariotaku/lvgl.git
 - Pinned commit: `185ea1fc61dd01fac61867d2d6b56892e80c6058`
-- Pin selected to match Moonlight TV: https://github.com/mariotaku/moonlight-tv (`third_party/lvgl`)
 - License: MIT; see `third_party/lvgl/LICENCE.txt`
 - Native usage: SDL-rendered pre-connect GUI for host/port entry before native RDP startup.
 

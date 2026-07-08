@@ -1,5 +1,7 @@
 #include "ui_preconnect.h"
 
+#include "ui_mixer.h"
+
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,6 +10,9 @@
 #include "draw/sdl/lv_draw_sdl.h"
 #include "lvgl.h"
 
+/* host/username/domain are capped at 255 usable chars: more than enough for any real
+ * endpoint (a DNS name maxes at 253), Windows username, or domain, and comfortably below
+ * NativeConfig's 512-byte storage so a form value can never overflow the config on save. */
 #define UI_HOST_MAX 256u
 #define UI_USERNAME_MAX 256u
 #define UI_DOMAIN_MAX 256u
@@ -21,7 +26,8 @@
 #define UI_CONNECT_BUTTON_WIDTH LV_DPX(180)
 #define UI_FORM_KEY_EVENT (LV_EVENT_KEY | LV_EVENT_PREPROCESS)
 /* LVGL consumes one key state per read; text input is represented as press+release per char.
- * Keep one extra ring slot empty, so capacity is UI_KEY_QUEUE_CAP - 1. */
+ * The ring is sized for the largest single field paste (the 511-char password) with one slot
+ * kept empty, so capacity is UI_KEY_QUEUE_CAP - 1. */
 #define UI_KEY_QUEUE_TEXT_MAX UI_PASSWORD_TEXT_MAX
 #define UI_KEY_QUEUE_CAP (2u * UI_KEY_QUEUE_TEXT_MAX + 1u)
 
@@ -49,7 +55,7 @@ typedef struct NativePreconnectKeyDriver {
     NativePreconnectQueuedKey queue[UI_KEY_QUEUE_CAP];
     unsigned head;
     unsigned tail;
-    bool overflow_logged;
+    bool overflow_pending;
 } NativePreconnectKeyDriver;
 
 struct NativePreconnectUi {
@@ -66,6 +72,8 @@ struct NativePreconnectUi {
     lv_indev_t *key_indev;
     lv_group_t *group;
     lv_obj_t *root;
+    lv_obj_t *slot_buttons[NATIVE_SETTINGS_MAX_SESSIONS];
+    lv_obj_t *form_title;
     lv_obj_t *host_input;
     lv_obj_t *username_input;
     lv_obj_t *domain_input;
@@ -73,8 +81,13 @@ struct NativePreconnectUi {
     lv_obj_t *fps_dropdown;
     lv_obj_t *audio_buffer_slider;
     lv_obj_t *audio_buffer_value_label;
+    lv_obj_t *audio_codec_dropdown;
     lv_obj_t *connect_btn;
     lv_obj_t *status_label;
+    /* Volume-mixer overlay (ui_mixer.c): a separate TRANSPARENT screen on this display,
+     * shown over the video plane during streaming. Owned here (shares the renderer /
+     * screen texture / lv display), driven from main.c via native_preconnect_ui_mixer. */
+    NativeUiMixer *mixer;
     lv_style_t root_style;
     lv_style_t nav_style;
     lv_style_t detail_style;
@@ -105,6 +118,13 @@ struct NativePreconnectUi {
     bool current_fps_option;
     uint16_t current_fps;
     uint16_t selected_fps;
+    /* Per-slot stored form values; the form shows slot_values[selected_slot]. */
+    NativeSessionConfig slot_values[NATIVE_SETTINGS_MAX_SESSIONS];
+    /* Set when slot_values[i].host holds raw (unparseable, mid-edit) endpoint text that
+     * must be restored verbatim instead of being re-formatted as host:port. */
+    bool slot_raw_endpoint[NATIVE_SETTINGS_MAX_SESSIONS];
+    int selected_slot;
+    int requested_slot;
     char requested_host[UI_HOST_MAX];
     char requested_username[UI_USERNAME_MAX];
     char requested_domain[UI_DOMAIN_MAX];
@@ -113,6 +133,7 @@ struct NativePreconnectUi {
     uint16_t requested_fps;
     uint16_t selected_audio_buffer;
     uint16_t requested_audio_buffer;
+    uint16_t requested_audio_codec;
 };
 
 static void ui_flush(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *src);
@@ -124,7 +145,11 @@ static void ui_fps_changed(lv_event_t *event);
 static void ui_audio_buffer_changed(lv_event_t *event);
 static void ui_form_key_event(lv_event_t *event);
 static void ui_connect_clicked(lv_event_t *event);
+static void ui_slot_button_clicked(lv_event_t *event);
 static void ui_scroll_focused_into_view(NativePreconnectUi *ui);
+static void ui_store_form_to_slot(NativePreconnectUi *ui, int slot);
+static void ui_load_slot_into_form(NativePreconnectUi *ui, int slot);
+static void ui_update_slot_buttons(NativePreconnectUi *ui);
 
 static bool ui_parse_port(const char *text, uint16_t *port) {
     if (!text || !text[0]) {
@@ -210,8 +235,13 @@ static bool ui_find_fps_option(uint16_t fps, size_t *index) {
 
 static size_t ui_select_fps_index(NativePreconnectUi *ui, uint16_t fps) {
     size_t builtin_index = 0;
+    /* Recomputed per load: a stale custom entry from the PREVIOUS slot would otherwise
+     * stay in every slot's dropdown and could save that slot's fps into this one. The
+     * callers always follow with ui_set_fps_options + ui_set_selected_fps, which keeps
+     * the option list and index consistent with this flag. */
+    ui->current_fps_option = false;
     if (ui_find_fps_option(fps, &builtin_index)) {
-        return ui->current_fps_option ? builtin_index + 1u : builtin_index;
+        return builtin_index;
     }
     ui->current_fps_option = true;
     ui->current_fps = fps;
@@ -462,8 +492,17 @@ static lv_obj_t *ui_make_dropdown(NativePreconnectUi *ui, lv_obj_t *parent, lv_c
     return dropdown;
 }
 
+/* Dropdown option order must match NATIVE_AUDIO_CODEC_AUTO (0) and NATIVE_AUDIO_CODEC_PCM (1). */
+static uint16_t ui_current_audio_codec(NativePreconnectUi *ui) {
+    if (!ui->audio_codec_dropdown) {
+        return NATIVE_AUDIO_CODEC_AUTO;
+    }
+    return lv_dropdown_get_selected(ui->audio_codec_dropdown) == 1 ? NATIVE_AUDIO_CODEC_PCM
+                                                                   : NATIVE_AUDIO_CODEC_AUTO;
+}
+
 static void ui_build(NativePreconnectUi *ui, const char *host, uint16_t port, const char *username, const char *password,
-                     const char *domain, uint16_t fps, uint16_t audio_prebuffer_ms) {
+                     const char *domain, uint16_t fps, uint16_t audio_prebuffer_ms, uint16_t audio_codec) {
     ui->root = lv_obj_create(lv_scr_act());
     lv_obj_remove_style_all(ui->root);
     lv_obj_add_style(ui->root, &ui->root_style, 0);
@@ -492,6 +531,34 @@ static void ui_build(NativePreconnectUi *ui, const char *host, uint16_t port, co
     lv_obj_t *subtitle = ui_make_label(nav, "Native RDP", &ui->label_style);
     lv_obj_set_style_text_color(subtitle, lv_color_hex(0x9fa8b2), 0);
 
+    /* Session-slot selector. Colors mirror the remote's green/yellow buttons, which jump
+     * straight to the matching slot (and switch the live video once streaming). */
+    lv_obj_t *slots_label = ui_make_label(nav, "Servers", &ui->label_style);
+    lv_obj_set_style_pad_top(slots_label, LV_DPX(28), 0);
+    static const uint32_t slot_colors[NATIVE_SETTINGS_MAX_SESSIONS] = {0xff4136, 0x2ecc40, 0xffdc00, 0x0074d9};
+    static const char *const slot_titles[NATIVE_SETTINGS_MAX_SESSIONS] = {"Red server", "Green server",
+                                                                          "Yellow server", "Blue server"};
+    for (int slot = 0; slot < NATIVE_SETTINGS_MAX_SESSIONS; slot++) {
+        lv_obj_t *btn = lv_btn_create(nav);
+        lv_obj_remove_style_all(btn);
+        lv_obj_add_style(btn, &ui->button_style, 0);
+        lv_obj_add_style(btn, &ui->button_focus_style, LV_STATE_FOCUSED);
+        lv_obj_set_size(btn, LV_PCT(100), LV_DPX(52));
+        lv_obj_set_style_bg_color(btn, lv_color_hex(0x232a32), 0);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(slot_colors[slot]), LV_STATE_CHECKED);
+        lv_obj_set_style_text_color(btn, lv_color_hex(0x101418), LV_STATE_CHECKED);
+        lv_obj_set_style_border_width(btn, LV_DPX(2), 0);
+        lv_obj_set_style_border_color(btn, lv_color_hex(slot_colors[slot]), 0);
+        lv_obj_add_flag(btn, LV_OBJ_FLAG_CHECKABLE);
+        lv_obj_add_event_cb(btn, ui_slot_button_clicked, LV_EVENT_CLICKED, ui);
+        lv_obj_t *btn_label = lv_label_create(btn);
+        lv_obj_remove_style_all(btn_label);
+        lv_obj_set_style_text_font(btn_label, &lv_font_montserrat_20, 0);
+        lv_label_set_text(btn_label, slot_titles[slot]);
+        lv_obj_center(btn_label);
+        ui->slot_buttons[slot] = btn;
+    }
+
     lv_obj_t *detail = lv_obj_create(ui->root);
     lv_obj_remove_style_all(detail);
     lv_obj_add_style(detail, &ui->detail_style, 0);
@@ -503,8 +570,8 @@ static void ui_build(NativePreconnectUi *ui, const char *host, uint16_t port, co
     lv_obj_set_flex_flow(detail, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(detail, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
 
-    lv_obj_t *title = ui_make_label(detail, "Connect", &ui->title_style);
-    lv_obj_set_style_pad_bottom(title, LV_DPX(14), 0);
+    ui->form_title = ui_make_label(detail, "Connect", &ui->title_style);
+    lv_obj_set_style_pad_bottom(ui->form_title, LV_DPX(14), 0);
 
     ui_make_label(detail, "Address", &ui->label_style);
     ui->host_input = lv_textarea_create(detail);
@@ -621,6 +688,12 @@ static void ui_build(NativePreconnectUi *ui, const char *host, uint16_t port, co
     lv_obj_set_width(ui->audio_buffer_value_label, LV_DPX(90));
     ui_set_audio_buffer_value(ui, audio_prebuffer_ms);
 
+    ui_make_label(detail, "Audio quality", &ui->label_style);
+    ui->audio_codec_dropdown = ui_make_dropdown(ui, detail, UI_COMPACT_FIELD_WIDTH);
+    lv_dropdown_set_options_static(ui->audio_codec_dropdown, "Auto (Opus)\nPCM lossless");
+    lv_dropdown_set_selected(ui->audio_codec_dropdown, audio_codec == NATIVE_AUDIO_CODEC_PCM ? 1 : 0);
+    lv_obj_add_event_cb(ui->audio_codec_dropdown, ui_form_key_event, UI_FORM_KEY_EVENT, ui);
+
     ui->connect_btn = lv_btn_create(detail);
     lv_obj_remove_style_all(ui->connect_btn);
     lv_obj_add_style(ui->connect_btn, &ui->button_style, 0);
@@ -650,17 +723,155 @@ static void ui_build(NativePreconnectUi *ui, const char *host, uint16_t port, co
     lv_group_add_obj(ui->group, ui->password_input);
     lv_group_add_obj(ui->group, ui->fps_dropdown);
     lv_group_add_obj(ui->group, ui->audio_buffer_slider);
+    lv_group_add_obj(ui->group, ui->audio_codec_dropdown);
     lv_group_add_obj(ui->group, ui->connect_btn);
     lv_group_focus_obj(ui->host_input);
     ui_scroll_focused_into_view(ui);
 
+    ui_update_slot_buttons(ui);
     ui_update_connect_state(ui);
 }
 
-NativePreconnectUi *native_preconnect_ui_create(SDL_Window *window, SDL_Renderer *renderer, const char *host,
-                                                uint16_t port, const char *username, const char *password,
-                                                const char *domain, uint16_t fps, uint16_t audio_prebuffer_ms) {
-    if (!window || !renderer) {
+/* Copies the form fields into slot_values[slot]. Best effort: an endpoint that does not
+ * parse (mid-edit) keeps the raw text as host so nothing typed is ever lost. */
+static const char *ui_slot_title(int slot) {
+    switch (slot) {
+    case NATIVE_SESSION_SLOT_RED:
+        return "Red server";
+    case NATIVE_SESSION_SLOT_GREEN:
+        return "Green server";
+    case NATIVE_SESSION_SLOT_YELLOW:
+        return "Yellow server";
+    case NATIVE_SESSION_SLOT_BLUE:
+        return "Blue server";
+    default:
+        return "Server";
+    }
+}
+
+static void ui_store_form_to_slot(NativePreconnectUi *ui, int slot) {
+    if (slot < 0 || slot >= NATIVE_SETTINGS_MAX_SESSIONS) {
+        return;
+    }
+    NativeSessionConfig *values = &ui->slot_values[slot];
+    uint16_t parsed_port = 0;
+    char parsed_host[UI_HOST_MAX];
+    const char *endpoint = lv_textarea_get_text(ui->host_input);
+    if (!endpoint || !endpoint[0]) {
+        /* A blanked address is a deliberate CLEAR, not a mid-edit state: it must reach
+         * the stored values (empty host = unconfigured slot) or the persisted settings
+         * would resurrect a server the user removed. */
+        values->host[0] = '\0';
+        values->port = 3389;
+        ui->slot_raw_endpoint[slot] = false;
+    } else if (ui_parse_endpoint(endpoint, parsed_host, sizeof(parsed_host), &parsed_port)) {
+        (void)snprintf(values->host, sizeof(values->host), "%s", parsed_host);
+        values->port = parsed_port;
+        ui->slot_raw_endpoint[slot] = false;
+    } else {
+        /* Mid-edit text (e.g. "myhost:"): keep it verbatim; re-formatting it as host:port
+         * would garble it into an IPv6-bracketed form on the next load. */
+        (void)snprintf(values->host, sizeof(values->host), "%s", endpoint ? endpoint : "");
+        ui->slot_raw_endpoint[slot] = true;
+    }
+    const char *username = lv_textarea_get_text(ui->username_input);
+    const char *domain = lv_textarea_get_text(ui->domain_input);
+    const char *password = lv_textarea_get_text(ui->password_input);
+    (void)snprintf(values->username, sizeof(values->username), "%s", username ? username : "");
+    (void)snprintf(values->domain, sizeof(values->domain), "%s", domain ? domain : "");
+    (void)snprintf(values->password, sizeof(values->password), "%s", password ? password : "");
+    values->fps = ui->selected_fps;
+}
+
+static void ui_load_slot_into_form(NativePreconnectUi *ui, int slot) {
+    if (slot < 0 || slot >= NATIVE_SETTINGS_MAX_SESSIONS) {
+        return;
+    }
+    const NativeSessionConfig *values = &ui->slot_values[slot];
+    if (ui->slot_raw_endpoint[slot] || !values->host[0]) {
+        /* Raw mid-edit text verbatim; a cleared slot shows an empty field (formatting an
+         * empty host would render a bogus ":3389"). */
+        lv_textarea_set_text(ui->host_input, values->host);
+    } else {
+        char endpoint_text[UI_ENDPOINT_MAX];
+        ui_format_endpoint(endpoint_text, sizeof(endpoint_text), values->host, values->port);
+        lv_textarea_set_text(ui->host_input, endpoint_text);
+    }
+    lv_textarea_set_cursor_pos(ui->host_input, LV_TEXTAREA_CURSOR_LAST);
+    lv_textarea_set_text(ui->username_input, values->username);
+    lv_textarea_set_cursor_pos(ui->username_input, LV_TEXTAREA_CURSOR_LAST);
+    lv_textarea_set_text(ui->domain_input, values->domain);
+    lv_textarea_set_cursor_pos(ui->domain_input, LV_TEXTAREA_CURSOR_LAST);
+    lv_textarea_set_text(ui->password_input, values->password);
+    lv_textarea_set_cursor_pos(ui->password_input, LV_TEXTAREA_CURSOR_LAST);
+    size_t fps_index = ui_select_fps_index(ui, values->fps);
+    ui_set_fps_options(ui);
+    ui_set_selected_fps(ui, fps_index);
+    lv_label_set_text(ui->form_title, ui_slot_title(slot));
+    ui_update_connect_state(ui);
+}
+
+static void ui_update_slot_buttons(NativePreconnectUi *ui) {
+    for (int slot = 0; slot < NATIVE_SETTINGS_MAX_SESSIONS; slot++) {
+        if (!ui->slot_buttons[slot]) {
+            continue;
+        }
+        if (slot == ui->selected_slot) {
+            lv_obj_add_state(ui->slot_buttons[slot], LV_STATE_CHECKED);
+        } else {
+            lv_obj_clear_state(ui->slot_buttons[slot], LV_STATE_CHECKED);
+        }
+    }
+}
+
+bool native_preconnect_ui_get_slot_values(NativePreconnectUi *ui, int slot, NativeSessionConfig *out) {
+    if (!ui || !out || slot < 0 || slot >= NATIVE_SETTINGS_MAX_SESSIONS) {
+        return false;
+    }
+    /* Make sure the on-screen form's latest edits are reflected for its own slot. */
+    if (slot == ui->selected_slot) {
+        ui_store_form_to_slot(ui, slot);
+    }
+    if (ui->slot_raw_endpoint[slot]) {
+        return false; /* endpoint mid-edit; the stored settings stay authoritative */
+    }
+    *out = ui->slot_values[slot];
+    return true;
+}
+
+void native_preconnect_ui_select_slot(NativePreconnectUi *ui, int slot) {
+    if (!ui || slot < 0 || slot >= NATIVE_SETTINGS_MAX_SESSIONS || ui->connecting) {
+        return;
+    }
+    if (slot == ui->selected_slot) {
+        return;
+    }
+    ui_store_form_to_slot(ui, ui->selected_slot);
+    ui->selected_slot = slot;
+    ui_load_slot_into_form(ui, slot);
+    ui_update_slot_buttons(ui);
+}
+
+static void ui_slot_button_clicked(lv_event_t *event) {
+    NativePreconnectUi *ui = (NativePreconnectUi *)lv_event_get_user_data(event);
+    if (!ui) {
+        return;
+    }
+    lv_obj_t *target = lv_event_get_target(event);
+    for (int slot = 0; slot < NATIVE_SETTINGS_MAX_SESSIONS; slot++) {
+        if (ui->slot_buttons[slot] == target) {
+            native_preconnect_ui_select_slot(ui, slot);
+            break;
+        }
+    }
+    /* A click toggles the CHECKABLE state on its own; re-assert the model's view. */
+    ui_update_slot_buttons(ui);
+}
+
+NativePreconnectUi *native_preconnect_ui_create(SDL_Window *window, SDL_Renderer *renderer,
+                                                const NativeSessionConfig *sessions, uint16_t audio_prebuffer_ms,
+                                                uint16_t audio_codec) {
+    if (!window || !renderer || !sessions) {
         return NULL;
     }
 
@@ -671,6 +882,11 @@ NativePreconnectUi *native_preconnect_ui_create(SDL_Window *window, SDL_Renderer
     ui->window = window;
     ui->renderer = renderer;
     ui->visible = true;
+    for (int slot = 0; slot < NATIVE_SETTINGS_MAX_SESSIONS; slot++) {
+        ui->slot_values[slot] = sessions[slot];
+    }
+    ui->selected_slot = NATIVE_SESSION_SLOT_GREEN;
+    ui->requested_slot = NATIVE_SESSION_SLOT_GREEN;
 
     SDL_GetWindowSize(window, &ui->width, &ui->height);
     if (ui->width <= 0 || ui->height <= 0) {
@@ -723,10 +939,16 @@ NativePreconnectUi *native_preconnect_ui_create(SDL_Window *window, SDL_Renderer
     ui->key_indev = lv_indev_drv_register(&ui->key_drv.base);
 
     ui_init_styles(ui);
-    ui_build(ui, host, port, username, password, domain, fps, audio_prebuffer_ms);
+    const NativeSessionConfig *initial = &ui->slot_values[ui->selected_slot];
+    ui_build(ui, initial->host, initial->port, initial->username, initial->password, initial->domain, initial->fps,
+             audio_prebuffer_ms, audio_codec);
+    lv_label_set_text(ui->form_title, ui_slot_title(ui->selected_slot));
     if (ui->key_indev && ui->group) {
         lv_indev_set_group(ui->key_indev, ui->group);
     }
+    /* A failed mixer create degrades gracefully: main.c falls back to its raw-SDL panel. */
+    ui->mixer = native_ui_mixer_create(renderer);
+    native_ui_mixer_set_texture(ui->mixer, ui->texture);
     return ui;
 }
 
@@ -749,6 +971,7 @@ void native_preconnect_ui_destroy(NativePreconnectUi *ui) {
     if (ui->root) {
         lv_obj_del(ui->root);
     }
+    native_ui_mixer_destroy(ui->mixer);
     ui_reset_styles(ui);
     if (ui->disp) {
         lv_disp_remove(ui->disp);
@@ -776,6 +999,7 @@ void native_preconnect_ui_resize(NativePreconnectUi *ui, int width, int height) 
     ui->disp_drv.ver_res = (lv_coord_t)height;
     SDL_SetRenderTarget(ui->renderer, ui->texture);
     lv_disp_drv_update(ui->disp, &ui->disp_drv);
+    native_ui_mixer_set_texture(ui->mixer, ui->texture);
     lv_obj_invalidate(lv_scr_act());
 }
 
@@ -829,12 +1053,26 @@ void native_preconnect_ui_set_connecting(NativePreconnectUi *ui, bool connecting
             lv_obj_add_state(ui->domain_input, LV_STATE_DISABLED);
             lv_obj_add_state(ui->password_input, LV_STATE_DISABLED);
             lv_obj_add_state(ui->fps_dropdown, LV_STATE_DISABLED);
+            lv_obj_add_state(ui->audio_buffer_slider, LV_STATE_DISABLED);
+            lv_obj_add_state(ui->audio_codec_dropdown, LV_STATE_DISABLED);
         } else {
             lv_obj_clear_state(ui->host_input, LV_STATE_DISABLED);
             lv_obj_clear_state(ui->username_input, LV_STATE_DISABLED);
             lv_obj_clear_state(ui->domain_input, LV_STATE_DISABLED);
             lv_obj_clear_state(ui->password_input, LV_STATE_DISABLED);
             lv_obj_clear_state(ui->fps_dropdown, LV_STATE_DISABLED);
+            lv_obj_clear_state(ui->audio_buffer_slider, LV_STATE_DISABLED);
+            lv_obj_clear_state(ui->audio_codec_dropdown, LV_STATE_DISABLED);
+        }
+        for (int slot = 0; slot < NATIVE_SETTINGS_MAX_SESSIONS; slot++) {
+            if (!ui->slot_buttons[slot]) {
+                continue;
+            }
+            if (connecting) {
+                lv_obj_add_state(ui->slot_buttons[slot], LV_STATE_DISABLED);
+            } else {
+                lv_obj_clear_state(ui->slot_buttons[slot], LV_STATE_DISABLED);
+            }
         }
     }
     native_preconnect_ui_set_status(ui, status, false);
@@ -849,13 +1087,17 @@ void native_preconnect_ui_set_status(NativePreconnectUi *ui, const char *status,
     lv_obj_set_style_text_color(ui->status_label, error ? lv_color_hex(0xff7a7a) : lv_color_hex(0xaeb6bf), 0);
 }
 
-bool native_preconnect_ui_take_connect(NativePreconnectUi *ui, char *host, size_t host_cap, uint16_t *port,
-                                       char *username, size_t username_cap, char *password, size_t password_cap,
-                                       char *domain, size_t domain_cap, uint16_t *fps, uint16_t *audio_prebuffer_ms) {
+bool native_preconnect_ui_take_connect(NativePreconnectUi *ui, int *slot, char *host, size_t host_cap,
+                                       uint16_t *port, char *username, size_t username_cap, char *password,
+                                       size_t password_cap, char *domain, size_t domain_cap, uint16_t *fps,
+                                       uint16_t *audio_prebuffer_ms, uint16_t *audio_codec) {
     if (!ui || !ui->connect_requested) {
         return false;
     }
     ui->connect_requested = false;
+    if (slot) {
+        *slot = ui->requested_slot;
+    }
     if (host && host_cap > 0) {
         size_t len = strlen(ui->requested_host);
         if (len >= host_cap) {
@@ -897,12 +1139,16 @@ bool native_preconnect_ui_take_connect(NativePreconnectUi *ui, char *host, size_
     if (audio_prebuffer_ms) {
         *audio_prebuffer_ms = ui->requested_audio_buffer;
     }
+    if (audio_codec) {
+        *audio_codec = ui->requested_audio_codec;
+    }
     return true;
 }
 
 bool native_preconnect_ui_read_current(NativePreconnectUi *ui, char *host, size_t host_cap, uint16_t *port,
                                        char *username, size_t username_cap, char *password, size_t password_cap,
-                                       char *domain, size_t domain_cap, uint16_t *fps, uint16_t *audio_prebuffer_ms) {
+                                       char *domain, size_t domain_cap, uint16_t *fps, uint16_t *audio_prebuffer_ms,
+                                       uint16_t *audio_codec) {
     if (!ui) {
         return false;
     }
@@ -957,7 +1203,14 @@ bool native_preconnect_ui_read_current(NativePreconnectUi *ui, char *host, size_
     if (audio_prebuffer_ms) {
         *audio_prebuffer_ms = ui->selected_audio_buffer;
     }
+    if (audio_codec) {
+        *audio_codec = ui_current_audio_codec(ui);
+    }
     return true;
+}
+
+NativeUiMixer *native_preconnect_ui_mixer(NativePreconnectUi *ui) {
+    return ui ? ui->mixer : NULL;
 }
 
 static void ui_flush(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *src) {
@@ -971,7 +1224,13 @@ static void ui_flush(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *src)
         NativePreconnectUi *ui = (NativePreconnectUi *)param->user_data;
         SDL_SetRenderTarget(ui->renderer, NULL);
         SDL_SetRenderDrawBlendMode(ui->renderer, SDL_BLENDMODE_BLEND);
-        SDL_SetRenderDrawColor(ui->renderer, 0x15, 0x17, 0x1a, 0xff);
+        if (native_ui_mixer_active(ui->mixer)) {
+            /* The mixer overlay floats on the punched video plane: clear the window to
+             * transparent so the hardware video shows through around the panel. */
+            SDL_SetRenderDrawColor(ui->renderer, 0, 0, 0, 0);
+        } else {
+            SDL_SetRenderDrawColor(ui->renderer, 0x15, 0x17, 0x1a, 0xff);
+        }
         SDL_RenderClear(ui->renderer);
         SDL_SetTextureBlendMode(ui->texture, SDL_BLENDMODE_BLEND);
         SDL_RenderCopy(ui->renderer, ui->texture, NULL, NULL);
@@ -1152,17 +1411,19 @@ static bool ui_key_queue_empty(const NativePreconnectKeyDriver *state) {
 static void ui_key_queue_clear(NativePreconnectKeyDriver *state) {
     state->head = 0;
     state->tail = 0;
-    state->overflow_logged = false;
+    state->overflow_pending = false;
 }
 
 static void ui_key_enqueue(NativePreconnectKeyDriver *state, uint32_t key, lv_indev_state_t key_state) {
     unsigned next_tail = (state->tail + 1u) % UI_KEY_QUEUE_CAP;
     if (next_tail == state->head) {
-        if (!state->overflow_logged) {
-            fprintf(stderr, "[native-ui] pre-connect key queue overflow; dropping oldest input event\n");
-            state->overflow_logged = true;
-        }
-        state->head = (state->head + 1u) % UI_KEY_QUEUE_CAP;
+        /* Full. Dropping the oldest event (the previous behavior) would strand half of a
+         * press/release pair and make LVGL treat a key as held -- runaway auto-repeat, e.g. a
+         * repeated Connect. Instead refuse the event and flag the burst so ui_key_read discards
+         * it wholesale and returns to a released state. Input is lost only in this pathological
+         * case (a paste larger than a full field between reads), but no key is left stuck. */
+        state->overflow_pending = true;
+        return;
     }
     state->queue[state->tail].key = key;
     state->queue[state->tail].state = key_state;
@@ -1175,9 +1436,6 @@ static bool ui_key_dequeue(NativePreconnectKeyDriver *state, NativePreconnectQue
     }
     *event = state->queue[state->head];
     state->head = (state->head + 1u) % UI_KEY_QUEUE_CAP;
-    if (ui_key_queue_empty(state)) {
-        state->overflow_logged = false;
-    }
     return true;
 }
 
@@ -1277,6 +1535,20 @@ static void ui_key_read(lv_indev_drv_t *drv, lv_indev_data_t *data) {
 
     ui_key_drain_sdl_events(state);
 
+    if (state->overflow_pending) {
+        /* A burst overflowed the ring. Drop it entirely and force a released state so no key is
+         * left logically held (which LVGL would auto-repeat). Logged once per burst (the burst
+         * is fully consumed here, so this cannot spam across reads). */
+        fprintf(stderr, "[native-ui] pre-connect key queue overflow; dropping burst and resetting key input\n");
+        ui_key_queue_clear(state); /* resets head/tail and the overflow flag */
+        state->key = 0;
+        state->state = LV_INDEV_STATE_RELEASED;
+        data->key = state->key;
+        data->state = state->state;
+        data->continue_reading = false;
+        return;
+    }
+
     NativePreconnectQueuedKey event;
     if (ui_key_dequeue(state, &event)) {
         state->key = event.key;
@@ -1309,8 +1581,11 @@ static void ui_form_key_event(lv_event_t *event) {
     if (!ui || !ui->group || ui->connecting) {
         return;
     }
+    /* An OPEN dropdown owns UP/DOWN for option selection; only navigate the form with
+     * them while every dropdown is closed. */
     lv_obj_t *target = lv_event_get_target(event);
-    if (target == ui->fps_dropdown && lv_dropdown_is_open(ui->fps_dropdown)) {
+    if ((target == ui->fps_dropdown && lv_dropdown_is_open(ui->fps_dropdown)) ||
+        (target == ui->audio_codec_dropdown && lv_dropdown_is_open(ui->audio_codec_dropdown))) {
         return;
     }
 
@@ -1398,5 +1673,8 @@ static void ui_connect_clicked(lv_event_t *event) {
     ui->requested_port = port;
     ui->requested_fps = ui->selected_fps;
     ui->requested_audio_buffer = ui->selected_audio_buffer;
+    ui->requested_audio_codec = ui_current_audio_codec(ui);
+    ui->requested_slot = ui->selected_slot;
+    ui_store_form_to_slot(ui, ui->selected_slot);
     ui->connect_requested = true;
 }

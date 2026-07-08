@@ -5,7 +5,9 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 build_dir="${NATIVE_WEBOS_BUILD_DIR:-$repo_root/build/native-webos}"
 stage_dir="${NATIVE_WEBOS_STAGING_DIR:-$build_dir/stage}"
 dist_dir="${NATIVE_WEBOS_DIST_DIR:-$repo_root/dist/native-webos}"
-build_type="${NATIVE_WEBOS_BUILD_TYPE:-RelWithDebInfo}"
+# Size-optimized by default, but with -g kept (see CMAKE_*_FLAGS_MINSIZEREL below) so on-device
+# crashes stay debuggable. Override with NATIVE_WEBOS_BUILD_TYPE=RelWithDebInfo for -O2, etc.
+build_type="${NATIVE_WEBOS_BUILD_TYPE:-MinSizeRel}"
 target="${NATIVE_WEBOS_RUST_TARGET:-armv7-unknown-linux-gnueabi}"
 if [[ "$target" != "armv7-unknown-linux-gnueabi" ]]; then
   echo "build-native-webos: native webOS packages require NATIVE_WEBOS_RUST_TARGET=armv7-unknown-linux-gnueabi (got $target)" >&2
@@ -166,6 +168,8 @@ if [[ "$skip_build" != "1" ]]; then
     -DHELLOLG_WITH_PRECONNECT_UI=ON \
     -DHELLOLG_LINK_RDP_FFI=ON \
     -DRDP_FFI_LIB="$rdp_ffi_lib" \
+    -DCMAKE_C_FLAGS_MINSIZEREL="-Os -DNDEBUG -g" \
+    -DCMAKE_CXX_FLAGS_MINSIZEREL="-Os -DNDEBUG -g" \
     "$@"
   cmake --build "$build_dir"
 elif [[ ! -f "$build_dir/CMakeCache.txt" ]]; then
@@ -174,6 +178,11 @@ fi
 
 rm -rf "$stage_dir"
 cmake --install "$build_dir" --prefix "$stage_dir"
+# Runtime settings live in an in-app dir shipped /tmp-style (01777 + sticky): the install
+# tree is root-owned on the TV, so the app (own uid) creates a private euid-suffixed
+# subdir inside — same trust model as the /tmp fallback, but on persistent storage.
+mkdir -p "$stage_dir/settings"
+chmod 1777 "$stage_dir/settings"
 verify_package_root "$stage_dir"
 
 command -v ares-package >/dev/null 2>&1 ||

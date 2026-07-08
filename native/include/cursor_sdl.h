@@ -75,6 +75,11 @@ void native_cursor_apply(NativeCursor *cursor, uint16_t desktop_w, uint16_t desk
                          uint16_t window_w, uint16_t window_h);
 /* SDL thread: drop server state and restore the default visible arrow (session ended). */
 void native_cursor_reset(NativeCursor *cursor);
+/* SDL thread: show the platform default arrow for a UI screen WITHOUT touching any
+ * session's cached pointer state — for leaving a stream whose session keeps running
+ * backgrounded (a later switch-back reasserts its cached cursor; the server does not
+ * resend shapes while suppressed). */
+void native_cursor_show_default(void);
 /* SDL thread: force the current server pointer state back onto the platform after a webOS
  * overlay (TV menu) hid the pointer behind our back — e.g. on window focus regain. Honours a
  * server-requested hide; otherwise re-shows and re-sets the last cursor shape. */

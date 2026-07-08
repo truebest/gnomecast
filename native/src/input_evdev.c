@@ -12,6 +12,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/eventfd.h>
+#include <sys/inotify.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <linux/input.h>
@@ -19,21 +21,24 @@
 #include <SDL.h>
 
 #define NATIVE_EVDEV_MAX_DEVICES 16
-
-typedef enum NativeEvdevDeviceKind {
-    NATIVE_EVDEV_DEVICE_MOUSE,
-    NATIVE_EVDEV_DEVICE_KEYBOARD,
-} NativeEvdevDeviceKind;
+/* Consecutive poll() failures tolerated before the reader gives up (see evdev_thread). */
+#define NATIVE_EVDEV_MAX_POLL_FAILURES 100
 
 typedef struct NativeEvdevDevice {
     int fd;
     struct libevdev *dev;
-    NativeEvdevDeviceKind kind;
+    /* A single /dev/input node can be both a pointer and a keyboard (e.g. an all-in-one
+     * wireless keyboard+trackpad on one dongle), so these are independent capabilities rather
+     * than one exclusive kind; events are routed per event type in evdev_dispatch. */
+    bool is_mouse;
+    bool is_keyboard;
+    char path[64]; /* /dev/input node path, used to de-duplicate hotplug re-scans */
 } NativeEvdevDevice;
 
 typedef struct NativeEvdevBackend {
     NativeEvdevDevice devices[NATIVE_EVDEV_MAX_DEVICES];
     int ndevices;
+    int inotify_fd; /* watches /dev/input for hotplugged nodes; -1 when unavailable */
 } NativeEvdevBackend;
 
 typedef struct NativeEvdevDrainResult {
@@ -46,41 +51,64 @@ static bool evdev_is_mouse(const struct libevdev *dev) {
            libevdev_has_event_code(dev, EV_REL, REL_Y);
 }
 
+/* True for a device we should grab as a keyboard: it has the typing keys AND is either a pure
+ * keyboard (no pointer buttons) or a genuine combined keyboard+trackpad (also a real relative
+ * mouse). A node that carries pointer buttons but is NOT a relative mouse is a TV remote / gyro
+ * pointer that merely advertises a full keymap (on webOS: "LGE RCU", "M-RCU", "CHECK INPUT",
+ * "IoT keypad", "Bluetooth-audio-source", ...). Grabbing one of those steals the remote from
+ * the compositor, so it must be rejected here. */
 static bool evdev_is_keyboard(const struct libevdev *dev) {
-    if (libevdev_has_event_code(dev, EV_KEY, BTN_LEFT) || libevdev_has_event_code(dev, EV_KEY, BTN_MOUSE)) {
+    if (!(libevdev_has_event_code(dev, EV_KEY, KEY_A) && libevdev_has_event_code(dev, EV_KEY, KEY_Z) &&
+          libevdev_has_event_code(dev, EV_KEY, KEY_SPACE))) {
         return false;
     }
-    return libevdev_has_event_code(dev, EV_KEY, KEY_A) && libevdev_has_event_code(dev, EV_KEY, KEY_Z) &&
-           libevdev_has_event_code(dev, EV_KEY, KEY_SPACE);
+    bool has_pointer_buttons =
+        libevdev_has_event_code(dev, EV_KEY, BTN_LEFT) || libevdev_has_event_code(dev, EV_KEY, BTN_MOUSE);
+    return !has_pointer_buttons || evdev_is_mouse(dev);
 }
 
-bool native_evdev_input_probe_keyboard(void) {
+/* Visit each /dev/input/event* node, calling `visit(path, user)`; stops as soon as a visit
+ * returns true and reports whether that happened. Shared by keyboard probing and grab setup so
+ * the two never disagree about which nodes exist or how they are enumerated. */
+typedef bool (*NativeEvdevNodeVisitor)(const char *path, void *user);
+
+static bool evdev_for_each_input_node(NativeEvdevNodeVisitor visit, void *user) {
     DIR *dir = opendir("/dev/input");
     if (!dir) {
         return false;
     }
-    bool found = false;
+    bool stopped = false;
     struct dirent *ent;
-    while (!found && (ent = readdir(dir)) != NULL) {
+    while (!stopped && (ent = readdir(dir)) != NULL) {
         if (strncmp(ent->d_name, "event", 5) != 0) {
             continue;
         }
         char path[300];
         (void)snprintf(path, sizeof(path), "/dev/input/%s", ent->d_name);
-        int fd = open(path, O_RDONLY | O_NONBLOCK);
-        if (fd < 0) {
-            continue;
-        }
-        struct libevdev *dev = NULL;
-        int ret = libevdev_new_from_fd(fd, &dev);
-        if (ret == 0) {
-            found = evdev_is_keyboard(dev);
-            libevdev_free(dev);
-        }
-        close(fd);
+        stopped = visit(path, user);
     }
     closedir(dir);
-    return found;
+    return stopped;
+}
+
+static bool evdev_probe_keyboard_node(const char *path, void *user) {
+    (void)user;
+    int fd = open(path, O_RDONLY | O_NONBLOCK);
+    if (fd < 0) {
+        return false;
+    }
+    struct libevdev *dev = NULL;
+    bool is_keyboard = false;
+    if (libevdev_new_from_fd(fd, &dev) == 0) {
+        is_keyboard = evdev_is_keyboard(dev);
+        libevdev_free(dev);
+    }
+    close(fd);
+    return is_keyboard; /* stop at the first keyboard found */
+}
+
+bool native_evdev_input_probe_keyboard(void) {
+    return evdev_for_each_input_node(evdev_probe_keyboard_node, NULL);
 }
 
 static uint8_t evdev_mouse_button(uint16_t code) {
@@ -193,11 +221,25 @@ static bool evdev_dispatch_keyboard(NativeEvdevInput *input, const struct input_
 }
 
 static bool evdev_dispatch(NativeEvdevInput *input, const NativeEvdevDevice *device, const struct input_event *raw) {
-    switch (device->kind) {
-    case NATIVE_EVDEV_DEVICE_MOUSE:
-        return evdev_dispatch_mouse(input, raw);
-    case NATIVE_EVDEV_DEVICE_KEYBOARD:
-        return evdev_dispatch_keyboard(input, raw);
+    switch (raw->type) {
+    case EV_REL:
+        /* Relative motion/wheel is always pointer data. */
+        return device->is_mouse ? evdev_dispatch_mouse(input, raw) : false;
+    case EV_KEY:
+        /* Pointer buttons (BTN_LEFT..BTN_TASK) belong to the mouse ring; every other EV_KEY is
+         * a typing key for the keyboard ring. A combined device routes each to its ring. */
+        if (raw->code >= BTN_LEFT && raw->code <= BTN_TASK) {
+            return device->is_mouse ? evdev_dispatch_mouse(input, raw) : false;
+        }
+        /* Remote color keys (session switching) ride whatever grabbed node emits them:
+         * some Magic Remote firmwares expose virtual nodes that qualify only as relative
+         * mice, and the switch keys must not depend on that node also typing like a
+         * keyboard. The keyboard drain runs whenever the ring holds events, so these get
+         * through even with no keyboard-classified device present. */
+        if (raw->code >= KEY_RED && raw->code <= KEY_BLUE) {
+            return evdev_dispatch_keyboard(input, raw);
+        }
+        return device->is_keyboard ? evdev_dispatch_keyboard(input, raw) : false;
     default:
         return false;
     }
@@ -279,9 +321,10 @@ static void evdev_update_active_flags(NativeEvdevInput *input, const NativeEvdev
     bool keyboard_active = false;
     if (backend) {
         for (int i = 0; i < backend->ndevices; i++) {
-            if (backend->devices[i].kind == NATIVE_EVDEV_DEVICE_MOUSE) {
+            if (backend->devices[i].is_mouse) {
                 mouse_active = true;
-            } else if (backend->devices[i].kind == NATIVE_EVDEV_DEVICE_KEYBOARD) {
+            }
+            if (backend->devices[i].is_keyboard) {
                 keyboard_active = true;
             }
         }
@@ -290,15 +333,17 @@ static void evdev_update_active_flags(NativeEvdevInput *input, const NativeEvdev
     atomic_store(&input->keyboard_active, keyboard_active);
 }
 
-static const char *evdev_device_kind_name(NativeEvdevDeviceKind kind) {
-    switch (kind) {
-    case NATIVE_EVDEV_DEVICE_MOUSE:
-        return "mouse";
-    case NATIVE_EVDEV_DEVICE_KEYBOARD:
-        return "keyboard";
-    default:
-        return "unknown";
+static const char *evdev_device_kind_name(const NativeEvdevDevice *device) {
+    if (device->is_mouse && device->is_keyboard) {
+        return "keyboard+mouse";
     }
+    if (device->is_mouse) {
+        return "mouse";
+    }
+    if (device->is_keyboard) {
+        return "keyboard";
+    }
+    return "unknown";
 }
 
 static void evdev_remove_device(NativeEvdevInput *input, NativeEvdevBackend *backend, int index) {
@@ -306,7 +351,7 @@ static void evdev_remove_device(NativeEvdevInput *input, NativeEvdevBackend *bac
         return;
     }
     NativeEvdevDevice removed = backend->devices[index];
-    fprintf(stderr, "[native-input] removing %s fd %d after disconnect/error\n", evdev_device_kind_name(removed.kind),
+    fprintf(stderr, "[native-input] removing %s fd %d after disconnect/error\n", evdev_device_kind_name(&removed),
             removed.fd);
     evdev_close_device(&removed);
     for (int i = index; i + 1 < backend->ndevices; i++) {
@@ -318,6 +363,20 @@ static void evdev_remove_device(NativeEvdevInput *input, NativeEvdevBackend *bac
     evdev_update_active_flags(input, backend);
 }
 
+/* Ungrab and close every open device (releasing EVIOCGRAB) and clear the active flags, WITHOUT
+ * freeing the backend. Used by the reader thread when it gives up on a persistent poll() error,
+ * so grabbed USB devices are actually handed back to the compositor (real SDL fallback) instead
+ * of staying captured until session teardown. The backend struct and its inotify fd remain for
+ * native_evdev_input_stop() to free after joining the thread. Idempotent (evdev_close_device
+ * clears fd/dev), so a later evdev_close_backend() over 0 devices is a no-op. */
+static void evdev_release_devices(NativeEvdevInput *input, NativeEvdevBackend *backend) {
+    for (int i = 0; i < backend->ndevices; i++) {
+        evdev_close_device(&backend->devices[i]);
+    }
+    backend->ndevices = 0;
+    evdev_update_active_flags(input, backend);
+}
+
 static void evdev_close_backend(NativeEvdevBackend *backend) {
     if (!backend) {
         return;
@@ -326,13 +385,33 @@ static void evdev_close_backend(NativeEvdevBackend *backend) {
         evdev_close_device(&backend->devices[i]);
     }
     backend->ndevices = 0;
+    if (backend->inotify_fd >= 0) {
+        close(backend->inotify_fd);
+        backend->inotify_fd = -1;
+    }
     free(backend);
 }
 
+static bool evdev_backend_has_path(const NativeEvdevBackend *backend, const char *path) {
+    for (int i = 0; i < backend->ndevices; i++) {
+        if (strcmp(backend->devices[i].path, path) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool evdev_add_device(NativeEvdevInput *input, NativeEvdevBackend *backend, const char *path) {
+    /* Already grabbed (initial scan or a prior hotplug rescan): nothing to do. Skipping before
+     * open() also avoids a second EVIOCGRAB on a device we already hold, which would fail EBUSY
+     * and leave a duplicate ungrabbed entry. */
+    if (backend->ndevices >= NATIVE_EVDEV_MAX_DEVICES || evdev_backend_has_path(backend, path)) {
+        return false;
+    }
+
     int fd = open(path, O_RDONLY | O_NONBLOCK);
     if (fd < 0) {
-        if (errno != ENXIO) {
+        if (errno != ENXIO && errno != EACCES) {
             fprintf(stderr, "[native-input] failed to open %s: %s\n", path, strerror(errno));
         }
         return false;
@@ -345,19 +424,21 @@ static bool evdev_add_device(NativeEvdevInput *input, NativeEvdevBackend *backen
         return false;
     }
 
-    NativeEvdevDeviceKind kind;
-    const char *kind_name;
-    if (evdev_is_keyboard(dev)) {
-        kind = NATIVE_EVDEV_DEVICE_KEYBOARD;
-        kind_name = "keyboard";
-    } else if (evdev_is_mouse(dev)) {
-        kind = NATIVE_EVDEV_DEVICE_MOUSE;
-        kind_name = "mouse";
-    } else {
+    bool is_keyboard = evdev_is_keyboard(dev);
+    bool is_mouse = evdev_is_mouse(dev);
+    if (!is_keyboard && !is_mouse) {
         libevdev_free(dev);
         close(fd);
         return false;
     }
+
+    NativeEvdevDevice *device = &backend->devices[backend->ndevices];
+    device->fd = fd;
+    device->dev = dev;
+    device->is_mouse = is_mouse;
+    device->is_keyboard = is_keyboard;
+    (void)snprintf(device->path, sizeof(device->path), "%s", path);
+    const char *kind_name = evdev_device_kind_name(device);
 
     ret = libevdev_grab(dev, LIBEVDEV_GRAB);
     if (ret < 0) {
@@ -366,16 +447,25 @@ static bool evdev_add_device(NativeEvdevInput *input, NativeEvdevBackend *backen
         fprintf(stderr, "[native-input] grabbed %s %s (%s)\n", kind_name, path, libevdev_get_name(dev));
     }
 
-    NativeEvdevDevice *device = &backend->devices[backend->ndevices++];
-    device->fd = fd;
-    device->dev = dev;
-    device->kind = kind;
-    if (kind == NATIVE_EVDEV_DEVICE_MOUSE) {
+    backend->ndevices++;
+    if (is_mouse) {
         atomic_store(&input->mouse_active, true);
-    } else {
+    }
+    if (is_keyboard) {
         atomic_store(&input->keyboard_active, true);
     }
     return true;
+}
+
+struct evdev_open_context {
+    NativeEvdevInput *input;
+    NativeEvdevBackend *backend;
+};
+
+static bool evdev_open_visit(const char *path, void *user) {
+    struct evdev_open_context *ctx = (struct evdev_open_context *)user;
+    (void)evdev_add_device(ctx->input, ctx->backend, path);
+    return ctx->backend->ndevices >= NATIVE_EVDEV_MAX_DEVICES; /* stop once the table is full */
 }
 
 static NativeEvdevBackend *evdev_open_backend(NativeEvdevInput *input) {
@@ -387,53 +477,91 @@ static NativeEvdevBackend *evdev_open_backend(NativeEvdevInput *input) {
         backend->devices[i].fd = -1;
     }
 
-    DIR *dir = opendir("/dev/input");
-    if (!dir) {
-        free(backend);
-        return NULL;
+    /* Watch /dev/input so a keyboard/mouse plugged in mid-session is grabbed without a restart
+     * (unplug is already handled by the reader's poll-error path). Best effort: if inotify is
+     * unavailable we simply fall back to a one-shot scan. */
+    backend->inotify_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    if (backend->inotify_fd >= 0 && inotify_add_watch(backend->inotify_fd, "/dev/input", IN_CREATE | IN_ATTRIB) < 0) {
+        fprintf(stderr, "[native-input] inotify watch on /dev/input failed (%s); hotplug add disabled\n",
+                strerror(errno));
+        close(backend->inotify_fd);
+        backend->inotify_fd = -1;
     }
 
-    struct dirent *ent;
-    while (backend->ndevices < NATIVE_EVDEV_MAX_DEVICES && (ent = readdir(dir)) != NULL) {
-        if (strncmp(ent->d_name, "event", 5) != 0) {
-            continue;
-        }
-        char path[300];
-        (void)snprintf(path, sizeof(path), "/dev/input/%s", ent->d_name);
-        (void)evdev_add_device(input, backend, path);
-    }
-    closedir(dir);
+    struct evdev_open_context ctx = {input, backend};
+    (void)evdev_for_each_input_node(evdev_open_visit, &ctx);
 
-    if (backend->ndevices == 0) {
+    /* Keep the reader alive with zero devices as long as hotplug is watching, so "start
+     * streaming, then plug in a keyboard" still works. Only give up when there is nothing to
+     * read and no way to notice a later device. */
+    if (backend->ndevices == 0 && backend->inotify_fd < 0) {
         evdev_close_backend(backend);
         return NULL;
     }
     return backend;
 }
 
+/* Drain the inotify queue (used only as a "something changed" trigger) and reconcile the
+ * grabbed set against /dev/input, grabbing any node we do not already hold. A full rescan is
+ * used rather than acting on individual inotify records so node renumbering across an
+ * unplug/replug cannot slip through. Returns true if the device set changed. */
+static bool evdev_handle_hotplug(NativeEvdevInput *input, NativeEvdevBackend *backend) {
+    if (backend->inotify_fd < 0) {
+        return false;
+    }
+    char buf[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
+    while (read(backend->inotify_fd, buf, sizeof(buf)) > 0) {
+        /* contents intentionally ignored; the rescan below is the source of truth */
+    }
+
+    int before = backend->ndevices;
+    struct evdev_open_context ctx = {input, backend};
+    (void)evdev_for_each_input_node(evdev_open_visit, &ctx);
+    return backend->ndevices != before;
+}
+
 static void *evdev_thread(void *arg) {
     NativeEvdevInput *input = (NativeEvdevInput *)arg;
     NativeEvdevBackend *backend = (NativeEvdevBackend *)input->backend;
-    struct pollfd fds[NATIVE_EVDEV_MAX_DEVICES + 1];
+    /* +2 for the stop eventfd and the /dev/input inotify fd. */
+    struct pollfd fds[NATIVE_EVDEV_MAX_DEVICES + 2];
+    int poll_failures = 0;
 
     while (atomic_load(&input->running)) {
         fds[0].fd = input->stop_fd;
         fds[0].events = POLLIN;
         fds[0].revents = 0;
+        fds[1].fd = backend->inotify_fd; /* a negative fd is ignored by poll() */
+        fds[1].events = POLLIN;
+        fds[1].revents = 0;
         for (int i = 0; i < backend->ndevices; i++) {
-            fds[i + 1].fd = backend->devices[i].fd;
-            fds[i + 1].events = POLLIN;
-            fds[i + 1].revents = 0;
+            fds[i + 2].fd = backend->devices[i].fd;
+            fds[i + 2].events = POLLIN;
+            fds[i + 2].revents = 0;
         }
 
-        int ret = poll(fds, (nfds_t)(backend->ndevices + 1), -1);
+        int ret = poll(fds, (nfds_t)(backend->ndevices + 2), -1);
         if (ret < 0) {
             if (errno == EINTR) {
                 continue;
             }
             fprintf(stderr, "[native-input] poll failed: %s\n", strerror(errno));
+            /* A persistent poll error (not EINTR) would otherwise spin the reader at 100% CPU,
+             * starving video decode and flooding the log. Back off briefly, and after a bounded
+             * run of consecutive failures give up so the app drops back to SDL input. */
+            if (++poll_failures >= NATIVE_EVDEV_MAX_POLL_FAILURES) {
+                fprintf(stderr, "[native-input] too many consecutive poll failures; stopping evdev reader\n");
+                /* Hand the devices back to the compositor before quitting, otherwise they stay
+                 * EVIOCGRAB-captured and the SDL fallback would have nothing to read. */
+                evdev_release_devices(input, backend);
+                atomic_store(&input->running, false);
+                break;
+            }
+            struct timespec backoff = {0, 10 * 1000 * 1000}; /* 10ms */
+            (void)nanosleep(&backoff, NULL);
             continue;
         }
+        poll_failures = 0;
         if (fds[0].revents & POLLIN) {
             uint64_t value;
             while (read(input->stop_fd, &value, sizeof(value)) == (ssize_t)sizeof(value)) {
@@ -442,16 +570,26 @@ static void *evdev_thread(void *arg) {
         }
 
         bool pushed = false;
+        bool changed = false;
+        /* Handle disconnects first so the hotplug rescan below sees an accurate device set
+         * (e.g. an unplug/replug that reuses the same eventN node). */
         for (int i = backend->ndevices - 1; i >= 0; i--) {
-            if (fds[i + 1].revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL)) {
+            if (fds[i + 2].revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL)) {
                 NativeEvdevDrainResult drain = evdev_drain_device(input, &backend->devices[i]);
                 pushed = drain.pushed || pushed;
-                if (drain.remove || (fds[i + 1].revents & (POLLERR | POLLHUP | POLLNVAL))) {
+                if (drain.remove || (fds[i + 2].revents & (POLLERR | POLLHUP | POLLNVAL))) {
                     evdev_remove_device(input, backend, i);
+                    changed = true;
                 }
             }
         }
-        if (pushed) {
+        /* Then pick up devices connected since the last scan. */
+        if (fds[1].revents & POLLIN) {
+            changed = evdev_handle_hotplug(input, backend) || changed;
+        }
+        /* Wake the main loop on new input and on a device-set change so it re-reads the
+         * mouse/keyboard active flags and starts (or stops) draining promptly. */
+        if (pushed || changed) {
             evdev_notify_main(input);
         }
     }

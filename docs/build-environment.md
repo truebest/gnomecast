@@ -63,9 +63,10 @@ Run the local native smoke commands:
 ```sh
 cc -fsyntax-only -Inative/include \
   native/src/main.c native/src/media_ss4s.c native/src/video_ss4s.c \
-  native/src/audio_ss4s.c native/src/video_rgba_sdl.c \
+  native/src/audio_ss4s.c native/src/audio_mixer.c native/src/audio_opus.c \
+  native/src/video_rgba_sdl.c \
   native/src/h264_annexb.c native/src/input_sdl.c native/src/cursor_sdl.c \
-  native/src/rdp_ffi_stub.c
+  native/src/rdp_ffi_stub.c native/src/config_paths.c native/src/settings_json.c
 cargo test --manifest-path webrdp-min/Cargo.toml --features native native::tests::
 cmake -S native -B /tmp/gnomecast-native-build
 cmake --build /tmp/gnomecast-native-build
