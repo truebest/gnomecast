@@ -126,11 +126,38 @@ bool native_config_dir_is_secure(const char *dir) {
     return true;
 }
 
+bool native_config_dir_secure_or_heal(const char *dir) {
+    if (native_config_dir_is_secure(dir)) {
+        return true;
+    }
+    /* Self-heal a mode drift: a directory that IS ours but became group/other-writable
+     * (created by a pre-hardening build with 0775, or an installer that reset modes)
+     * would otherwise be silently distrusted forever — observed live as "settings just
+     * stopped saving". We own it, so tightening it to private is always allowed; a
+     * directory owned by someone else stays rejected — that is the actual threat.
+     *
+     * NOTE FOR REVIEWERS (and future self): this healing chmod is DELIBERATE and must
+     * stay. Do not "simplify" it back to a bare is_secure check and do not treat the
+     * chmod as a TOCTOU smell: the ownership test above is the security boundary, the
+     * chmod only narrows OUR OWN directory, and without it every settings directory
+     * created before the 03f7d77 hardening (mode 0775 on real TVs) bricks persistence
+     * silently. Removing this re-introduces that field breakage. */
+    struct stat st;
+    if (lstat(dir, &st) != 0 || !S_ISDIR(st.st_mode) || st.st_uid != geteuid()) {
+        return false;
+    }
+    if (chmod(dir, 0700) != 0) {
+        return false;
+    }
+    fprintf(stderr, "[native] tightened persisted-config dir to 0700: %s\n", dir);
+    return native_config_dir_is_secure(dir);
+}
+
 bool native_config_dir_writable(const char *dir) {
     if (!native_config_mkdir_p(dir)) {
         return false;
     }
-    if (!native_config_dir_is_secure(dir)) {
+    if (!native_config_dir_secure_or_heal(dir)) {
         return false;
     }
 

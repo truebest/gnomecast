@@ -35,6 +35,11 @@ if(HELLOLG_TARGET_WEBOS)
   if(NOT HELLOLG_LINK_RDP_FFI)
     message(FATAL_ERROR "webOS product builds require HELLOLG_LINK_RDP_FFI=ON")
   endif()
+  # System-volume bridge (mixer MASTER fader) talks to the Luna bus via the NATIVE
+  # luna-service2 client. A luna-send-pub subprocess is NOT an option: fork()ing this
+  # process while the NDL/OMX pipeline is (re)loading raced its in-process decoder
+  # state (black screens observed live), and a pipe cannot deliver subscribe events.
+  set(HELLOLG_WITH_LS2 ON)
   if(NOT HELLOLG_WITH_SS4S)
     message(FATAL_ERROR "webOS product builds require HELLOLG_WITH_SS4S=ON for H.264 hardware decode")
   endif()
@@ -45,6 +50,8 @@ endif()
 
 add_executable(gnomecast-native
   src/main.c
+  src/au_snapshot.c
+  src/luna_volume.c
   src/config_paths.c
   src/settings_json.c
   src/media_ss4s.c
@@ -72,6 +79,13 @@ target_compile_definitions(gnomecast-native PRIVATE
 # libm: the volume overlay's meter math (log10f) lives in SDL builds, but linking m
 # unconditionally is harmless and keeps the host build in sync.
 target_link_libraries(gnomecast-native PRIVATE Threads::Threads m)
+
+if(HELLOLG_WITH_LS2)
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(GLIB2 REQUIRED IMPORTED_TARGET glib-2.0)
+  target_compile_definitions(gnomecast-native PRIVATE HELLOLG_WITH_LS2=1)
+  target_link_libraries(gnomecast-native PRIVATE PkgConfig::GLIB2 luna-service2)
+endif()
 
 if(HELLOLG_WITH_OPUS)
   # Reuses ss4s's recipe: builds libopus 1.4 from source under the active toolchain.
@@ -302,6 +316,21 @@ if(BUILD_TESTING)
   )
   target_include_directories(test-settings-json PRIVATE include)
   add_test(NAME settings-json COMMAND test-settings-json)
+
+  add_executable(test-au-snapshot
+    tests/test_au_snapshot.c
+    src/au_snapshot.c
+  )
+  target_include_directories(test-au-snapshot PRIVATE include)
+  add_test(NAME au-snapshot COMMAND test-au-snapshot)
+
+  add_executable(test-luna-volume
+    tests/test_luna_volume.c
+    src/luna_volume.c
+  )
+  target_include_directories(test-luna-volume PRIVATE include)
+  target_link_libraries(test-luna-volume PRIVATE Threads::Threads)
+  add_test(NAME luna-volume COMMAND test-luna-volume)
 
   add_executable(test-audio-mixer
     tests/test_audio_mixer.c

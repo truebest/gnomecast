@@ -47,6 +47,11 @@ bool native_config_mkdir_p(const char *dir);
  * planted or could replace a file inside it. */
 bool native_config_dir_is_secure(const char *dir);
 
+/* dir_is_secure, plus self-healing for OUR OWN directories whose mode drifted loose
+ * (e.g. 0775 from a pre-hardening build): tightens them to 0700 and re-checks. A
+ * directory owned by anyone else stays rejected. */
+bool native_config_dir_secure_or_heal(const char *dir);
+
 /* True when `dir` can be created/used AND is secure AND a probe file can be
  * written and removed there. Used to pick a directory safe for the credentials
  * file. */

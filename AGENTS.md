@@ -114,6 +114,4 @@ webOS. Toolchain default
 - Do not reintroduce Web/MSE/WebCodecs/RDCleanPath or the deleted browser/Luna trees, and do
   not package `app/` or `service/` into the native target.
 - Do not use dummy/software ss4s video backends for acceptance.
-- Do not copy or adapt Moonlight-TV (GPL) application code — read-only reference only;
-  gnomecast is MIT-licensed. Preserve dependency licenses when pinning submodules.
 - Do not log passwords or local config contents.

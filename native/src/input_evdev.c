@@ -231,12 +231,13 @@ static bool evdev_dispatch(NativeEvdevInput *input, const NativeEvdevDevice *dev
         if (raw->code >= BTN_LEFT && raw->code <= BTN_TASK) {
             return device->is_mouse ? evdev_dispatch_mouse(input, raw) : false;
         }
-        /* Remote color keys (session switching) ride whatever grabbed node emits them:
-         * some Magic Remote firmwares expose virtual nodes that qualify only as relative
-         * mice, and the switch keys must not depend on that node also typing like a
-         * keyboard. The keyboard drain runs whenever the ring holds events, so these get
-         * through even with no keyboard-classified device present. */
-        if (raw->code >= KEY_RED && raw->code <= KEY_BLUE) {
+        /* Remote color keys and the channel rocker (session switching/zapping) ride
+         * whatever grabbed node emits them: some Magic Remote firmwares expose virtual
+         * nodes that qualify only as relative mice, and the switch keys must not depend
+         * on that node also typing like a keyboard. The keyboard drain runs whenever the
+         * ring holds events, so these get through even with no keyboard-classified
+         * device present. (KEY_RED..KEY_BLUE and KEY_CHANNELUP/DOWN are contiguous.) */
+        if (raw->code >= KEY_RED && raw->code <= KEY_CHANNELDOWN) {
             return evdev_dispatch_keyboard(input, raw);
         }
         return device->is_keyboard ? evdev_dispatch_keyboard(input, raw) : false;

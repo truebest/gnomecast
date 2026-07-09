@@ -178,6 +178,44 @@ void native_mixer_get_source_peaks(NativeAudioMixer *mixer, int source, int32_t 
     pthread_mutex_unlock(&mixer->lock);
 }
 
+void native_mixer_get_output_peaks(NativeAudioMixer *mixer, int32_t *left, int32_t *right) {
+    if (left) {
+        *left = 0;
+    }
+    if (right) {
+        *right = 0;
+    }
+    if (!mixer || !mixer->initialized) {
+        return;
+    }
+    pthread_mutex_lock(&mixer->lock);
+    if (mixer->mix_peak_left != 0 || mixer->mix_peak_right != 0) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        uint64_t age_ns = timespec_diff_ns(&now, &mixer->mix_peak_when);
+        if (age_ns <= 100000000u) { /* a few chunk periods; older = the pump paused */
+            if (left) {
+                *left = mixer->mix_peak_left;
+            }
+            if (right) {
+                *right = mixer->mix_peak_right;
+            }
+        }
+    }
+    pthread_mutex_unlock(&mixer->lock);
+}
+
+unsigned native_mixer_get_source_latency_ms(NativeAudioMixer *mixer, int source) {
+    if (!mixer || !mixer->initialized || !source_index_valid(source)) {
+        return 0;
+    }
+    pthread_mutex_lock(&mixer->lock);
+    size_t frames = mixer->sources[source].open ? mixer->sources[source].len_frames : 0;
+    uint32_t rate = mixer->sample_rate;
+    pthread_mutex_unlock(&mixer->lock);
+    return rate ? (unsigned)(frames * 1000u / rate) : 0;
+}
+
 /* Caller holds the lock. */
 static void source_write_frames(NativeAudioMixer *mixer, NativeMixerSource *src, const int16_t *samples,
                                 size_t frames) {
@@ -414,9 +452,18 @@ static bool mixer_pull_locked(NativeAudioMixer *mixer, int16_t *out) {
         }
     }
 
+    int32_t mix_peak[2] = {0, 0};
     for (size_t sample = 0; sample < out_samples; sample++) {
-        out[sample] = saturate_i16(mixer->accum_buf[sample]);
+        int16_t clamped = saturate_i16(mixer->accum_buf[sample]);
+        out[sample] = clamped;
+        int32_t magnitude = clamped < 0 ? -(int32_t)clamped : (int32_t)clamped;
+        if (magnitude > mix_peak[sample % channels & 1]) {
+            mix_peak[sample % channels & 1] = magnitude;
+        }
     }
+    mixer->mix_peak_left = mix_peak[0];
+    mixer->mix_peak_right = channels > 1 ? mix_peak[1] : mix_peak[0];
+    clock_gettime(CLOCK_MONOTONIC, &mixer->mix_peak_when);
     /* Post-take depth is the honest standing level: its window minimum (the floor) is
      * audio that persistently sat unplayed — the input to the standing-backlog trim. */
     for (int i = 0; i < NATIVE_MIXER_MAX_SOURCES; i++) {

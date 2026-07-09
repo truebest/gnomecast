@@ -14,8 +14,18 @@ int32_t native_ui_mixer_gain_db_to_q15(int gain_db) {
 
 #if defined(HELLOLG_WITH_SDL) && HELLOLG_WITH_SDL
 
-/* Remote-button order red/green/yellow/blue — same palette as the session badges. */
-static const uint32_t ui_mixer_slot_colors[NATIVE_SETTINGS_MAX_SESSIONS] = {0xff4136, 0x2ecc40, 0xffdc00, 0x0074d9};
+/* Remote-button order red/green/yellow/blue, then the MASTER's neutral white — same
+ * palette as the session badges. */
+static const uint32_t ui_mixer_channel_colors[NATIVE_UI_MIXER_CHANNELS] = {0xff4136, 0x2ecc40, 0xffdc00, 0x0074d9,
+                                                                           0xffffff};
+
+/* Both faders travel the same track; only the value domain differs (dB vs percent). */
+static int ui_mixer_master_pct_clamped(int pct) {
+    if (pct < 0) {
+        return 0; /* unknown volume parks the (dimmed) knob at the bottom stop */
+    }
+    return pct > 100 ? 100 : pct;
+}
 
 /* Horizontal capsule (rounded bar) out of three rects — smooth enough at 1080p from
  * couch distance; SDL2 has no filled-rounded-rect primitive. */
@@ -32,7 +42,7 @@ static void ui_mixer_fill_capsule(SDL_Renderer *renderer, SDL_Rect rect) {
     SDL_RenderFillRect(renderer, &cap_bottom);
 }
 
-void native_ui_mixer_draw_fallback(SDL_Renderer *renderer, const int8_t *gain_db, int selected,
+void native_ui_mixer_draw_fallback(SDL_Renderer *renderer, const int8_t *gain_db, int master_pct, int selected,
                                    unsigned connected_mask) {
     if (!renderer || !gain_db) {
         return;
@@ -56,14 +66,14 @@ void native_ui_mixer_draw_fallback(SDL_Renderer *renderer, const int8_t *gain_db
     const int handle_w = 60;
     const int handle_h = 18;
     SDL_Rect panel;
-    panel.w = NATIVE_SETTINGS_MAX_SESSIONS * column_w + 2 * pad_x;
+    panel.w = NATIVE_UI_MIXER_CHANNELS * column_w + 2 * pad_x;
     panel.h = pad_top + track_h + bottom_area;
     panel.x = (output_width - panel.w) / 2;
     panel.y = (output_height - panel.h) / 2;
     SDL_SetRenderDrawColor(renderer, 8, 10, 14, 200);
     SDL_RenderFillRect(renderer, &panel);
 
-    for (int i = 0; i < NATIVE_SETTINGS_MAX_SESSIONS; i++) {
+    for (int i = 0; i < NATIVE_UI_MIXER_CHANNELS; i++) {
         int col_x = panel.x + pad_x + i * column_w;
         int track_y = panel.y + pad_top;
         /* Rails sit right of the column center so the tick scale fits on their left. */
@@ -107,9 +117,15 @@ void native_ui_mixer_draw_fallback(SDL_Renderer *renderer, const int8_t *gain_db
 
         bool connected = (connected_mask & (1u << i)) != 0;
 
-        /* The capsule handle rides the rails: +6 dB at the top, -60 (mute) at the bottom. */
-        int handle_y = track_y + (track_h - handle_h) * (NATIVE_MIXER_FADER_MAX_DB - (int)gain_db[i]) /
+        /* The capsule handle rides the rails: +6 dB at the top, -60 (mute) at the bottom
+         * — or 100..0 for the MASTER, whose fader is the system volume. */
+        int handle_y;
+        if (i == NATIVE_UI_MIXER_MASTER) {
+            handle_y = track_y + (track_h - handle_h) * (100 - ui_mixer_master_pct_clamped(master_pct)) / 100;
+        } else {
+            handle_y = track_y + (track_h - handle_h) * (NATIVE_MIXER_FADER_MAX_DB - (int)gain_db[i]) /
                                      (NATIVE_MIXER_FADER_MAX_DB - NATIVE_MIXER_FADER_MIN_DB);
+        }
         SDL_Rect handle = {center_x - handle_w / 2, handle_y, handle_w, handle_h};
         uint8_t handle_alpha = connected ? (is_selected ? 255 : 185) : 90;
         SDL_SetRenderDrawColor(renderer, 255, 255, 255, handle_alpha);
@@ -121,8 +137,8 @@ void native_ui_mixer_draw_fallback(SDL_Renderer *renderer, const int8_t *gain_db
             SDL_RenderFillRect(renderer, &grip);
         }
 
-        /* Slot color bar under the channel — the channel "label" (no fonts here). */
-        uint32_t color = ui_mixer_slot_colors[i];
+        /* Channel color bar under the fader — the channel "label" (no fonts here). */
+        uint32_t color = ui_mixer_channel_colors[i];
         SDL_SetRenderDrawColor(renderer, (uint8_t)(color >> 16), (uint8_t)(color >> 8), (uint8_t)color,
                                connected ? 235 : 96);
         SDL_Rect color_bar = {center_x - handle_w / 2, track_y + track_h + 40, handle_w, 10};
@@ -155,19 +171,25 @@ struct NativeUiMixer {
     lv_disp_t *disp;
     lv_obj_t *screen;
     lv_obj_t *restore_screen; /* whatever was active when the overlay opened */
-    lv_obj_t *channels[NATIVE_SETTINGS_MAX_SESSIONS];
-    lv_obj_t *knobs[NATIVE_SETTINGS_MAX_SESSIONS];
-    lv_obj_t *meter_clips[NATIVE_SETTINGS_MAX_SESSIONS][2];
-    lv_obj_t *meter_grads[NATIVE_SETTINGS_MAX_SESSIONS][2];
-    lv_obj_t *color_bars[NATIVE_SETTINGS_MAX_SESSIONS];
+    lv_obj_t *channels[NATIVE_UI_MIXER_CHANNELS];
+    lv_obj_t *knobs[NATIVE_UI_MIXER_CHANNELS];
+    lv_obj_t *meter_clips[NATIVE_UI_MIXER_CHANNELS][2];
+    lv_obj_t *meter_grads[NATIVE_UI_MIXER_CHANNELS][2];
+    lv_obj_t *color_bars[NATIVE_UI_MIXER_CHANNELS];
+    lv_obj_t *latency_labels[NATIVE_UI_MIXER_CHANNELS]; /* NULL for the MASTER */
     /* Rendered per-frame while up: cache the last-pushed values so only changed widgets
-     * are touched (LVGL then redraws only those areas). */
-    int meter_px[NATIVE_SETTINGS_MAX_SESSIONS][2];
-    int knob_db[NATIVE_SETTINGS_MAX_SESSIONS];
+     * are touched (LVGL then redraws only those areas). knob_value carries dB for the
+     * slots and percent for the MASTER — it is only ever compared for change. */
+    int meter_px[NATIVE_UI_MIXER_CHANNELS][2];
+    int knob_value[NATIVE_UI_MIXER_CHANNELS];
+    /* Channel-header latency readouts: refreshed at a calm cadence so the number is
+     * readable rather than a per-chunk blur. */
+    unsigned latency_shown[NATIVE_UI_MIXER_CHANNELS];
+    uint32_t latency_ticks;
     int selected;
     unsigned mask;
-    /* Displayed post-fader level per slot/side in dBFS (instant attack, steady release). */
-    float meter_db[NATIVE_SETTINGS_MAX_SESSIONS][2];
+    /* Displayed level per channel/side in dBFS (instant attack, steady release). */
+    float meter_db[NATIVE_UI_MIXER_CHANNELS][2];
     uint32_t meter_ticks;
     bool active;
     bool full_refresh;
@@ -178,9 +200,13 @@ static int ui_mixer_db_to_y(int db) {
            (NATIVE_MIXER_FADER_MAX_DB - db) * UI_MIXER_FADER_H / (NATIVE_MIXER_FADER_MAX_DB - NATIVE_MIXER_FADER_MIN_DB);
 }
 
+static int ui_mixer_pct_to_y(int pct) {
+    return UI_MIXER_FADER_Y + (100 - ui_mixer_master_pct_clamped(pct)) * UI_MIXER_FADER_H / 100;
+}
+
 /* The panel is centered and its layout fully deterministic (flex row, fixed channel
  * width/gaps), so pointer hit-testing is pure arithmetic — no LVGL involved. */
-#define UI_MIXER_PANEL_W (NATIVE_SETTINGS_MAX_SESSIONS * UI_MIXER_CHANNEL_W + 3 * 12 + 2 * 28)
+#define UI_MIXER_PANEL_W (NATIVE_UI_MIXER_CHANNELS * UI_MIXER_CHANNEL_W + (NATIVE_UI_MIXER_CHANNELS - 1) * 12 + 2 * 28)
 #define UI_MIXER_PANEL_H (UI_MIXER_CHANNEL_H + 2 * 28)
 
 bool native_ui_mixer_hit_test(int win_w, int win_h, int x, int y, int *slot, bool *on_fader) {
@@ -198,7 +224,7 @@ bool native_ui_mixer_hit_test(int win_w, int win_h, int x, int y, int *slot, boo
     int rel_x = x - panel_x - 28;
     if (slot && rel_x >= 0) {
         int i = rel_x / (UI_MIXER_CHANNEL_W + 12);
-        if (i < NATIVE_SETTINGS_MAX_SESSIONS && rel_x - i * (UI_MIXER_CHANNEL_W + 12) < UI_MIXER_CHANNEL_W) {
+        if (i < NATIVE_UI_MIXER_CHANNELS && rel_x - i * (UI_MIXER_CHANNEL_W + 12) < UI_MIXER_CHANNEL_W) {
             *slot = i;
         }
     }
@@ -232,6 +258,18 @@ int native_ui_mixer_fader_db_at(int win_h, int y) {
         db = NATIVE_MIXER_FADER_MAX_DB;
     }
     return db;
+}
+
+int native_ui_mixer_fader_pct_at(int win_h, int y) {
+    int track_y = (win_h - UI_MIXER_PANEL_H) / 2 + 28 + UI_MIXER_FADER_Y;
+    int fy = y - track_y;
+    if (fy < 0) {
+        fy = 0;
+    }
+    if (fy > UI_MIXER_FADER_H) {
+        fy = UI_MIXER_FADER_H;
+    }
+    return 100 - (fy * 100 + UI_MIXER_FADER_H / 2) / UI_MIXER_FADER_H;
 }
 
 /* One channel per session slot, styled after a hardware fader bank: an L/R pair of
@@ -290,6 +328,10 @@ static void ui_mixer_build_channel(NativeUiMixer *mixer, lv_obj_t *panel, int sl
         lv_obj_set_style_bg_opa(grad, LV_OPA_COVER, 0);
     }
 
+    /* Tick scale: every channel wears the same dBFS artwork — including the MASTER,
+     * whose fader actually travels system-volume percent over the full track. The
+     * mismatch is deliberate (a uniform bank reads better from the couch); only the
+     * knob position and the input mapping are percent there. */
     for (int db = NATIVE_MIXER_FADER_MAX_DB; db >= NATIVE_MIXER_FADER_MIN_DB; db -= 3) {
         int y = ui_mixer_db_to_y(db);
         if (db <= 0 && db % 15 == 0) {
@@ -325,6 +367,24 @@ static void ui_mixer_build_channel(NativeUiMixer *mixer, lv_obj_t *panel, int sl
     lv_obj_set_style_shadow_opa(knob, LV_OPA_50, 0);
     lv_obj_set_style_shadow_color(knob, lv_color_black(), 0);
 
+    if (slot != NATIVE_UI_MIXER_MASTER) {
+        /* Channel-header readout: the session's client-held audio queue in ms. */
+        lv_obj_t *latency = lv_label_create(channel);
+        mixer->latency_labels[slot] = latency;
+        lv_obj_set_style_text_font(latency, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(latency, lv_color_white(), 0);
+        lv_obj_set_style_text_opa(latency, LV_OPA_60, 0);
+        /* Right-aligned in a fixed box centered on the channel: the "ms" suffix stays
+         * anchored and extra digits grow leftwards, so the readout never jiggles when
+         * the value crosses a digit boundary. Sized for four digits (ring caps allow
+         * seconds of backlog). */
+        lv_obj_set_style_text_align(latency, LV_TEXT_ALIGN_RIGHT, 0);
+        lv_label_set_long_mode(latency, LV_LABEL_LONG_CLIP);
+        lv_obj_set_width(latency, 56);
+        lv_label_set_text(latency, "");
+        lv_obj_set_pos(latency, UI_MIXER_CHANNEL_W / 2 - 28, 6);
+    }
+
     lv_obj_t *bar = lv_obj_create(channel);
     mixer->color_bars[slot] = bar;
     lv_obj_set_size(bar, 64, 8);
@@ -358,8 +418,7 @@ NativeUiMixer *native_ui_mixer_create(SDL_Renderer *renderer) {
     lv_obj_clear_flag(mixer->screen, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *panel = lv_obj_create(mixer->screen);
-    lv_obj_set_size(panel, NATIVE_SETTINGS_MAX_SESSIONS * UI_MIXER_CHANNEL_W + 3 * 12 + 2 * 28,
-                    UI_MIXER_CHANNEL_H + 2 * 28);
+    lv_obj_set_size(panel, UI_MIXER_PANEL_W, UI_MIXER_PANEL_H);
     lv_obj_center(panel);
     lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_bg_color(panel, lv_color_hex(0x0b0d12), 0);
@@ -376,8 +435,8 @@ NativeUiMixer *native_ui_mixer_create(SDL_Renderer *renderer) {
     lv_obj_set_flex_flow(panel, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(panel, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
-    for (int slot = 0; slot < NATIVE_SETTINGS_MAX_SESSIONS; slot++) {
-        ui_mixer_build_channel(mixer, panel, slot, ui_mixer_slot_colors[slot]);
+    for (int slot = 0; slot < NATIVE_UI_MIXER_CHANNELS; slot++) {
+        ui_mixer_build_channel(mixer, panel, slot, ui_mixer_channel_colors[slot]);
     }
     return mixer;
 }
@@ -409,14 +468,16 @@ void native_ui_mixer_show(NativeUiMixer *mixer) {
     mixer->active = true;
     /* Poison the caches so the first render pushes every widget; meters start from
      * silence and attack to the live level on the first frames. */
-    for (int i = 0; i < NATIVE_SETTINGS_MAX_SESSIONS; i++) {
+    for (int i = 0; i < NATIVE_UI_MIXER_CHANNELS; i++) {
         mixer->meter_px[i][0] = -1;
         mixer->meter_px[i][1] = -1;
-        mixer->knob_db[i] = 127;
+        mixer->knob_value[i] = INT32_MAX;
+        mixer->latency_shown[i] = UINT32_MAX;
         mixer->meter_db[i][0] = NATIVE_MIXER_METER_FLOOR_DB;
         mixer->meter_db[i][1] = NATIVE_MIXER_METER_FLOOR_DB;
     }
     mixer->meter_ticks = SDL_GetTicks();
+    mixer->latency_ticks = 0; /* first render publishes immediately */
     mixer->selected = -2;
     mixer->mask = 0xffffffffu;
     mixer->full_refresh = true;
@@ -440,10 +501,29 @@ void native_ui_mixer_hide(NativeUiMixer *mixer) {
      * tick, and back on the configurator the normal tick path re-renders the form. */
 }
 
-void native_ui_mixer_render(NativeUiMixer *mixer, const int32_t (*peaks)[2], const int8_t *gain_db, int selected,
-                            unsigned connected_mask, uint32_t now_ticks) {
-    if (!mixer || !peaks || !gain_db || !mixer->active) {
+void native_ui_mixer_render(NativeUiMixer *mixer, const int32_t (*peaks)[2], const unsigned *latency_ms,
+                            const int8_t *gain_db, int master_pct, int selected, unsigned connected_mask,
+                            uint32_t now_ticks) {
+    if (!mixer || !peaks || !latency_ms || !gain_db || !mixer->active) {
         return;
+    }
+    /* Latency readouts tick at 4 Hz: the queue depth breathes with every 21ms chunk,
+     * and a calmer number is a readable one. */
+    if (SDL_TICKS_PASSED(now_ticks, mixer->latency_ticks)) {
+        mixer->latency_ticks = now_ticks + 250u;
+        for (int i = 0; i < NATIVE_SETTINGS_MAX_SESSIONS; i++) {
+            bool connected = (connected_mask & (1u << i)) != 0;
+            unsigned shown = connected ? latency_ms[i] : UINT32_MAX - 1u;
+            if (shown == mixer->latency_shown[i] || !mixer->latency_labels[i]) {
+                continue;
+            }
+            mixer->latency_shown[i] = shown;
+            if (connected) {
+                lv_label_set_text_fmt(mixer->latency_labels[i], "%u ms", latency_ms[i]);
+            } else {
+                lv_label_set_text(mixer->latency_labels[i], "");
+            }
+        }
     }
     /* Meter ballistics: instant attack to the audio mixer's post-fader chunk peak,
      * steady dB/s release. Wrap-safe tick math; a stalled loop just decays further. */
@@ -453,7 +533,7 @@ void native_ui_mixer_render(NativeUiMixer *mixer, const int32_t (*peaks)[2], con
     /* Called every frame while the overlay is up: touch only what changed, so LVGL
      * invalidates (and the GPU repaints) just the moving meters, not the whole panel.
      * With nothing changed lv_refr_now finds no dirty areas and presents nothing. */
-    for (int i = 0; i < NATIVE_SETTINGS_MAX_SESSIONS; i++) {
+    for (int i = 0; i < NATIVE_UI_MIXER_CHANNELS; i++) {
         for (int side = 0; side < 2; side++) {
             float target_db = peaks[i][side] > 0 ? 20.0f * log10f((float)peaks[i][side] / 32768.0f)
                                                  : NATIVE_MIXER_METER_FLOOR_DB;
@@ -492,16 +572,17 @@ void native_ui_mixer_render(NativeUiMixer *mixer, const int32_t (*peaks)[2], con
             lv_obj_set_height(clip, px);
             lv_obj_set_y(mixer->meter_grads[i][side], px - UI_MIXER_FADER_H);
         }
-        int db = gain_db[i];
-        if (db != mixer->knob_db[i]) {
-            mixer->knob_db[i] = db;
-            lv_obj_set_y(mixer->knobs[i], ui_mixer_db_to_y(db) - UI_MIXER_KNOB_H / 2);
+        int value = i == NATIVE_UI_MIXER_MASTER ? master_pct : gain_db[i];
+        if (value != mixer->knob_value[i]) {
+            mixer->knob_value[i] = value;
+            int knob_y = i == NATIVE_UI_MIXER_MASTER ? ui_mixer_pct_to_y(value) : ui_mixer_db_to_y(value);
+            lv_obj_set_y(mixer->knobs[i], knob_y - UI_MIXER_KNOB_H / 2);
         }
     }
     if (selected != mixer->selected || connected_mask != mixer->mask) {
         mixer->selected = selected;
         mixer->mask = connected_mask;
-        for (int i = 0; i < NATIVE_SETTINGS_MAX_SESSIONS; i++) {
+        for (int i = 0; i < NATIVE_UI_MIXER_CHANNELS; i++) {
             bool connected = (connected_mask & (1u << i)) != 0;
             bool is_selected = i == selected;
             lv_obj_set_style_bg_opa(mixer->channels[i], is_selected ? LV_OPA_10 : LV_OPA_TRANSP, 0);

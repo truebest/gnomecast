@@ -37,9 +37,44 @@ the TV remote's color buttons in the remote's own order: red, green, yellow, blu
   Because grd resumes with a delta frame and rejects Refresh Rect, switching back forces
   a fresh IDR by re-submitting the Display Control monitor layout (grd rebuilds its
   encode session on every layout PDU, even an identical one → RESET_GRAPHICS + IDR). If
-  no decodable frame arrives within 4s of a switch (e.g. grd mirror mode has no Display
+  no decodable frame arrives within 2s of a switch (e.g. grd mirror mode has no Display
   Control channel), the client reconnects that session once — a fresh connection always
-  starts with an IDR.
+  starts with an IDR — and remembers the slot as refresh-ineffective, so later switches
+  skip the doomed wait.
+- **IDR-snapshot backgrounding** (refresh-ineffective slots): a plain suppress would
+  strand such a slot behind an unusable delta chain (grd emits its only IDR at connect),
+  so leaving its stream instead reconnects the slot invisibly — behind the new active
+  screen — and caches the fresh connection's compressed IDR (+ any deltas racing the
+  suppress) in an 8MB/slot AU snapshot; the server is suppressed once the IDR is in
+  hand. Switching back replays the cache into the shared decoder (same-size in-band
+  handover, no pipeline reload, no splash) and resumes output without a refresh: the
+  server's next delta references exactly the replayed state. The first frame shown is
+  the desktop as of backgrounding time; the resume delta catches it up. Cache overflow
+  (a server that keeps streaming despite suppress) voids the snapshot and switch-back
+  falls back to the visible reconnect. `HELLOLG_SNAPSHOT_FORCE=1` arms snapshot
+  backgrounding for every slot without waiting for the watchdog to learn — the on-device
+  experiment knob for validating that grd's resume delta really continues the cached
+  chain.
+- **Deferred switching**: a color-key press whose target stream is not ready (no cached
+  IDR yet — first switch to a slot, a manual-Connect flag reset, a flip-back racing the
+  suppress tail) no longer moves the screen into a black reload window. The CURRENT
+  stream keeps playing (the badge shows the destination), the target fills its snapshot
+  in the background — keyframe request first, hidden reconnect after the 2s no-keyframe
+  deadline (which is also where refresh-ineffective is learned, now invisibly) — and the
+  switch completes by replay once the cache is ready and quiet (~0.5s). Re-pressing the
+  CURRENT slot's key cancels the deferred switch. Trade-off accepted deliberately: the
+  hidden reconnect of a backgrounding slot interrupts that session's own audio in the
+  mix for ~1-2s (`source N ran dry` + a one-cut backlog trim on rejoin) — the price of
+  instant switch-backs on servers that only ever emit their connect IDR.
+- **Channel-rocker ring switching**: during streaming CH_UP/CH_DOWN zap through the
+  connected slots (red → green → yellow → blue → red; empty slots are skipped and stay
+  reachable via their color buttons). Handled on both delivery paths like the color
+  keys: SDL scancodes 480/481 from the ungrabbed RCU node and evdev KEY_CHANNELUP/DOWN
+  402/403 from grabbed remote nodes. Channel keys mean nothing inside an RDP session,
+  so nothing is taken from the remote desktop; the D-pad stays free for the mixer
+  overlay. SDL key presses during streaming are logged (`remote sdl key scancode=`) —
+  with the keyboard evdev-grabbed, only the remote and the system reach SDL, so the log
+  maps what a given remote firmware actually sends.
 - **Re-pressing the ACTIVE slot's color button** (while its stream is on screen) opens the
   volume mixer: a semi-transparent panel with one fader channel per slot. Each channel is
   an L/R pair of LIVE volume-meter columns (post-fader peak, instant attack / 30 dB/s
@@ -50,7 +85,34 @@ the TV remote's color buttons in the remote's own order: red, green, yellow, blu
   active slot's button, OK, or Back closes it, and it auto-hides after ~6s without input.
   While it is open the pointer belongs to the SYSTEM (the evdev grab is released and the
   plain arrow shown): click a fader to jump/drag it, click a channel elsewhere to select
-  it, scroll the wheel for 3 dB steps, click outside the panel to close. No mouse or
+  it, scroll the wheel for 3 dB steps, click outside the panel to close.
+- **MASTER fader** (white, rightmost channel): mirrors and drives the webOS SYSTEM
+  volume (`luna://com.webos.audio` get/setVolume — undocumented-but-working from the
+  app's jail; officially LG only documents volumeUp/Down/setMuted, so an unavailable
+  bus just leaves the channel dimmed). It never touches the app's own mix: its meters
+  show the mix OUTPUT (the summed, saturated chunk leaving for the audio track) and its
+  knob travels volume percent over the full track while wearing the same dBFS scale
+  artwork as the other channels (deliberate — a uniform bank; the user chose the "wrong"
+  scale over a mismatched one). Steps of 3 per key press/wheel notch — one remote VOL
+  press moves the system volume by 3, so keys and fader land on the same grid.
+  TRANSPORT IS THE NATIVE luna-service2 CLIENT on a GMainLoop thread — NEVER a
+  luna-send-pub subprocess: fork()ing the app while the NDL/OMX pipeline (re)loads
+  races its in-process decoder state (black screens observed live), and a pipe-spawned
+  subscriber cannot deliver events anyway (block-buffered stdout, no stdbuf on the TV).
+  Volume-change SUBSCRIPTIONS DO NOT WORK for a dev-mode app on webOS 24 — probed live:
+  com.webos.audio/getVolume accepts the subscribe but the DYNAMIC service idles out and
+  takes it along ("com.webos.audio is not running"; zero events even while alive);
+  master/getVolume subscribe → "Message status unknown"; apiadapter (the route external
+  SSAP controllers get their change events from) → "Not permitted"; a NAMED bus client
+  → "Invalid permissions" (the jail allows anonymous only). The cache is therefore kept
+  live by polling getVolume every 200ms while streaming — in-process LS2 one-shots,
+  cheap, and each call wakes the dozing service. Set calls are coalesced to the newest
+  value on the loop thread; the cache updates optimistically for a snappy knob.
+- **Auto-raise on volume change**: while streaming, any system-volume change made
+  outside the overlay (remote VOL keys, BT-headphone buttons) pops the mixer with the
+  MASTER channel selected; while the volume keeps moving the auto-hide timer keeps
+  resetting, and once it settles the ~6s idle timeout hides the panel as usual. The
+  first reading after launch is the baseline, so nothing pops at startup. No mouse or
   keyboard input reaches the RDP session while the panel is up; the grab and the
   session's cursor shape come back when it closes. Levels are per launch (not persisted), survive reconnects
   and codec re-pins, and disconnected slots show dimmed knobs whose level applies once
@@ -115,7 +177,7 @@ Targeted local loop:
 cc -fsyntax-only -Inative/include \
   native/src/main.c native/src/media_ss4s.c native/src/video_ss4s.c \
   native/src/audio_ss4s.c native/src/audio_mixer.c native/src/audio_opus.c \
-  native/src/video_rgba_sdl.c \
+  native/src/video_rgba_sdl.c native/src/au_snapshot.c \
   native/src/h264_annexb.c native/src/input_sdl.c native/src/cursor_sdl.c \
   native/src/rdp_ffi_stub.c native/src/config_paths.c native/src/settings_json.c
 cargo test --manifest-path webrdp-min/Cargo.toml --features native native::tests::

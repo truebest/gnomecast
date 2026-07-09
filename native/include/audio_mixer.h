@@ -108,6 +108,12 @@ typedef struct NativeAudioMixer {
     void *feed_ctx;
     int16_t *mix_buf;  /* chunk_frames * channels samples */
     int32_t *accum_buf; /* wide mix accumulator: clamp once after ALL sources are summed */
+    /* Peak of the most recent pulled OUTPUT chunk (post-sum, post-saturation — exactly
+     * what leaves for the audio track), for the master-bus meter. Guarded by the mixer
+     * lock; stamped like the per-source peaks. */
+    int32_t mix_peak_left;
+    int32_t mix_peak_right;
+    struct timespec mix_peak_when;
 } NativeAudioMixer;
 
 /* Pure logic (host-tested; no pump thread involved). All functions no-op / fail cleanly on
@@ -134,6 +140,15 @@ void native_mixer_set_source_gain(NativeAudioMixer *mixer, int source, int32_t g
  * where the last pulled peak would otherwise stay frozen (staleness cutoff 100ms, a few
  * chunk periods). Callable from any thread. */
 void native_mixer_get_source_peaks(NativeAudioMixer *mixer, int source, int32_t *left, int32_t *right);
+
+/* Peaks of the most recent pulled OUTPUT chunk — the summed, saturated mix as it leaves
+ * for the audio track (the master-bus meter). Same staleness cutoff as the source peaks. */
+void native_mixer_get_output_peaks(NativeAudioMixer *mixer, int32_t *left, int32_t *right);
+
+/* Audio currently queued in the source's ring, in milliseconds — the client-held
+ * latency of that session's sound (what the mixer overlay shows per channel). 0 for
+ * closed sources or an uninitialized mixer. Callable from any thread. */
+unsigned native_mixer_get_source_latency_ms(NativeAudioMixer *mixer, int source);
 
 /* Queues interleaved S16LE frames from one session (RDP worker thread). When the ring is
  * full the OLDEST frames are dropped to keep latency bounded; returns the number of frames
