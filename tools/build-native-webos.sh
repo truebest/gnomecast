@@ -147,8 +147,9 @@ if [[ "$skip_build" != "1" ]]; then
   sdk="$(cd "$(dirname "$toolchain")/../.." && pwd)"
 
   if [[ ! -f "$repo_root/third_party/IronRDP/Cargo.toml" || ! -f "$repo_root/third_party/ss4s/CMakeLists.txt" ||
-        ! -f "$repo_root/third_party/commons/CMakeLists.txt" || ! -f "$repo_root/third_party/lvgl/CMakeLists.txt" ]]; then
-    fail "native submodules are not initialized; run: git submodule update --init third_party/IronRDP third_party/ss4s third_party/commons third_party/lvgl"
+        ! -f "$repo_root/third_party/commons/CMakeLists.txt" || ! -f "$repo_root/third_party/lvgl/CMakeLists.txt" ||
+        ! -f "$repo_root/third_party/miniaudio/miniaudio.c" || ! -f "$repo_root/third_party/miniaudio/miniaudio.h" ]]; then
+    fail "native submodules are not initialized; run: git submodule update --init third_party/IronRDP third_party/ss4s third_party/commons third_party/lvgl third_party/miniaudio"
   fi
 
   rustup target add "$target"

@@ -20,7 +20,7 @@ pipelines:
           - "linux"
         script:
           - git config --global --add safe.directory '*'
-          - git submodule update --init third_party/IronRDP third_party/ss4s third_party/commons third_party/lvgl
+          - git submodule update --init third_party/IronRDP third_party/ss4s third_party/commons third_party/lvgl third_party/miniaudio
           - cargo fmt --manifest-path webrdp-min/Cargo.toml --check
           # Quoted: a plain YAML scalar ending in ':' parses as a mapping key.
           - "cargo test --manifest-path webrdp-min/Cargo.toml --features native --locked native::tests::"

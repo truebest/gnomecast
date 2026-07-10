@@ -52,7 +52,7 @@ and browser WASM bundle were removed and are not runtime dependencies of the nat
 
 ## miniaudio
 
-- Path: `third_party/miniaudio` (vendored `miniaudio.c`, `miniaudio.h`, and upstream license)
+- Path: `third_party/miniaudio` (git submodule)
 - Upstream: https://github.com/mackron/miniaudio
 - Version/tag: `0.11.25`
 - Pinned commit: `9634bedb5b5a2ca38c1ee7108a9358a4e233f14d`

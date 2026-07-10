@@ -53,7 +53,7 @@ rustup default stable
 From the repository root:
 
 ```sh
-git submodule update --init third_party/IronRDP third_party/ss4s third_party/commons third_party/lvgl
+git submodule update --init third_party/IronRDP third_party/ss4s third_party/commons third_party/lvgl third_party/miniaudio
 ```
 
 Pinned native third-party revisions are recorded in `third_party/PROVENANCE.md`.
@@ -79,7 +79,8 @@ The native webOS product cross-build requires:
 
 - webOS buildroot toolchain;
 - SDL2 for the target;
-- initialized `third_party/ss4s`, `third_party/commons`, and `third_party/lvgl`;
+- initialized `third_party/IronRDP`, `third_party/ss4s`, `third_party/commons`,
+  `third_party/lvgl`, and `third_party/miniaudio`;
 - Rust target support for `armv7-unknown-linux-gnueabi`.
 
 Default toolchain path expected by `tools/build-native-webos.sh`:
@@ -106,7 +107,7 @@ ARES_DEVICE=<tv-device> HELLOLG_NATIVE_CONFIG=native/config.local.json \
 ## Minimal Local Verification
 
 ```sh
-git submodule update --init third_party/IronRDP third_party/ss4s third_party/commons third_party/lvgl
+git submodule update --init third_party/IronRDP third_party/ss4s third_party/commons third_party/lvgl third_party/miniaudio
 cmake -S native -B /tmp/gnomecast-native-build
 cmake --build /tmp/gnomecast-native-build
 ctest --test-dir /tmp/gnomecast-native-build --output-on-failure

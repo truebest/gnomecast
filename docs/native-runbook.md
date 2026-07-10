@@ -225,7 +225,8 @@ cmake --build /tmp/gnomecast-native-rust-build
 The product webOS build requires:
 
 - webOS buildroot toolchain;
-- initialized `third_party/IronRDP`, `third_party/ss4s`, `third_party/commons`, and `third_party/lvgl` submodules;
+- initialized `third_party/IronRDP`, `third_party/ss4s`, `third_party/commons`,
+  `third_party/lvgl`, and `third_party/miniaudio` submodules;
 - SDL2 for the webOS target;
 - Rust target support for `armv7-unknown-linux-gnueabi`.
 
@@ -337,8 +338,8 @@ Implemented:
 - Rust `native` feature exporting FFI lifecycle, input symbols, direct TCP/TLS/CredSSP
   worker scaffold, AVC420 callbacks, and native RemoteFX/bitmap callbacks.
 - C FFI stub for local scaffold builds; product webOS builds require the Rust staticlib.
-- Pinned `third_party/ss4s`/`commons` submodules and vendored miniaudio 0.11.25 with
-  provenance and license staging.
+- Pinned native dependency submodules, including miniaudio 0.11.25, with provenance and
+  license staging.
 - ss4s NDL/SMP hardware-module selection, dummy backend rejection, and H.264 feed boundary.
 - H.264 framing normalization, including AU size caps. NOTE: the wire carries BOTH
   framings — the nominal RDPEGFX shape is AVC length-prefixed (converted to Annex-B),
@@ -376,7 +377,7 @@ Not yet implemented or not yet TV-verified:
 Initialize pinned native dependencies:
 
 ```sh
-git submodule update --init third_party/IronRDP third_party/ss4s third_party/commons third_party/lvgl
+git submodule update --init third_party/IronRDP third_party/ss4s third_party/commons third_party/lvgl third_party/miniaudio
 ```
 
 See `third_party/PROVENANCE.md` for pinned commits, licenses, and the Moonlight reference boundary.

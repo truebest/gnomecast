@@ -21,8 +21,8 @@ shell (`native/`) around a Rust RDP core (`webrdp-min/`), linked through a C ABI
   (Magic Remote) only. The grab follows window focus so a webOS overlay (TV menu) stays usable.
 
 Stack: C11 + CMake (native shell, decoder boundary, CTests), Rust 2021 (`webrdp-min`
-`staticlib` + C ABI), vendored deps under `third_party/` (IronRDP fork, ss4s, commons, LVGL),
-and the webOS buildroot toolchain + `ares` CLI for packaging.
+`staticlib` + C ABI), pinned git submodules under `third_party/` (IronRDP fork, ss4s,
+commons, LVGL, miniaudio), and the webOS buildroot toolchain + `ares` CLI for packaging.
 
 ## Key paths
 

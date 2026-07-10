@@ -105,7 +105,7 @@ The same ceiling applies to any ss4s-based client.
   `native/include/rdp_ffi.h`.
 - `third_party/` — pinned native dependencies (git submodules): our IronRDP fork
   ([truebest/IronRDP](https://github.com/truebest/IronRDP), branch `gnome-rdp-support`,
-  mirror patch record in `patches/ironrdp/`), ss4s, commons, LVGL.
+  mirror patch record in `patches/ironrdp/`), ss4s, commons, LVGL, miniaudio.
 - `Dockerfile` + `bitbucket-pipelines.yml` — reproducible build environment and CI that
   produces the webOS `.ipk`. CI runs inside a prebuilt public image
   (`cubicattache/gnomecast-webos-build`); rebuild and push it with
@@ -130,7 +130,7 @@ browser runtime fallback paths.
 gnomecast's own code is released under the [MIT License](LICENSE).
 
 Bundled dependencies under `third_party/` (git submodules) keep their own licenses: IronRDP
-(MIT OR Apache-2.0), LVGL (MIT), commons (MIT), and **ss4s (LGPL-3.0)**. The ss4s core is
-statically linked into the application binary; the LGPL-3.0 relinking requirement is
-satisfied by this repository being fully open source. Packaged builds ship all dependency
-license texts under `licenses/` inside the `.ipk`.
+(MIT OR Apache-2.0), LVGL (MIT), commons (MIT), miniaudio (MIT-0), and **ss4s
+(LGPL-3.0)**. The ss4s core is statically linked into the application binary; the LGPL-3.0
+relinking requirement is satisfied by this repository being fully open source. Packaged
+builds ship all dependency license texts under `licenses/` inside the `.ipk`.
