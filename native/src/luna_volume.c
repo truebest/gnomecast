@@ -66,13 +66,46 @@ typedef struct NativeLunaVolumeImpl {
     atomic_int desired_pct;
     atomic_bool invoke_queued;
     atomic_bool loop_ready;
+    /* Flow control, loop thread only (every LS2 callback runs on the loop's context).
+     * At most one setVolume and one getVolume are in flight at a time: the bus replies
+     * far slower than remote-key autorepeat or the 200ms poll, and unthrottled calls
+     * pile up outstanding callback records and answer out of order. Tokens let a
+     * stalled call be CANCELLED before its replacement goes out — and let callbacks
+     * ignore a superseded call's late reply. */
+    bool set_in_flight;
+    bool refresh_in_flight;
+    gint64 refresh_issued_us;
+    gint64 set_issued_us;
+    LSMessageToken get_token;
+    LSMessageToken set_token;
 } NativeLunaVolumeImpl;
 
-/* Shared reply handler: one-shot gets, set confirmations and every subscription event
- * all carry the same payload shape. Loop thread. */
-static bool luna_volume_reply_cb(LSHandle *sh, LSMessage *message, void *ctx) {
+/* A reply never comes back for a lost call when the service hangs while staying
+ * registered (a DEAD service is answered by the hub itself with an error reply); the
+ * stall ceiling re-arms polling/sets instead of wedging them forever. */
+#define LUNA_VOLUME_CALL_STALL_US (2 * G_USEC_PER_SEC)
+
+/* Cancels a stalled call's callback record so it cannot pile up per stall window or
+ * fire late over a newer call's result. Loop thread. */
+static void luna_volume_cancel_call(NativeLunaVolumeImpl *impl, LSMessageToken token) {
+    LSError error;
+    LSErrorInit(&error);
+    if (!LSCallCancel(impl->handle, token, &error)) {
+        LSErrorFree(&error);
+    }
+}
+
+/* getVolume replies: the ONLY authoritative cache writer. Loop thread. */
+static bool luna_volume_get_reply_cb(LSHandle *sh, LSMessage *message, void *ctx) {
     (void)sh;
-    NativeLunaVolume *lv = (NativeLunaVolume *)ctx;
+    NativeLunaVolumeImpl *impl = (NativeLunaVolumeImpl *)ctx;
+    NativeLunaVolume *lv = impl->owner;
+    if (message && LSMessageGetResponseToken(message) != impl->get_token) {
+        /* A superseded call's late reply (stalled calls are cancelled, this is the
+         * belt): it may neither write an older reading nor re-arm the poll. */
+        return true;
+    }
+    impl->refresh_in_flight = false;
     const char *payload = message ? LSMessageGetPayload(message) : NULL;
     int volume = -1;
     bool muted = false;
@@ -86,37 +119,103 @@ static bool luna_volume_reply_cb(LSHandle *sh, LSMessage *message, void *ctx) {
     return true;
 }
 
-/* Loop thread. Sends the newest coalesced set (if any); the reply flows through the
- * shared handler. */
+/* Sends the newest coalesced set, if any. Loop thread. */
+static void luna_volume_send_set(NativeLunaVolumeImpl *impl);
+
+/* setVolume replies deliberately touch NEITHER the volume cache NOR availability: the
+ * confirmation echoes the value of an OLDER call than the newest optimistic store
+ * whenever sets are chained (applying it would visibly yank the knob backward), and a
+ * reply also arrives for a REJECTED set (returnValue:false) — lighting the dim MASTER
+ * off one would present an optimistic value the TV never accepted. getVolume replies
+ * are the sole authority for both; on firmware that rejects these endpoints the fader
+ * stays dim, as the header promises. Loop thread. */
+static bool luna_volume_set_reply_cb(LSHandle *sh, LSMessage *message, void *ctx) {
+    (void)sh;
+    NativeLunaVolumeImpl *impl = (NativeLunaVolumeImpl *)ctx;
+    if (message && LSMessageGetResponseToken(message) != impl->set_token) {
+        return true; /* a superseded call's late reply must not clear the new in-flight */
+    }
+    impl->set_in_flight = false;
+    if (atomic_load(&impl->desired_pct) >= 0) {
+        luna_volume_send_set(impl); /* chain the newest value the drag left behind */
+    }
+    return true;
+}
+
+static void luna_volume_send_set(NativeLunaVolumeImpl *impl) {
+    int pct = atomic_exchange(&impl->desired_pct, -1);
+    if (pct < 0 || !impl->handle) {
+        return;
+    }
+    char payload[48];
+    (void)snprintf(payload, sizeof(payload), "{\"volume\":%d}", pct);
+    LSError error;
+    LSErrorInit(&error);
+    if (!LSCallOneReply(impl->handle, "luna://com.webos.audio/setVolume", payload, luna_volume_set_reply_cb, impl,
+                        &impl->set_token, &error)) {
+        fprintf(stderr, "[native-luna] setVolume call failed: %s\n", error.message ? error.message : "?");
+        LSErrorFree(&error);
+        /* Not in flight; the next set (or the poll) recovers the knob. */
+        return;
+    }
+    impl->set_in_flight = true;
+    impl->set_issued_us = g_get_monotonic_time();
+}
+
+/* Loop thread. Starts a set only when none is in flight — otherwise the pending value
+ * waits for the in-flight call's reply to chain it (one call in flight, ever). A set
+ * whose reply never came (hung-but-registered service) is cancelled after the stall
+ * ceiling: without that the MASTER wedges forever, because later fader edits only
+ * replace desired_pct and this guard would never dispatch them. */
 static gboolean luna_volume_dispatch_cb(gpointer data) {
     NativeLunaVolumeImpl *impl = (NativeLunaVolumeImpl *)data;
     atomic_store(&impl->invoke_queued, false);
-    int pct = atomic_exchange(&impl->desired_pct, -1);
-    if (pct >= 0 && impl->handle) {
-        char payload[48];
-        (void)snprintf(payload, sizeof(payload), "{\"volume\":%d}", pct);
-        LSError error;
-        LSErrorInit(&error);
-        if (!LSCallOneReply(impl->handle, "luna://com.webos.audio/setVolume", payload, luna_volume_reply_cb,
-                            impl->owner, NULL, &error)) {
-            fprintf(stderr, "[native-luna] setVolume call failed: %s\n", error.message ? error.message : "?");
-            LSErrorFree(&error);
+    if (impl->set_in_flight) {
+        if (g_get_monotonic_time() - impl->set_issued_us < LUNA_VOLUME_CALL_STALL_US) {
+            return G_SOURCE_REMOVE; /* the reply (or the next edit after the ceiling) chains it */
         }
+        luna_volume_cancel_call(impl, impl->set_token);
+        impl->set_in_flight = false;
     }
+    luna_volume_send_set(impl);
     return G_SOURCE_REMOVE;
 }
 
 static gboolean luna_volume_refresh_cb(gpointer data) {
     NativeLunaVolumeImpl *impl = (NativeLunaVolumeImpl *)data;
-    if (impl->handle) {
-        LSError error;
-        LSErrorInit(&error);
-        if (!LSCallOneReply(impl->handle, "luna://com.webos.audio/getVolume", "{}", luna_volume_reply_cb,
-                            impl->owner, NULL, &error)) {
-            fprintf(stderr, "[native-luna] getVolume call failed: %s\n", error.message ? error.message : "?");
-            LSErrorFree(&error);
-        }
+    if (!impl->handle) {
+        return G_SOURCE_REMOVE;
     }
+    gint64 now = g_get_monotonic_time();
+    /* The 200ms poll is this module's only steady heartbeat, so stalled SETS recover
+     * here too: dispatch_cb only runs on user edits, and an edit landing before the
+     * stall ceiling leaves desired_pct waiting for a chain reply that never comes —
+     * the newest requested volume would stay unsent until the next edit. */
+    if (impl->set_in_flight && now - impl->set_issued_us >= LUNA_VOLUME_CALL_STALL_US) {
+        luna_volume_cancel_call(impl, impl->set_token);
+        impl->set_in_flight = false;
+        luna_volume_send_set(impl);
+    }
+    if (impl->refresh_in_flight) {
+        if (now - impl->refresh_issued_us < LUNA_VOLUME_CALL_STALL_US) {
+            return G_SOURCE_REMOVE; /* one outstanding get is enough; the poll re-arms after its reply */
+        }
+        /* Never answered: cancel the record BEFORE replacing the call, or a hung
+         * service accumulates one per stall window and its eventual late reply would
+         * overwrite a newer reading. */
+        luna_volume_cancel_call(impl, impl->get_token);
+        impl->refresh_in_flight = false;
+    }
+    LSError error;
+    LSErrorInit(&error);
+    if (!LSCallOneReply(impl->handle, "luna://com.webos.audio/getVolume", "{}", luna_volume_get_reply_cb, impl,
+                        &impl->get_token, &error)) {
+        fprintf(stderr, "[native-luna] getVolume call failed: %s\n", error.message ? error.message : "?");
+        LSErrorFree(&error);
+        return G_SOURCE_REMOVE;
+    }
+    impl->refresh_in_flight = true;
+    impl->refresh_issued_us = now;
     return G_SOURCE_REMOVE;
 }
 
@@ -133,8 +232,8 @@ static void *luna_volume_thread(void *arg) {
 
     LSError error;
     LSErrorInit(&error);
-    /* Anonymous client — the ONLY identity the dev-mode jail permits (verified live on
-     * webOS 24: a named LSRegister answers "Invalid permissions"). */
+    /* Anonymous client — the ONLY identity the dev-mode jail permits (verified live:
+     * a named LSRegister answers "Invalid permissions"). */
     if (!LSRegister(NULL, &impl->handle, &error)) {
         fprintf(stderr, "[native-luna] LSRegister failed: %s\n", error.message ? error.message : "?");
         LSErrorFree(&error);
@@ -148,8 +247,9 @@ static void *luna_volume_thread(void *arg) {
         impl->handle = NULL;
     }
 
-    /* NO volume-change subscription — every path was probed live on webOS 24 and none
-     * delivers events to a dev-mode app, so callers poll getVolume instead (cheap
+    /* NO volume-change subscription — every path was probed live on the target
+     * firmware and none delivers events to a dev-mode app, so callers poll getVolume
+     * instead (cheap
      * in-process one-shots that also wake the dozing service). The dead ends, with
      * their exact refusals, so nobody re-walks them:
      *   - com.webos.audio/getVolume subscribe: accepted ("subscribed":true) but the
@@ -226,8 +326,8 @@ void native_luna_volume_stop(NativeLunaVolume *lv) {
     lv->impl = NULL;
 }
 
-/* Queue `cb` into the loop thread (any thread). False while the loop is still booting
- * (the boot path already reads the volume via the subscription's first reply). */
+/* Queue `cb` into the loop thread (any thread). False while the loop is still booting —
+ * the queued work is simply dropped; the 200ms poll re-issues reads soon enough. */
 static bool luna_volume_invoke(NativeLunaVolumeImpl *impl, GSourceFunc cb) {
     if (!atomic_load(&impl->loop_ready)) {
         return false;

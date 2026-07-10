@@ -4,7 +4,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#include "audio_mixer.h"
+#include "audio_pipeline.h"
 #include "settings_json.h"
 
 /* Volume-mixer overlay: one channel per session slot — a dBFS fader (bottom stop = full
@@ -73,18 +73,17 @@ bool native_ui_mixer_active(const NativeUiMixer *mixer);
 
 /* Per-frame while the overlay is up: applies the meter ballistics to the caller-supplied
  * post-fader peaks (one [L,R] pair per slot — the caller snapshots them from the audio
- * mixer under its lifecycle lock, so this render path never touches mixer internals that
- * a format re-pin may be destroying), touches only widgets whose values changed (so LVGL
+ * pipeline through atomic snapshots), touches only widgets whose values changed (so LVGL
  * repaints just those areas) and paints immediately via lv_refr_now — no LVGL timer pump
  * runs during streaming. `peaks` holds one [L,R] pair per channel — post-fader per slot,
- * the mix OUTPUT for index NATIVE_UI_MIXER_MASTER. `latency_ms` holds one value per
- * SLOT channel (client-held queue depth, shown as a number in the channel header,
- * refreshed at ~4 Hz; the MASTER has no queue and shows none). `gain_db` holds
+ * the mix OUTPUT for index NATIVE_UI_MIXER_MASTER. `queue_ms` and `target_ms` hold one
+ * value per SLOT channel and are shown as `queue/target ms` in the channel header,
+ * refreshed at ~4 Hz; the MASTER has no queue and shows none. `gain_db` holds
  * NATIVE_SETTINGS_MAX_SESSIONS fader positions; `master_pct` the system volume (0..100,
  * <0 = unknown); `now_ticks` = SDL_GetTicks(). */
-void native_ui_mixer_render(NativeUiMixer *mixer, const int32_t (*peaks)[2], const unsigned *latency_ms,
-                            const int8_t *gain_db, int master_pct, int selected, unsigned connected_mask,
-                            uint32_t now_ticks);
+void native_ui_mixer_render(NativeUiMixer *mixer, const int32_t (*peaks)[2], const unsigned *queue_ms,
+                            const unsigned *target_ms, const int8_t *gain_db, int master_pct, int selected,
+                            unsigned connected_mask, uint32_t now_ticks);
 
 /* Pointer support (LVGL panel layout; pure arithmetic, window coordinates). hit_test:
  * true when (x,y) lands inside the panel, with *slot the channel under x (or -1 over

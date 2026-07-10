@@ -19,6 +19,7 @@ option(HELLOLG_SS4S_WEBOS_MODULES_ONLY "Build only ss4s webOS hardware-video mod
 set(HELLOLG_SS4S_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/ss4s" CACHE PATH "Path to the pinned ss4s checkout")
 set(HELLOLG_COMMONS_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/commons" CACHE PATH "Path to the pinned commons-c checkout")
 set(HELLOLG_LVGL_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/lvgl" CACHE PATH "Path to the pinned LVGL checkout")
+set(HELLOLG_MINIAUDIO_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/miniaudio" CACHE PATH "Path to pinned miniaudio sources")
 
 get_filename_component(HELLOLG_C_COMPILER_NAME "${CMAKE_C_COMPILER}" NAME)
 set(HELLOLG_TARGET_WEBOS OFF)
@@ -29,7 +30,7 @@ endif()
 # Default ON only for product (webOS) builds: ExternalOPUS downloads the libopus source
 # tarball at build time, which would break the documented offline host smoke build.
 # Host test runs opt in with -DHELLOLG_WITH_OPUS=ON to cover the audio-opus ctest.
-option(HELLOLG_WITH_OPUS "Decode rdpsnd Opus streams in-process for the audio mixer" ${HELLOLG_TARGET_WEBOS})
+option(HELLOLG_WITH_OPUS "Decode rdpsnd Opus streams in-process for the audio pipeline" ${HELLOLG_TARGET_WEBOS})
 
 if(HELLOLG_TARGET_WEBOS)
   if(NOT HELLOLG_LINK_RDP_FFI)
@@ -58,7 +59,7 @@ add_executable(gnomecast-native
   src/video_rgba_sdl.c
   src/video_ss4s.c
   src/audio_ss4s.c
-  src/audio_mixer.c
+  src/audio_pipeline.c
   src/audio_opus.c
   src/h264_annexb.c
   src/input_sdl.c
@@ -67,6 +68,27 @@ add_executable(gnomecast-native
 )
 
 find_package(Threads REQUIRED)
+
+if(NOT EXISTS "${HELLOLG_MINIAUDIO_SOURCE_DIR}/miniaudio.c" OR
+   NOT EXISTS "${HELLOLG_MINIAUDIO_SOURCE_DIR}/miniaudio.h")
+  message(FATAL_ERROR "Pinned miniaudio sources are missing from ${HELLOLG_MINIAUDIO_SOURCE_DIR}")
+endif()
+add_library(hellolg-miniaudio STATIC "${HELLOLG_MINIAUDIO_SOURCE_DIR}/miniaudio.c")
+target_include_directories(hellolg-miniaudio SYSTEM PUBLIC "${HELLOLG_MINIAUDIO_SOURCE_DIR}")
+target_compile_definitions(hellolg-miniaudio PRIVATE
+  MA_NO_DEVICE_IO
+  MA_NO_DECODING
+  MA_NO_ENCODING
+  MA_NO_RESOURCE_MANAGER
+  MA_NO_GENERATION
+  MA_NO_ENGINE
+  MA_NO_THREADING
+  MA_NO_RUNTIME_LINKING
+)
+if(HELLOLG_TARGET_WEBOS)
+  # miniaudio's node clocks use 64-bit atomics; armv7 GCC lowers those through libatomic.
+  target_link_libraries(hellolg-miniaudio PUBLIC atomic)
+endif()
 
 target_include_directories(gnomecast-native PRIVATE include)
 target_compile_definitions(gnomecast-native PRIVATE
@@ -78,7 +100,7 @@ target_compile_definitions(gnomecast-native PRIVATE
 
 # libm: the volume overlay's meter math (log10f) lives in SDL builds, but linking m
 # unconditionally is harmless and keeps the host build in sync.
-target_link_libraries(gnomecast-native PRIVATE Threads::Threads m)
+target_link_libraries(gnomecast-native PRIVATE hellolg-miniaudio Threads::Threads m)
 
 if(HELLOLG_WITH_LS2)
   find_package(PkgConfig REQUIRED)
@@ -243,6 +265,9 @@ endif()
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/libevdev-COPYING")
   install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/libevdev-COPYING" DESTINATION licenses RENAME libevdev-COPYING.txt)
 endif()
+if(EXISTS "${HELLOLG_MINIAUDIO_SOURCE_DIR}/LICENSE")
+  install(FILES "${HELLOLG_MINIAUDIO_SOURCE_DIR}/LICENSE" DESTINATION licenses RENAME miniaudio-MIT-0.txt)
+endif()
 
 set(HELLOLG_NATIVE_STAGE_DIR "${CMAKE_BINARY_DIR}/webos-stage" CACHE PATH "Staging directory for native webOS packaging")
 add_custom_target(webos-stage-native
@@ -320,6 +345,7 @@ if(BUILD_TESTING)
   add_executable(test-au-snapshot
     tests/test_au_snapshot.c
     src/au_snapshot.c
+    src/h264_annexb.c
   )
   target_include_directories(test-au-snapshot PRIVATE include)
   add_test(NAME au-snapshot COMMAND test-au-snapshot)
@@ -332,13 +358,14 @@ if(BUILD_TESTING)
   target_link_libraries(test-luna-volume PRIVATE Threads::Threads)
   add_test(NAME luna-volume COMMAND test-luna-volume)
 
-  add_executable(test-audio-mixer
-    tests/test_audio_mixer.c
-    src/audio_mixer.c
+  add_executable(test-audio-pipeline
+    tests/test_audio_pipeline.c
+    src/audio_pipeline.c
   )
-  target_include_directories(test-audio-mixer PRIVATE include)
-  target_link_libraries(test-audio-mixer PRIVATE Threads::Threads)
-  add_test(NAME audio-mixer COMMAND test-audio-mixer)
+  target_include_directories(test-audio-pipeline PRIVATE include)
+  target_compile_definitions(test-audio-pipeline PRIVATE HELLOLG_AUDIO_PIPELINE_TESTING=1)
+  target_link_libraries(test-audio-pipeline PRIVATE hellolg-miniaudio Threads::Threads m)
+  add_test(NAME audio-pipeline COMMAND test-audio-pipeline)
 
   if(HELLOLG_WITH_OPUS)
     add_executable(test-audio-opus

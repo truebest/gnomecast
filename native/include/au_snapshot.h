@@ -43,7 +43,7 @@ typedef struct NativeAuSnapshot {
     NativeAuSnapshotEntry entries[NATIVE_AU_SNAPSHOT_MAX_AUS];
     unsigned count;
     bool armed;   /* appends are accepted */
-    bool has_idr; /* a keyframe seeded the snapshot */
+    bool has_idr; /* an AU carrying an actual IDR NAL seeded the snapshot */
 } NativeAuSnapshot;
 
 /* Empties the snapshot and (re)allocates the byte buffer; appends are accepted until the
@@ -54,13 +54,15 @@ bool native_au_snapshot_arm(NativeAuSnapshot *snap);
 /* Drops everything and frees the buffer. Safe on a zeroed or already-reset snapshot. */
 void native_au_snapshot_reset(NativeAuSnapshot *snap);
 
-/* Caches one compressed AU. Keyframes restart the snapshot; deltas arriving before any
- * keyframe are skipped (a snapshot must begin with decodable state) without invalidating
- * it. Returns false only when this call voided the snapshot (byte or entry overflow). */
+/* Caches one compressed AU. A keyframe restarts the snapshot — but only when the AU
+ * really carries an IDR NAL: the transport's is_keyframe flag also fires on parameter-
+ * set-only AUs (standalone SPS), which cannot seed a decoder. Deltas (and config-only
+ * AUs) arriving before the first IDR are skipped without invalidating the snapshot.
+ * Returns false only when this call voided the snapshot (byte or entry overflow). */
 bool native_au_snapshot_append(NativeAuSnapshot *snap, const uint8_t *data, size_t len, bool is_keyframe,
                                uint64_t pts90k);
 
-/* True when a replay would rebuild decodable state: armed and seeded with a keyframe. */
+/* True when a replay would rebuild decodable state: armed and seeded with an IDR. */
 bool native_au_snapshot_ready(const NativeAuSnapshot *snap);
 
 #endif

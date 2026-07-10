@@ -15,15 +15,10 @@ typedef enum NativeAudioResult {
 
 /* Attaches an audio track to the shared media player. codec takes RdpAudioCodec values
  * from rdp_ffi.h (1=Opus, 2=PCM S16LE). Returns NULL when ss4s is not linked, the module
- * lacks the codec, or the hardware open fails — callers degrade to silent video.
- *
- * prebuffer_ms enables a client-side jitter buffer: roughly that much audio is
- * accumulated before feeding starts (and again after a source pause), so the hardware
- * always plays with that safety margin and short network stalls — e.g. audio packets
- * queuing behind large video frames on the shared TCP connection — no longer cause
- * audible dropouts. Costs the same amount of extra audio latency; 0 disables it. */
-NativeAudio *native_audio_open(NativeMedia *media, uint32_t codec, uint32_t sample_rate, uint16_t channels,
-                               uint32_t prebuffer_ms);
+ * lacks the codec, or the hardware open fails — callers degrade to silent video. Jitter
+ * buffering and resampling live upstream in NativeAudioPipeline; this boundary feeds
+ * already-paced PCM directly. */
+NativeAudio *native_audio_open(NativeMedia *media, uint32_t codec, uint32_t sample_rate, uint16_t channels);
 /* Feed one encoded Opus packet or one interleaved S16LE PCM chunk. Transient conditions
  * (decoder not ready, buffer overflow) drop the chunk and still return OK. */
 NativeAudioResult native_audio_feed(NativeAudio *audio, const uint8_t *data, size_t len);

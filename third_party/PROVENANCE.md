@@ -50,6 +50,20 @@ and browser WASM bundle were removed and are not runtime dependencies of the nat
   `third_party/libevdev-COPYING`
 - Native usage: statically linked into webOS builds for grabbed USB mouse/keyboard evdev input.
 
+## miniaudio
+
+- Path: `third_party/miniaudio` (vendored `miniaudio.c`, `miniaudio.h`, and upstream license)
+- Upstream: https://github.com/mackron/miniaudio
+- Version/tag: `0.11.25`
+- Pinned commit: `9634bedb5b5a2ca38c1ee7108a9358a4e233f14d`
+- License choice: MIT No Attribution (upstream Alternative 2); see
+  `third_party/miniaudio/LICENSE`
+- Native usage: headless 48 kHz float node graph, per-session S16 conversion and dynamic
+  resampling. Device I/O, file decoding/encoding, the resource manager, generators, and
+  the engine, runtime backend loading, and miniaudio threading primitives are disabled
+  at compile time; the graph is wired once before rendering and NDL/ss4s is the selected
+  production audio sink.
+
 ## Moonlight reference boundary
 
 [Moonlight TV](https://github.com/mariotaku/moonlight-tv) (GPL-3.0) was used as a

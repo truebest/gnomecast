@@ -162,6 +162,15 @@ void native_ui_mixer_draw_fallback(SDL_Renderer *renderer, const int8_t *gain_db
 #define UI_MIXER_METER_GAP 10
 #define UI_MIXER_KNOB_W 66
 #define UI_MIXER_KNOB_H 22
+/* Peak-hold marks: a detached segment riding above each meter bar at the loudest
+ * recent level — held, then released (console bridge style). */
+#define UI_MIXER_PEAK_MARK_H 5
+#define UI_MIXER_PEAK_HOLD_MS 1500u
+#define UI_MIXER_PEAK_DECAY_DB_S 20.0f
+/* Clip threshold: the honest 0 dBFS. The meters see the PRE-saturation sum, so unlike
+ * hardware meters (which cannot read past their rail and warn early at ~-0.3 dB) red
+ * here means the clamp really cut samples; a legal full-scale hit stays yellow. */
+#define UI_MIXER_CLIP_DB (0.0f)
 /* The L/R meter pair sits right of the channel center so the tick scale fits left. */
 #define UI_MIXER_PAIR_CX (UI_MIXER_CHANNEL_W / 2 + 14)
 
@@ -175,6 +184,7 @@ struct NativeUiMixer {
     lv_obj_t *knobs[NATIVE_UI_MIXER_CHANNELS];
     lv_obj_t *meter_clips[NATIVE_UI_MIXER_CHANNELS][2];
     lv_obj_t *meter_grads[NATIVE_UI_MIXER_CHANNELS][2];
+    lv_obj_t *peak_marks[NATIVE_UI_MIXER_CHANNELS][2];
     lv_obj_t *color_bars[NATIVE_UI_MIXER_CHANNELS];
     lv_obj_t *latency_labels[NATIVE_UI_MIXER_CHANNELS]; /* NULL for the MASTER */
     /* Rendered per-frame while up: cache the last-pushed values so only changed widgets
@@ -184,12 +194,19 @@ struct NativeUiMixer {
     int knob_value[NATIVE_UI_MIXER_CHANNELS];
     /* Channel-header latency readouts: refreshed at a calm cadence so the number is
      * readable rather than a per-chunk blur. */
-    unsigned latency_shown[NATIVE_UI_MIXER_CHANNELS];
+    unsigned queue_shown[NATIVE_UI_MIXER_CHANNELS];
+    unsigned target_shown[NATIVE_UI_MIXER_CHANNELS];
     uint32_t latency_ticks;
     int selected;
     unsigned mask;
     /* Displayed level per channel/side in dBFS (instant attack, steady release). */
     float meter_db[NATIVE_UI_MIXER_CHANNELS][2];
+    /* Peak-hold ballistics: instant capture of the loudest chunk peak, held for
+     * UI_MIXER_PEAK_HOLD_MS, then a steady release. */
+    float peak_db[NATIVE_UI_MIXER_CHANNELS][2];
+    uint32_t peak_since[NATIVE_UI_MIXER_CHANNELS][2];
+    int peak_px[NATIVE_UI_MIXER_CHANNELS][2];
+    bool peak_clip[NATIVE_UI_MIXER_CHANNELS][2]; /* mark currently painted clip-red */
     uint32_t meter_ticks;
     bool active;
     bool full_refresh;
@@ -326,6 +343,19 @@ static void ui_mixer_build_channel(NativeUiMixer *mixer, lv_obj_t *panel, int sl
         lv_obj_set_style_bg_grad_color(grad, lv_color_hex(0x27cf5a), 0); /* quiet end */
         lv_obj_set_style_bg_grad_dir(grad, LV_GRAD_DIR_VER, 0);
         lv_obj_set_style_bg_opa(grad, LV_OPA_COVER, 0);
+
+        /* The peak-hold mark: detached segment floating at the held level, in the
+         * meter's loud-end yellow so it reads as "this is where the bar peaked". */
+        lv_obj_t *mark = lv_obj_create(channel);
+        mixer->peak_marks[slot][side] = mark;
+        lv_obj_set_pos(mark, x, UI_MIXER_FADER_Y);
+        lv_obj_set_size(mark, UI_MIXER_METER_W, UI_MIXER_PEAK_MARK_H);
+        lv_obj_clear_flag(mark, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_style_bg_color(mark, lv_color_hex(0xf7d038), 0);
+        lv_obj_set_style_bg_opa(mark, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(mark, 2, 0);
+        lv_obj_set_style_border_width(mark, 0, 0);
+        lv_obj_add_flag(mark, LV_OBJ_FLAG_HIDDEN);
     }
 
     /* Tick scale: every channel wears the same dBFS artwork — including the MASTER,
@@ -374,15 +404,13 @@ static void ui_mixer_build_channel(NativeUiMixer *mixer, lv_obj_t *panel, int sl
         lv_obj_set_style_text_font(latency, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(latency, lv_color_white(), 0);
         lv_obj_set_style_text_opa(latency, LV_OPA_60, 0);
-        /* Right-aligned in a fixed box centered on the channel: the "ms" suffix stays
-         * anchored and extra digits grow leftwards, so the readout never jiggles when
-         * the value crosses a digit boundary. Sized for four digits (ring caps allow
-         * seconds of backlog). */
+        /* Right-aligned fixed box for `queue/target ms`; the suffix stays anchored and
+         * changing digits do not jiggle the channel header. */
         lv_obj_set_style_text_align(latency, LV_TEXT_ALIGN_RIGHT, 0);
         lv_label_set_long_mode(latency, LV_LABEL_LONG_CLIP);
-        lv_obj_set_width(latency, 56);
+        lv_obj_set_width(latency, 84);
         lv_label_set_text(latency, "");
-        lv_obj_set_pos(latency, UI_MIXER_CHANNEL_W / 2 - 28, 6);
+        lv_obj_set_pos(latency, UI_MIXER_CHANNEL_W / 2 - 42, 6);
     }
 
     lv_obj_t *bar = lv_obj_create(channel);
@@ -472,9 +500,18 @@ void native_ui_mixer_show(NativeUiMixer *mixer) {
         mixer->meter_px[i][0] = -1;
         mixer->meter_px[i][1] = -1;
         mixer->knob_value[i] = INT32_MAX;
-        mixer->latency_shown[i] = UINT32_MAX;
-        mixer->meter_db[i][0] = NATIVE_MIXER_METER_FLOOR_DB;
-        mixer->meter_db[i][1] = NATIVE_MIXER_METER_FLOOR_DB;
+        mixer->queue_shown[i] = UINT32_MAX;
+        mixer->target_shown[i] = UINT32_MAX;
+        for (int side = 0; side < 2; side++) {
+            mixer->meter_db[i][side] = NATIVE_MIXER_METER_FLOOR_DB;
+            mixer->peak_db[i][side] = NATIVE_MIXER_METER_FLOOR_DB;
+            mixer->peak_since[i][side] = 0;
+            mixer->peak_px[i][side] = -1;
+            if (mixer->peak_clip[i][side]) {
+                mixer->peak_clip[i][side] = false;
+                lv_obj_set_style_bg_color(mixer->peak_marks[i][side], lv_color_hex(0xf7d038), 0);
+            }
+        }
     }
     mixer->meter_ticks = SDL_GetTicks();
     mixer->latency_ticks = 0; /* first render publishes immediately */
@@ -501,33 +538,38 @@ void native_ui_mixer_hide(NativeUiMixer *mixer) {
      * tick, and back on the configurator the normal tick path re-renders the form. */
 }
 
-void native_ui_mixer_render(NativeUiMixer *mixer, const int32_t (*peaks)[2], const unsigned *latency_ms,
-                            const int8_t *gain_db, int master_pct, int selected, unsigned connected_mask,
-                            uint32_t now_ticks) {
-    if (!mixer || !peaks || !latency_ms || !gain_db || !mixer->active) {
+void native_ui_mixer_render(NativeUiMixer *mixer, const int32_t (*peaks)[2], const unsigned *queue_ms,
+                            const unsigned *target_ms, const int8_t *gain_db, int master_pct, int selected,
+                            unsigned connected_mask, uint32_t now_ticks) {
+    if (!mixer || !peaks || !queue_ms || !target_ms || !gain_db || !mixer->active) {
         return;
     }
-    /* Latency readouts tick at 4 Hz: the queue depth breathes with every 21ms chunk,
+    /* Latency readouts tick at 4 Hz: the queue depth breathes with every 10ms block,
      * and a calmer number is a readable one. */
     if (SDL_TICKS_PASSED(now_ticks, mixer->latency_ticks)) {
         mixer->latency_ticks = now_ticks + 250u;
         for (int i = 0; i < NATIVE_SETTINGS_MAX_SESSIONS; i++) {
             bool connected = (connected_mask & (1u << i)) != 0;
-            unsigned shown = connected ? latency_ms[i] : UINT32_MAX - 1u;
-            if (shown == mixer->latency_shown[i] || !mixer->latency_labels[i]) {
+            unsigned shown_queue = connected ? queue_ms[i] : UINT32_MAX - 1u;
+            unsigned shown_target = connected ? target_ms[i] : UINT32_MAX - 1u;
+            if ((shown_queue == mixer->queue_shown[i] && shown_target == mixer->target_shown[i]) ||
+                !mixer->latency_labels[i]) {
                 continue;
             }
-            mixer->latency_shown[i] = shown;
+            mixer->queue_shown[i] = shown_queue;
+            mixer->target_shown[i] = shown_target;
             if (connected) {
-                lv_label_set_text_fmt(mixer->latency_labels[i], "%u ms", latency_ms[i]);
+                lv_label_set_text_fmt(mixer->latency_labels[i], "%u/%u ms", queue_ms[i], target_ms[i]);
             } else {
                 lv_label_set_text(mixer->latency_labels[i], "");
             }
         }
     }
-    /* Meter ballistics: instant attack to the audio mixer's post-fader chunk peak,
-     * steady dB/s release. Wrap-safe tick math; a stalled loop just decays further. */
+    /* Meter ballistics: instant attack to the audio pipeline's post-fader block peak,
+     * steady dB/s release. Wrap-safe tick math; a stalled loop just decays further.
+     * The peak-hold marks release on their own (slower) slope once the hold expires. */
     float fall_db = (float)(now_ticks - mixer->meter_ticks) * (NATIVE_MIXER_METER_DECAY_DB_S / 1000.0f);
+    float peak_fall_db = (float)(now_ticks - mixer->meter_ticks) * (UI_MIXER_PEAK_DECAY_DB_S / 1000.0f);
     mixer->meter_ticks = now_ticks;
 
     /* Called every frame while the overlay is up: touch only what changed, so LVGL
@@ -543,6 +585,60 @@ void native_ui_mixer_render(NativeUiMixer *mixer, const int32_t (*peaks)[2], con
                 level_db = NATIVE_MIXER_METER_FLOOR_DB;
             }
             mixer->meter_db[i][side] = level_db;
+
+            /* Peak-hold mark: capture the loudest INSTANT chunk peak (not the decayed
+             * bar), hold it for UI_MIXER_PEAK_HOLD_MS, then let it fall. */
+            float peak = mixer->peak_db[i][side];
+            if (target_db >= peak) {
+                peak = target_db;
+                mixer->peak_since[i][side] = now_ticks;
+            } else if (SDL_TICKS_PASSED(now_ticks, mixer->peak_since[i][side] + UI_MIXER_PEAK_HOLD_MS)) {
+                peak -= peak_fall_db;
+            }
+            if (peak < NATIVE_MIXER_METER_FLOOR_DB) {
+                peak = NATIVE_MIXER_METER_FLOOR_DB;
+            }
+            mixer->peak_db[i][side] = peak;
+
+            /* Clip detector: the mark burns red while the HELD peak sits above the
+             * threshold (strict >: peaks come in pre-saturation, so anything past
+             * full scale is a real clamp, while a legal rail-touching sample reads
+             * exactly 0 dB). The red rides the hold+release, staying visible ~2s. */
+            bool clipped = peak > UI_MIXER_CLIP_DB;
+            if (clipped != mixer->peak_clip[i][side]) {
+                mixer->peak_clip[i][side] = clipped;
+                lv_obj_set_style_bg_color(mixer->peak_marks[i][side],
+                                          lv_color_hex(clipped ? 0xff4136 : 0xf7d038), 0);
+            }
+
+            int hold_px = 0;
+            if (peak > (float)NATIVE_MIXER_FADER_MIN_DB) {
+                float f = (peak - (float)NATIVE_MIXER_FADER_MIN_DB) * (float)UI_MIXER_FADER_H /
+                          (float)(NATIVE_MIXER_FADER_MAX_DB - NATIVE_MIXER_FADER_MIN_DB);
+                hold_px = (int)f;
+                if (hold_px > UI_MIXER_FADER_H) {
+                    hold_px = UI_MIXER_FADER_H;
+                }
+                if (hold_px < 4) {
+                    hold_px = 0; /* park the mark with the bar's sub-radius slivers */
+                }
+            }
+            if (hold_px != mixer->peak_px[i][side]) {
+                mixer->peak_px[i][side] = hold_px;
+                lv_obj_t *mark = mixer->peak_marks[i][side];
+                if (hold_px == 0) {
+                    lv_obj_add_flag(mark, LV_OBJ_FLAG_HIDDEN);
+                } else {
+                    lv_obj_clear_flag(mark, LV_OBJ_FLAG_HIDDEN);
+                    /* The mark's BOTTOM sits at the held level, so it floats above the
+                     * bar; clamped at the rail top for full-scale peaks. */
+                    int mark_y = UI_MIXER_FADER_Y + UI_MIXER_FADER_H - hold_px - UI_MIXER_PEAK_MARK_H;
+                    if (mark_y < UI_MIXER_FADER_Y) {
+                        mark_y = UI_MIXER_FADER_Y;
+                    }
+                    lv_obj_set_y(mark, mark_y);
+                }
+            }
 
             int px = 0;
             if (level_db > (float)NATIVE_MIXER_FADER_MIN_DB) {

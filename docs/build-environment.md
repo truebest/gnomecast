@@ -61,9 +61,9 @@ Pinned native third-party revisions are recorded in `third_party/PROVENANCE.md`.
 Run the local native smoke commands:
 
 ```sh
-cc -fsyntax-only -Inative/include \
+cc -fsyntax-only -Inative/include -Ithird_party/miniaudio \
   native/src/main.c native/src/media_ss4s.c native/src/video_ss4s.c \
-  native/src/audio_ss4s.c native/src/audio_mixer.c native/src/audio_opus.c \
+  native/src/audio_ss4s.c native/src/audio_pipeline.c native/src/audio_opus.c \
   native/src/video_rgba_sdl.c \
   native/src/h264_annexb.c native/src/input_sdl.c native/src/cursor_sdl.c \
   native/src/rdp_ffi_stub.c native/src/config_paths.c native/src/settings_json.c

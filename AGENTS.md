@@ -6,7 +6,7 @@ of the surrounding code; do not over-engineer.
 ## Project
 
 `gnomecast` is a native webOS RDP client for LG TVs that casts a GNOME desktop
-(gnome-remote-desktop) to the TV with hardware-decoded video and audio. It is a C11/CMake
+(gnome-remote-desktop) to the TV with hardware-decoded video and native audio. It is a C11/CMake
 shell (`native/`) around a Rust RDP core (`webrdp-min/`), linked through a C ABI
 (`native/include/rdp_ffi.h`).
 
@@ -33,7 +33,10 @@ and the webOS buildroot toolchain + `ares` CLI for packaging.
 - `native/src/cursor_sdl.c` / `.h` — server-driven cursor on the platform cursor plane.
 - `native/src/media_ss4s.c`, `video_ss4s.c`, `audio_ss4s.c` — the shared ss4s player and its
   video/audio tracks.
-- `native/src/h264_annexb.c` — AVC length-prefixed H.264 → Annex-B conversion.
+- `native/src/audio_pipeline.c` / `.h` — headless miniaudio graph, per-source adaptive
+  SPSC buffering/resampling, meters, and the NDL PCM pump.
+- `native/src/h264_annexb.c` — H.264 framing scanners/conversion (AVC length-prefixed
+  AND Annex-B — grd sends the latter); the only parsers to use for classifying AUs.
 - `native/src/video_rgba_sdl.c` — RemoteFX/bitmap RGBA surface.
 - `native/src/ui_preconnect.c` — on-TV LVGL pre-connect settings screen.
 - `native/src/ui_mixer.c` / `.h` — the volume-mixer overlay: dBFS faders + live L/R meters
@@ -53,9 +56,9 @@ reintroduce them.
 Local checks before committing native changes (these mirror CI):
 
 ```sh
-cc -fsyntax-only -Inative/include \
+cc -fsyntax-only -Inative/include -Ithird_party/miniaudio \
   native/src/main.c native/src/media_ss4s.c native/src/video_ss4s.c \
-  native/src/audio_ss4s.c native/src/audio_mixer.c native/src/audio_opus.c \
+  native/src/audio_ss4s.c native/src/audio_pipeline.c native/src/audio_opus.c \
   native/src/video_rgba_sdl.c \
   native/src/h264_annexb.c native/src/input_sdl.c native/src/cursor_sdl.c native/src/ui_mixer.c \
   native/src/rdp_ffi_stub.c native/src/config_paths.c native/src/settings_json.c
@@ -89,7 +92,9 @@ webOS. Toolchain default
   tests, and docs together.
 - Callback byte lifetimes are synchronous — copy `on_video_au` / bitmap bytes before returning
   if you retain them.
-- RDPEGFX AVC data is length-prefixed H.264; normalize to Annex-B before feeding ss4s.
+- RDPEGFX AVC data arrives in BOTH framings: nominally length-prefixed H.264, but
+  gnome-remote-desktop delivers Annex-B directly. Feed ss4s Annex-B (convert or pass
+  through); classify AUs only with the `h264_annexb.h` scanners, which handle both.
 - Product webOS builds set `HELLOLG_WITH_SS4S=ON`, `HELLOLG_WITH_SDL=ON`, and
   `HELLOLG_LINK_RDP_FFI=ON`.
 - C: C11, 4-space indent, small file-local helpers, explicit error returns, ASCII. Native

@@ -25,21 +25,38 @@ enum {
 };
 
 #define NATIVE_CURSOR_MAX_DIM 384u /* MS-RDPBCGR large pointer limit */
+/* Ceiling on the WINDOW-mapped cursor size: a server advertising a tiny desktop would
+ * otherwise scale a legal 384px shape toward 65535px, whose w*h*4 allocation size
+ * overflows 32-bit size_t on the armv7 target (a small malloc followed by full-size
+ * writes = heap corruption). 1024px is far beyond any sane pointer. */
+#define NATIVE_CURSOR_MAX_SCALED_DIM 1024u
 
 typedef struct NativeCursor {
     pthread_mutex_t lock;
     /* Pending state (written on the RDP worker thread, consumed on the SDL thread). */
     uint32_t desired;
-    uint8_t *shape_rgba; /* malloc'd width*height*4; consumed (freed) by apply */
+    /* malloc'd width*height*4. RETAINED across applies (replaced by the next submit,
+     * freed by reset/destroy): a desktop-resolution change (RESET_GRAPHICS) must be
+     * able to rebuild the SDL cursor at the new scale without waiting for the server
+     * to happen to send another shape. */
+    uint8_t *shape_rgba;
     uint16_t shape_width;
     uint16_t shape_height;
     uint16_t hotspot_x;
     uint16_t hotspot_y;
+    /* Bumped with every new shape bitmap (guarded by lock): tells the SDL thread "new
+     * artwork" apart from "same artwork, new geometry". */
+    uint32_t shape_serial;
     /* Bumped on every submit; lets the SDL thread skip the mutex when idle. */
     atomic_uint generation;
     unsigned applied_generation;
 #if defined(HELLOLG_WITH_SDL) && HELLOLG_WITH_SDL
     SDL_Cursor *cursor; /* SDL thread only */
+    /* SDL thread only: what the current SDL cursor was built from/for, so apply can
+     * rebuild when the desktop-to-window mapping changes under an unchanged shape. */
+    uint32_t built_serial;
+    uint16_t applied_desktop_w, applied_desktop_h;
+    uint16_t applied_window_w, applied_window_h;
     bool color_cursor_unavailable;
     bool visible;
 #endif

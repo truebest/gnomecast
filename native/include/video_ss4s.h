@@ -14,7 +14,11 @@ typedef enum NativeVideoResult {
     NATIVE_VIDEO_OK = 0,
     NATIVE_VIDEO_NEED_KEYFRAME = 1,
     NATIVE_VIDEO_UNSUPPORTED = 2,
-    NATIVE_VIDEO_ERROR = 3
+    NATIVE_VIDEO_ERROR = 3,
+    /* The AU was DISCARDED (decoder still loading), not decoded: benign transiently,
+     * but callers must not count it as playback progress — a snapshot replay whose
+     * AUs all land here has rebuilt nothing and must not be declared successful. */
+    NATIVE_VIDEO_DROPPED = 4
 } NativeVideoResult;
 
 #define NATIVE_VIDEO_MAX_AU_BYTES NATIVE_H264_MAX_AU_BYTES

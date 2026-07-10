@@ -42,11 +42,16 @@ void native_settings_defaults(NativeSettings *settings) {
     settings->height = 1080;
     settings->wheel_step = 60;
     settings->wheel_scroll_divisor = 1;
-    /* 60ms: measured on device as the knee of the jitter curve — 0ms dried the ring out
-     * ~10 times/30s, 40ms ~4, 60ms none. Rarer ~150ms spikes pierce anything below
-     * ~150ms and are not worth the standing latency. */
-    settings->audio_prebuffer_ms = 60;
     settings->audio_codec = NATIVE_AUDIO_CODEC_AUTO;
+}
+
+void native_settings_warn_deprecated_audio_prebuffer(void) {
+    static bool warned;
+    if (!warned) {
+        fprintf(stderr,
+                "[native-audio] audioPrebufferMs/--audio-prebuffer-ms is deprecated and ignored; adaptive buffering is always enabled\n");
+        warned = true;
+    }
 }
 
 const char *native_json_skip_ws(const char *p) {
@@ -245,9 +250,17 @@ static bool apply_audio_codec_json(NativeSettings *settings, const char *json, c
 }
 
 static bool apply_global_json(NativeSettings *settings, const char *json, const char *source) {
+    uint16_t ignored_prebuffer = 0;
+    int deprecated = native_json_read_u16(json, "audioPrebufferMs", 0, 1000, &ignored_prebuffer);
+    if (deprecated < 0) {
+        fprintf(stderr, "[native] invalid value for deprecated config field audioPrebufferMs in %s\n", source);
+        return false;
+    }
+    if (deprecated > 0) {
+        native_settings_warn_deprecated_audio_prebuffer();
+    }
     return apply_json_u16(json, "wheelStep", 1, 120, &settings->wheel_step, source) &&
            apply_json_u16(json, "wheelScrollDivisor", 1, 120, &settings->wheel_scroll_divisor, source) &&
-           apply_json_u16(json, "audioPrebufferMs", 0, 1000, &settings->audio_prebuffer_ms, source) &&
            apply_audio_codec_json(settings, json, source);
 }
 
@@ -496,10 +509,9 @@ bool native_settings_write_json(const NativeSettings *settings, FILE *file) {
         }
     }
     return fprintf(file,
-                   "  ],\n  \"wheelStep\": %u,\n  \"wheelScrollDivisor\": %u,\n  \"audioPrebufferMs\": %u,\n"
+                   "  ],\n  \"wheelStep\": %u,\n  \"wheelScrollDivisor\": %u,\n"
                    "  \"audioCodec\": \"%s\"\n}\n",
                    (unsigned)settings->wheel_step, (unsigned)settings->wheel_scroll_divisor,
-                   (unsigned)settings->audio_prebuffer_ms,
                    settings->audio_codec == NATIVE_AUDIO_CODEC_PCM ? "pcm" : "auto") >= 0;
 }
 

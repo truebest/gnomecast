@@ -25,9 +25,9 @@ pipelines:
           # Quoted: a plain YAML scalar ending in ':' parses as a mapping key.
           - "cargo test --manifest-path webrdp-min/Cargo.toml --features native --locked native::tests::"
           - >-
-            cc -fsyntax-only -Inative/include
+            cc -fsyntax-only -Inative/include -Ithird_party/miniaudio
             native/src/main.c native/src/media_ss4s.c native/src/video_ss4s.c
-            native/src/audio_ss4s.c native/src/audio_mixer.c native/src/audio_opus.c native/src/video_rgba_sdl.c
+            native/src/audio_ss4s.c native/src/audio_pipeline.c native/src/audio_opus.c native/src/video_rgba_sdl.c
             native/src/h264_annexb.c native/src/input_sdl.c native/src/cursor_sdl.c native/src/ui_mixer.c
             native/src/rdp_ffi_stub.c native/src/config_paths.c native/src/settings_json.c
           - cmake -S native -B /tmp/gnomecast-native-build

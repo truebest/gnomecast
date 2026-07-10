@@ -222,22 +222,39 @@ Three additional blockers surfaced on the real TV↔grd pair, all fixed:
    shared pipeline without reloading the surviving track. Consequences and fixes:
    a mid-session audio feed error must **mute** (`native_audio_disable`) instead of
    closing the track (closing would freeze video in eternal `FEED_NOT_READY`); the
-   RGBA-switch path reopens the audio track after closing video (cheap — Opus/PCM need no
-   keyframe); an audio format change under live video closes the video track so
-   `on_video_au` reopens it on the next SPS+PPS+IDR rather than feeding P-frames into a
-   freshly reset hardware decoder.
+   RGBA-switch path reopens the audio track after closing video. The mixed sink is now
+   permanently PCM 48kHz stereo, so an RDP source format change resets only that source's
+   miniaudio converter and never reloads the shared media/video pipeline.
 
-5. **Audio dropouts under heavy video traffic → client jitter buffer.** Audio and video
+5. **Audio dropouts under heavy video traffic → adaptive per-source pipeline.** Audio and video
    share one TCP connection; bursts of large 4K frames delay the audio DVC packets, which
    then arrive in a late burst (arrival gaps of 60–230 ms measured in live logs) while
    the NDL buffer runs dry — audible sub-second dropouts. Server-side QoS was ruled out:
    grd estimates render latency purely from the client's WaveConfirm `wTimeStamp` (grd
    sends its waves with timestamp 0, our confirms echo it, and grd skips zero values —
-   its 300 ms drop logic never fires for us). Fix: `native_audio_feed` fronts a
-   configurable jitter prebuffer (`audioPrebufferMs`, default 60, 0 disables) — it
-   accumulates that much audio before the first hardware feed and re-arms after source
-   pauses, so playback always carries a safety margin at the cost of the same added audio
-   latency; arrival gaps above 60 ms are logged as evidence for future tuning.
+   its 300 ms drop logic never fires for us). The original fixed prebuffer was replaced
+   by `NativeAudioPipeline`: four lock-free SPSC S16 sources, source-local miniaudio data
+   converters, and a 48kHz stereo float node graph rendered in 480-frame blocks. Each
+   source tracks a rolling 10s/5ms-bucket relative-transit histogram and uses `p95+20ms`
+   as a 40–150ms target, starting at 60ms. RDPEA timestamps use unsigned 32-bit wrap;
+   zero/repeated values fall back to decoded duration, and gaps over 500ms restart a
+   talkspurt instead of becoming jitter samples.
+
+   Queue error drives dynamic SRC up to +/-0.5%; a slow integral term learns producer
+   clock drift. Underrun silences/rebuffers only one source. Backlog over target by 80ms
+   performs a 5ms fade-out, consumer-owned trim to target+20ms, converter reset, and 5ms
+   fade-in. Producer overflow only requests that trim and never moves the read cursor.
+   The graph mixes float, meters before the S16 clamp, then the pump feeds PCM
+   to NDL/ss4s. `audioPrebufferMs` and `--audio-prebuffer-ms` are one-release deprecated
+   inputs: accepted, ignored with one warning, and no longer persisted.
+
+6. **NDL remains the production sink.** An independent SDL callback sink was evaluated:
+   its pull model maps cleanly onto the graph, but it adds a second webOS device path whose
+   volume/mute, focus, suspend/resume, NDL-video coexistence, and A/V drift would all need
+   separate device qualification. The selected design therefore keeps the proven NDL/ss4s
+   PCM sink and the F32 headless graph. There is no SDL audio rollout and no custom NDL
+   `ma_device` backend. WSOLA/PLC stays deferred unless SRC plus rare fade/trim corrections
+   fail device acceptance.
 
 Also observed (benign): one `omxopusdec ... failed to setup output format` GStreamer
 error on the audio-only NDL load, gone after the full audio+video reload; noisy
@@ -264,10 +281,15 @@ error on the audio-only NDL load, gone after the full audio+video reload; noisy
 
 1. `cargo test --features native` (layout test + new DVC state-machine tests).
 2. `cc -fsyntax-only` matrix (SDL on/off × preconnect on/off), local CMake build + ctest
-   (audio compiles as stubs without `HELLOLG_WITH_SS4S`).
+   (audio compiles as stubs without `HELLOLG_WITH_SS4S`). The `audio-pipeline` CTest uses
+   an injected clock and covers simultaneous 44.1/48kHz mix/duration, regular and burst
+   delivery, target growth/decay, timestamp wrap/fallback/silence reset, both drift
+   directions, isolated underrun/rebuffer, hard trim/fades, overflow/sink-stall recovery,
+   gain/meters/clipping, mono/reopen parity, and pump start/stop.
 3. `tools/build-native-webos.sh` cross-build → verified `.ipk`.
 4. Deploy to `mylgtv` via `tools/deploy-native-webos.sh`; in `/tmp/gnomecast-native.log`
-   expect: `[native-audio] negotiated Opus 48000Hz 2ch` (or similar), NDL
+   expect: `[native-audio] miniaudio graph running at 48000Hz stereo` and
+   `[native-audio] opened PCM S16LE 48000Hz 2ch sink` (or equivalent), NDL
    `NDL_DirectMediaLoad(... atype!=0 ...)`, no decoder errors, video still streams
    (watch for the expected one-time reload around video start).
 5. Manual: play music on the remote PC, confirm sound on the TV; mute/pause and confirm

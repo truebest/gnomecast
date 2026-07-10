@@ -48,7 +48,7 @@
 typedef void NativePreconnectUi;
 #endif
 #include "au_snapshot.h"
-#include "audio_mixer.h"
+#include "audio_pipeline.h"
 #include "audio_opus.h"
 #include "luna_volume.h"
 #include "ui_mixer.h"
@@ -73,24 +73,6 @@ typedef void NativePreconnectUi;
 #define NATIVE_CONFIG_STRING_MAX NATIVE_SETTINGS_STRING_MAX
 /* NATIVE_PERSISTED_CONFIG_{FILENAME,PATH_MAX,MAX_CANDIDATES} live in config_paths.h. */
 
-/* PCM chunk the mixer produces per tick: ~21ms at 48kHz, commensurate with
- * gnome-remote-desktop's packetization (Opus 20ms/960 frames; legacy PCM 1024-frame
- * waves). 480 frames (10ms) was tried live and works — PLAYING intact, ~11ms less
- * standing latency — but doubles the pump cadence for a gain below hearing, so the
- * conservative quantum stays. */
-#define NATIVE_MIXER_CHUNK_FRAMES 1024u
-/* Per-source ring bound: 65536 frames (~1.49s at 44.1kHz, 256KB). The capacity IS the
- * audio latency cap — drop-oldest at the boundary bounds how far behind a source can
- * fall, with no separate trimming heuristics. Sized for two of the ~700ms waves old
- * gnome-remote-desktop versions ship; on modern servers (23ms packets) the ring idles
- * near the prebuffer. */
-#define NATIVE_MIXER_CAPACITY_FRAMES 65536u
-/* The expected mix format: the client advertises Opus 48k + PCM, and gnome-remote-desktop
- * prefers Opus among the client's formats, so sessions land on 48kHz stereo (Opus decodes
- * at its native 48k). A PCM-only server at another rate re-pins the mixer on the first
- * negotiated format (see on_audio_format). */
-#define NATIVE_AUDIO_MIX_DEFAULT_RATE 48000u
-#define NATIVE_AUDIO_MIX_DEFAULT_CHANNELS 2u
 /* If the freshly switched-to session produces no decodable frame within this window,
  * force a reconnect (guaranteed IDR) — covers servers where neither suppress-resume nor
  * the display-control refresh yields a keyframe (e.g. grd mirror mode). */
@@ -116,14 +98,14 @@ typedef void NativePreconnectUi;
  * step with the remote's VOL keys at negligible bus traffic). */
 #define NATIVE_MIXER_OVERLAY_VOLUME_POLL_MS 500u
 
-_Static_assert(NATIVE_MIXER_MAX_SOURCES >= NATIVE_SETTINGS_MAX_SESSIONS,
-               "every session slot needs a mixer source");
+_Static_assert(NATIVE_AUDIO_PIPELINE_MAX_SOURCES >= NATIVE_SETTINGS_MAX_SESSIONS,
+               "every session slot needs an audio source");
 
 typedef struct App App;
 
 /* One remote-button session slot (green/yellow). The slot owns its RDP session handle,
  * connection config (stable while connected — on_log redaction and reconnects read it),
- * per-session server state (desktop size, cursor) and its audio-mixer routing. The slot
+ * per-session server state (desktop size, cursor) and its audio-pipeline routing. The slot
  * struct itself is the callback ctx for all RdpCallbacks of its session. */
 typedef struct NativeSessionSlot {
     App *app;
@@ -147,9 +129,11 @@ typedef struct NativeSessionSlot {
     /* Server-driven cursor. Background sessions keep caching their latest shape here;
      * the SDL thread applies only the active slot's cursor each tick. */
     NativeCursor cursor;
-    /* Audio-mixer routing (worker thread of this session only). */
+    /* Audio-pipeline routing (worker thread of this session only). */
     bool audio_routed;
     bool audio_incompatible_logged;
+    uint32_t audio_sample_rate;
+    uint16_t audio_channels;
     /* Per-session Opus decoder (worker thread; created in on_audio_format, destroyed
      * after the worker is joined in native_stop_slot). NULL for raw-PCM sessions. */
     NativeOpusDecoder *opus_decoder;
@@ -238,21 +222,16 @@ typedef struct App {
      * exactly once per switch (one audio interruption instead of two). */
     int video_owner_slot;
     unsigned video_owner_epoch;
-    /* The single mixed-PCM audio track; all sessions' audio flows through the mixer into
-     * it. Format == mixer format (video_lock). */
+    /* The single mixed-PCM audio track; all sessions flow through the fixed 48 kHz stereo
+     * graph into it (video_lock). */
     NativeAudio *audio;
-    /* Sums per-session PCM rings; its pump thread feeds app->audio. The mixer object is
-     * internally locked; init/start state below is guarded by video_lock. */
-    NativeAudioMixer mixer;
-    bool mixer_started;
-    uint32_t mixer_sample_rate;
-    uint16_t mixer_channels;
-    uint16_t audio_prebuffer_ms; /* per-source mixer jitter prebuffer, from settings */
+    /* Headless miniaudio graph plus lock-free per-session adaptive sources. Its pump
+     * thread feeds app->audio; the graph format never follows a source format. */
+    NativeAudioPipeline audio_pipeline;
     uint16_t audio_codec;        /* NATIVE_AUDIO_CODEC_*: auto (Opus) or lossless PCM */
     /* Per-slot fader position in dB (NATIVE_MIXER_FADER_MIN_DB..MAX_DB, 3 dB steps,
      * default 0 = unity; the bottom stop mutes). Only the SDL thread writes it (volume
-     * overlay), under video_lock: workers re-read the set in native_ensure_mixer_locked
-     * when a codec change re-pins the mixer, so the levels survive re-inits. */
+     * overlay). The pipeline gain target is atomic and survives source reopen. */
     int8_t mixer_gain_db[NATIVE_SETTINGS_MAX_SESSIONS];
     /* System-volume bridge for the mixer overlay's MASTER fader (luna_volume.h): the
      * fader mirrors and drives the webOS volume, never the app's own mix. */
@@ -263,10 +242,6 @@ typedef struct App {
      * redact_if_sensitive. A slot's own worker is joined before its config is written,
      * but that never protected the cross-slot scan. */
     pthread_mutex_t redaction_lock;
-    /* Serializes the mixer re-pin (pump stop -> destroy -> reinit) across rdp-workers:
-     * the mixer's internal control_lock cannot protect its own destruction. Taken
-     * BEFORE video_lock (see on_audio_format); never taken by the pump thread. */
-    pthread_mutex_t mixer_repin_lock;
     NativeInput input;
 #if HELLOLG_WITH_EVDEV_INPUT
     /* Raw evdev mouse+keyboard reader (active during streaming); one background thread polls
@@ -346,6 +321,11 @@ typedef struct App {
     atomic_bool pointer_warp_pending;
     atomic_uint pointer_warp_x;
     atomic_uint pointer_warp_y;
+    /* Which slot published the warp: the drain drops it when it no longer matches the
+     * active slot — an outgoing worker can pass its active check right before a switch
+     * and publish afterwards, and its desktop coordinates are meaningless (and visibly
+     * jumpy) mapped through the NEW session's dimensions. */
+    atomic_int pointer_warp_slot;
     atomic_uint render_width;
     atomic_uint render_height;
     /* SDL thread only. Set true on window FOCUS_LOST (a remote-invoked webOS overlay such as
@@ -921,6 +901,13 @@ static bool apply_cli_audio_codec(int argc, char **argv, NativeSettings *setting
     return false;
 }
 
+static bool apply_cli_deprecated_audio_prebuffer(int argc, char **argv) {
+    if (arg_value(argc, argv, "--audio-prebuffer-ms", NULL)) {
+        native_settings_warn_deprecated_audio_prebuffer();
+    }
+    return true;
+}
+
 static bool native_config_apply_cli(NativeSettings *settings, int argc, char **argv) {
     /* Flat CLI flags keep their historical meaning and target the GREEN slot; the yellow
      * slot is configured via the settings file, launch JSON ("sessions" array) or UI. */
@@ -936,7 +923,7 @@ static bool native_config_apply_cli(NativeSettings *settings, int argc, char **a
           apply_cli_u16(argc, argv, "--fps", 1, 240, &green->fps) &&
           apply_cli_u16(argc, argv, "--wheel-step", 1, 120, &settings->wheel_step) &&
           apply_cli_u16(argc, argv, "--wheel-scroll-divisor", 1, 120, &settings->wheel_scroll_divisor) &&
-          apply_cli_u16(argc, argv, "--audio-prebuffer-ms", 0, 1000, &settings->audio_prebuffer_ms) &&
+          apply_cli_deprecated_audio_prebuffer(argc, argv) &&
           apply_cli_audio_codec(argc, argv, settings))) {
         return false;
     }
@@ -1018,10 +1005,9 @@ static void native_config_log_effective(const NativeSettings *settings) {
                 session->domain[0] ? "set" : "empty", (unsigned)session->fps);
     }
     fprintf(stderr,
-            "[native] effective globals desktop=%ux%u wheelStep=%u wheelScrollDivisor=%u audioPrebufferMs=%u"
-            " audioCodec=%s\n",
+            "[native] effective globals desktop=%ux%u wheelStep=%u wheelScrollDivisor=%u audioCodec=%s\n",
             (unsigned)settings->width, (unsigned)settings->height, (unsigned)settings->wheel_step,
-            (unsigned)settings->wheel_scroll_divisor, (unsigned)settings->audio_prebuffer_ms,
+            (unsigned)settings->wheel_scroll_divisor,
             settings->audio_codec == NATIVE_AUDIO_CODEC_PCM ? "pcm" : "auto");
 }
 
@@ -1306,36 +1292,14 @@ static NativeMedia *native_ensure_media_locked(App *app) {
     return app->media;
 }
 
-/* ~40ms of PCM silence to prime a freshly (re)opened audio track: NDL defers the
- * pipeline's LOADCOMPLETED->PLAYING transition until audio data arrives, and the mixer
- * deliberately pauses while every session is silent — without the primer a reload during
- * a quiet moment stalls the video start until someone makes a sound (observed live:
- * PLAYING arrived 12s after LOADCOMPLETED). Kept minimal: everything primed here queues
- * in the hardware ahead of real audio, i.e. is direct A/V latency. Caller must hold
- * app->video_lock. */
-static void native_prime_audio_silence_locked(App *app) {
-    static const int16_t silence[NATIVE_MIXER_CHUNK_FRAMES * 2] = {0};
-    if (!app || !app->audio || app->mixer_channels == 0 || app->mixer_channels > 2) {
-        return;
-    }
-    size_t bytes = (size_t)NATIVE_MIXER_CHUNK_FRAMES * app->mixer_channels * sizeof(int16_t);
-    for (int i = 0; i < 2; i++) {
-        if (native_audio_feed(app->audio, (const uint8_t *)silence, bytes) != NATIVE_AUDIO_OK) {
-            break;
-        }
-    }
-    /* And keep paced silence flowing from the pump for a while: a one-shot primer is not
-     * always enough for NDL to reach PLAYING when every session is silent. */
-    native_mixer_feed_silence_for(&app->mixer, 2000u);
-}
-
-/* Mixer pump thread: pushes one mixed PCM chunk into the shared ss4s audio track. The
- * mixer lock is NOT held here (see audio_mixer.h), so taking video_lock is safe. */
-static void native_mixer_feed_cb(void *ctx, const int16_t *samples, size_t frames) {
+/* NDL sink: the headless miniaudio graph renders one 10 ms S16 block and this
+ * callback feeds NDL. The graph render itself is lock-free; only the shared ss4s track
+ * needs the existing media lock. */
+static void native_audio_pipeline_feed_cb(void *ctx, const int16_t *samples, size_t frames) {
     App *app = (App *)ctx;
     pthread_mutex_lock(&app->video_lock);
     if (app->audio) {
-        size_t bytes = frames * (size_t)app->mixer_channels * sizeof(int16_t);
+        size_t bytes = frames * NATIVE_AUDIO_PIPELINE_CHANNELS * sizeof(int16_t);
         if (native_audio_feed(app->audio, (const uint8_t *)samples, bytes) == NATIVE_AUDIO_ERROR) {
             /* Mute instead of closing: on the webOS ss4s backends closing the audio track
              * unloads the shared pipeline and would freeze a live video stream. */
@@ -1344,37 +1308,6 @@ static void native_mixer_feed_cb(void *ctx, const int16_t *samples, size_t frame
         }
     }
     pthread_mutex_unlock(&app->video_lock);
-}
-
-/* Initializes the mixer (once) at the given output format and starts its pump. Caller
- * must hold app->video_lock. */
-static bool native_ensure_mixer_locked(App *app, uint32_t sample_rate, uint16_t channels) {
-    if (!app || sample_rate == 0 || channels == 0) {
-        return false;
-    }
-    if (app->mixer.initialized) {
-        return true;
-    }
-    size_t prebuffer_frames = (size_t)app->audio_prebuffer_ms * sample_rate / 1000u;
-    if (!native_mixer_init(&app->mixer, sample_rate, channels, NATIVE_MIXER_CHUNK_FRAMES,
-                           NATIVE_MIXER_CAPACITY_FRAMES, prebuffer_frames)) {
-        fprintf(stderr, "[native-audio] failed to initialize the audio mixer\n");
-        return false;
-    }
-    app->mixer_sample_rate = sample_rate;
-    app->mixer_channels = channels;
-    for (int i = 0; i < NATIVE_SETTINGS_MAX_SESSIONS; i++) {
-        /* Fresh mixers start at unity; restore the user's per-slot levels. */
-        native_mixer_set_source_gain(&app->mixer, i, native_ui_mixer_gain_db_to_q15(app->mixer_gain_db[i]));
-    }
-    if (!native_mixer_pump_start(&app->mixer, native_mixer_feed_cb, app)) {
-        native_mixer_destroy(&app->mixer);
-        return false;
-    }
-    app->mixer_started = true;
-    fprintf(stderr, "[native-audio] mixer running at %u Hz %u ch (per-source prebuffer %u ms)\n",
-            (unsigned)sample_rate, (unsigned)channels, (unsigned)app->audio_prebuffer_ms);
-    return true;
 }
 
 /* Opens the shared mixed-audio track speculatively as PCM 48kHz stereo before the
@@ -1386,20 +1319,14 @@ static bool native_ensure_mixer_locked(App *app, uint32_t sample_rate, uint16_t 
  * resends. If negotiation ends up choosing something else (or the server has no audio),
  * the normal on_audio_format path corrects or mutes it. Caller must hold app->video_lock. */
 static void native_open_speculative_audio_locked(App *app) {
-    if (!app || app->audio || !app->media) {
+    if (!app || app->audio || !app->media || !native_audio_pipeline_is_initialized(&app->audio_pipeline)) {
         return;
     }
-    if (!native_ensure_mixer_locked(app, NATIVE_AUDIO_MIX_DEFAULT_RATE, NATIVE_AUDIO_MIX_DEFAULT_CHANNELS)) {
-        return;
-    }
-    /* The mixer carries the jitter prebuffer per source; the track itself feeds with no
-     * extra buffering (prebuffer 0). */
-    app->audio = native_audio_open(app->media, RDP_AUDIO_CODEC_PCM_S16LE, app->mixer_sample_rate,
-                                   app->mixer_channels, 0);
+    app->audio = native_audio_open(app->media, RDP_AUDIO_CODEC_PCM_S16LE, NATIVE_AUDIO_PIPELINE_SAMPLE_RATE,
+                                   NATIVE_AUDIO_PIPELINE_CHANNELS);
     if (app->audio) {
         fprintf(stderr, "[native-audio] opened speculative mixed PCM %uHz %uch track ahead of negotiation\n",
-                (unsigned)app->mixer_sample_rate, (unsigned)app->mixer_channels);
-        native_prime_audio_silence_locked(app);
+                NATIVE_AUDIO_PIPELINE_SAMPLE_RATE, NATIVE_AUDIO_PIPELINE_CHANNELS);
     }
 }
 
@@ -1411,12 +1338,10 @@ static void native_reopen_audio_locked(App *app) {
         return;
     }
     native_audio_close(app->audio);
-    app->audio = native_audio_open(app->media, RDP_AUDIO_CODEC_PCM_S16LE, app->mixer_sample_rate,
-                                   app->mixer_channels, 0);
+    app->audio = native_audio_open(app->media, RDP_AUDIO_CODEC_PCM_S16LE, NATIVE_AUDIO_PIPELINE_SAMPLE_RATE,
+                                   NATIVE_AUDIO_PIPELINE_CHANNELS);
     if (!app->audio) {
         fprintf(stderr, "[native-audio] failed to reopen audio after pipeline reload; continuing without audio\n");
-    } else {
-        native_prime_audio_silence_locked(app);
     }
 }
 
@@ -1560,16 +1485,13 @@ static void on_video_au(void *ctx, const uint8_t *data, size_t len, bool is_keyf
      * If this callback later queues AUs to another thread, copy the bytes before returning.
      */
     NativeVideoResult result = native_video_feed(app->video, data, len, is_keyframe, pts90k);
-    pthread_mutex_unlock(&app->video_lock);
-    if (result == NATIVE_VIDEO_OK) {
-        app->decoder_keyframe_pending = false;
-        /* Signals the SDL thread that the freshly switched-to stream is decoding. */
-        atomic_fetch_add(&slot->video_ok_frames, 1u);
-        return;
-    }
-
     if (result == NATIVE_VIDEO_NEED_KEYFRAME) {
-        if (!app->decoder_keyframe_pending) {
+        /* Published while still holding video_lock and only for the slot that is active
+         * RIGHT NOW: a switch flips active_index (and clears this flag) under the same
+         * lock, so a feed racing the switch cannot leave a stale request behind — the
+         * tick would send that refresh to the fresh target and arm its watchdog into a
+         * needless reconnect on a static desktop. */
+        if (slot->index == atomic_load(&app->active_index) && !app->decoder_keyframe_pending) {
             fprintf(stderr,
                     "[native] decoder requested keyframe/recovery; waiting for native RDP recovery, no web fallback\n");
             app->decoder_keyframe_pending = true;
@@ -1579,6 +1501,20 @@ static void on_video_au(void *ctx, const uint8_t *data, size_t len, bool is_keyf
              * stream forever — grd never resends an IDR on its own. */
             atomic_store(&app->video_refresh_needed, true);
         }
+        pthread_mutex_unlock(&app->video_lock);
+        return;
+    }
+    pthread_mutex_unlock(&app->video_lock);
+    if (result == NATIVE_VIDEO_OK) {
+        app->decoder_keyframe_pending = false;
+        /* Signals the SDL thread that the freshly switched-to stream is decoding. */
+        atomic_fetch_add(&slot->video_ok_frames, 1u);
+        return;
+    }
+    if (result == NATIVE_VIDEO_DROPPED) {
+        /* Discarded by a still-loading decoder: not progress (video_ok_frames must not
+         * move — the snapshot-replay success check and the switch watchdog read it as
+         * "frames actually consumed") but not an error either. */
         return;
     }
 
@@ -1596,101 +1532,16 @@ static void on_audio_format(void *ctx, uint32_t codec, uint32_t sample_rate, uin
         return;
     }
     App *app = slot->app;
-    pthread_mutex_lock(&app->video_lock);
     if (codec != RDP_AUDIO_CODEC_PCM_S16LE && codec != RDP_AUDIO_CODEC_OPUS) {
         if (!slot->audio_incompatible_logged) {
             fprintf(stderr, "[native-audio] %s session negotiated unsupported codec %u; muting it in the mix\n",
                     native_session_slot_name(slot->index), (unsigned)codec);
             slot->audio_incompatible_logged = true;
         }
-        native_mixer_set_source_open(&app->mixer, slot->index, false);
+        native_audio_pipeline_close_source(&app->audio_pipeline, slot->index);
         slot->audio_routed = false;
-        pthread_mutex_unlock(&app->video_lock);
         return;
     }
-    if (!native_ensure_mixer_locked(app, sample_rate, channels)) {
-        pthread_mutex_unlock(&app->video_lock);
-        return;
-    }
-    if (sample_rate != app->mixer_sample_rate || channels != app->mixer_channels) {
-        /* This session is negotiating AWAY from the current mix format, so it must not
-         * count as a reason to keep the old pin: close its source first so the
-         * any_routed scans below see only OTHER live sources. Otherwise a lone session
-         * renegotiating 44.1<->48kHz would block its own re-pin and mute itself. */
-        native_mixer_set_source_open(&app->mixer, slot->index, false);
-        slot->audio_routed = false;
-        bool any_routed = false;
-        for (int i = 0; i < NATIVE_SETTINGS_MAX_SESSIONS; i++) {
-            any_routed = any_routed || app->sessions[i].audio_routed;
-        }
-        if (!any_routed) {
-            /* Only the speculative default (PCM 44.1k) pinned the mixer so far; re-pin to
-             * the actually negotiated format. The pump join must happen OUTSIDE
-             * video_lock (its feed callback takes it), so drop and retake the lock and
-             * revalidate: another session may have routed a source meanwhile.
-             * mixer_repin_lock serializes the WHOLE stop->destroy->reinit against other
-             * re-pinning workers: without it one worker can destroy (and memset) the
-             * mixer's own control_lock while another still blocks inside pump_stop on
-             * that same mutex — destroying a mutex with waiters is undefined behavior.
-             * Lock order: mixer_repin_lock, then video_lock; the feed callback takes
-             * only video_lock. */
-            pthread_mutex_unlock(&app->video_lock);
-            pthread_mutex_lock(&app->mixer_repin_lock);
-            native_mixer_pump_stop(&app->mixer);
-            pthread_mutex_lock(&app->video_lock);
-            for (int i = 0; i < NATIVE_SETTINGS_MAX_SESSIONS; i++) {
-                any_routed = any_routed || app->sessions[i].audio_routed;
-            }
-            if (!any_routed && app->mixer.initialized &&
-                (sample_rate != app->mixer_sample_rate || channels != app->mixer_channels)) {
-                fprintf(stderr, "[native-audio] re-pinning the mix from %uHz %uch to the negotiated %uHz %uch\n",
-                        (unsigned)app->mixer_sample_rate, (unsigned)app->mixer_channels, (unsigned)sample_rate,
-                        (unsigned)channels);
-                native_mixer_destroy(&app->mixer);
-                app->mixer_started = false;
-                if (app->audio) {
-                    /* The track runs at the old rate; drop it so the block below reopens
-                     * it at the new one (with the usual pipeline-reload video dance). */
-                    native_audio_close(app->audio);
-                    app->audio = NULL;
-                    if (app->video) {
-                        fprintf(stderr,
-                                "[native] audio format re-pin reloaded the media pipeline; reopening video on next keyframe\n");
-                        native_video_close(app->video);
-                        app->video = NULL;
-                        app->decoder_keyframe_pending = false;
-                        atomic_store(&app->video_refresh_needed, true);
-                    }
-                }
-                if (!native_ensure_mixer_locked(app, sample_rate, channels)) {
-                    pthread_mutex_unlock(&app->mixer_repin_lock);
-                    pthread_mutex_unlock(&app->video_lock);
-                    return;
-                }
-            } else if (app->mixer.initialized && !app->mixer.thread_running) {
-                /* Lost the revalidation race (or nothing to re-pin): restart the pump for
-                 * whichever format the mixer kept. */
-                if (native_mixer_pump_start(&app->mixer, native_mixer_feed_cb, app)) {
-                    app->mixer_started = true;
-                }
-            }
-            pthread_mutex_unlock(&app->mixer_repin_lock);
-        }
-        if (sample_rate != app->mixer_sample_rate || channels != app->mixer_channels) {
-            if (!slot->audio_incompatible_logged) {
-                fprintf(stderr,
-                        "[native-audio] %s session PCM %uHz %uch mismatches the %uHz %uch mix; muting it (no resampler)\n",
-                        native_session_slot_name(slot->index), (unsigned)sample_rate, (unsigned)channels,
-                        (unsigned)app->mixer_sample_rate, (unsigned)app->mixer_channels);
-                slot->audio_incompatible_logged = true;
-            }
-            native_mixer_set_source_open(&app->mixer, slot->index, false);
-            slot->audio_routed = false;
-            pthread_mutex_unlock(&app->video_lock);
-            return;
-        }
-    }
-
     if (codec == RDP_AUDIO_CODEC_OPUS) {
         /* Fresh stream (or renegotiation): restart decoder state. Safe against
          * on_audio_data — both run on this session's own rdp-worker thread. */
@@ -1702,9 +1553,8 @@ static void on_audio_format(void *ctx, uint32_t codec, uint32_t sample_rate, uin
                         native_session_slot_name(slot->index));
                 slot->audio_incompatible_logged = true;
             }
-            native_mixer_set_source_open(&app->mixer, slot->index, false);
+            native_audio_pipeline_close_source(&app->audio_pipeline, slot->index);
             slot->audio_routed = false;
-            pthread_mutex_unlock(&app->video_lock);
             return;
         }
     } else if (slot->opus_decoder) {
@@ -1712,23 +1562,36 @@ static void on_audio_format(void *ctx, uint32_t codec, uint32_t sample_rate, uin
         slot->opus_decoder = NULL;
     }
 
-    native_mixer_set_source_open(&app->mixer, slot->index, true);
+    if (!native_audio_pipeline_set_source_format(&app->audio_pipeline, slot->index, sample_rate, channels)) {
+        if (!slot->audio_incompatible_logged) {
+            fprintf(stderr, "[native-audio] %s session has unsupported PCM format %uHz %uch; muting it\n",
+                    native_session_slot_name(slot->index), (unsigned)sample_rate, (unsigned)channels);
+            slot->audio_incompatible_logged = true;
+        }
+        native_opus_decoder_close(slot->opus_decoder);
+        slot->opus_decoder = NULL;
+        slot->audio_routed = false;
+        return;
+    }
+    slot->audio_sample_rate = sample_rate;
+    slot->audio_channels = channels;
     slot->audio_routed = true;
     slot->audio_incompatible_logged = false;
     fprintf(stderr, "[native-audio] %s session audio joined the mix (%s %uHz %uch)\n",
             native_session_slot_name(slot->index), codec == RDP_AUDIO_CODEC_OPUS ? "Opus->PCM" : "PCM",
             (unsigned)sample_rate, (unsigned)channels);
 
+    pthread_mutex_lock(&app->video_lock);
     if (!app->audio) {
         /* First working audio format and the speculative open didn't happen (or failed):
          * bring the shared track up now. */
         NativeMedia *media = native_ensure_media_locked(app);
         if (media) {
-            app->audio = native_audio_open(media, RDP_AUDIO_CODEC_PCM_S16LE, app->mixer_sample_rate,
-                                           app->mixer_channels, 0);
+            app->audio = native_audio_open(media, RDP_AUDIO_CODEC_PCM_S16LE,
+                                           NATIVE_AUDIO_PIPELINE_SAMPLE_RATE,
+                                           NATIVE_AUDIO_PIPELINE_CHANNELS);
         }
         if (app->audio) {
-            native_prime_audio_silence_locked(app);
             if (app->video) {
                 /* First-time open under a live video stream reloads the shared pipeline
                  * (webOS); drop the dead video track so on_video_au reopens it on the next
@@ -1744,15 +1607,13 @@ static void on_audio_format(void *ctx, uint32_t codec, uint32_t sample_rate, uin
                 atomic_store(&app->video_refresh_needed, true);
             }
         } else {
-            fprintf(stderr, "[native-audio] audio unavailable (PCM %uHz %uch); continuing with silent video\n",
-                    (unsigned)sample_rate, (unsigned)channels);
+            fprintf(stderr, "[native-audio] audio sink unavailable (PCM 48000Hz 2ch); continuing with silent video\n");
         }
     }
     pthread_mutex_unlock(&app->video_lock);
 }
 
 static void on_audio_data(void *ctx, const uint8_t *data, size_t len, uint32_t ts_ms) {
-    (void)ts_ms; /* the mixer pump provides the playback cadence */
     NativeSessionSlot *slot = (NativeSessionSlot *)ctx;
     if (!slot || !data || len == 0 || !slot->audio_routed) {
         return;
@@ -1762,15 +1623,15 @@ static void on_audio_data(void *ctx, const uint8_t *data, size_t len, uint32_t t
         const int16_t *pcm = NULL;
         int frames = native_opus_decoder_decode(slot->opus_decoder, data, len, &pcm);
         if (frames > 0) {
-            (void)native_mixer_push(&app->mixer, slot->index, pcm, (size_t)frames);
+            (void)native_audio_pipeline_push(&app->audio_pipeline, slot->index, pcm, (size_t)frames, ts_ms);
         }
         return;
     }
-    size_t frame_bytes = (size_t)app->mixer_channels * sizeof(int16_t);
+    size_t frame_bytes = (size_t)slot->audio_channels * sizeof(int16_t);
     size_t frames = frame_bytes ? len / frame_bytes : 0;
     if (frames > 0) {
-        /* Drop-oldest on overflow is handled (and logged) inside the mixer. */
-        (void)native_mixer_push(&app->mixer, slot->index, (const int16_t *)(const void *)data, frames);
+        (void)native_audio_pipeline_push(&app->audio_pipeline, slot->index,
+                                         (const int16_t *)(const void *)data, frames, ts_ms);
     }
 }
 
@@ -1802,6 +1663,7 @@ static void on_pointer_position(void *ctx, uint16_t x, uint16_t y) {
     App *app = slot->app;
     atomic_store(&app->pointer_warp_x, (unsigned)x);
     atomic_store(&app->pointer_warp_y, (unsigned)y);
+    atomic_store(&app->pointer_warp_slot, slot->index);
     atomic_store(&app->pointer_warp_pending, true);
 #else
     (void)x;
@@ -1861,13 +1723,11 @@ static void native_stop_slot(App *app, int index) {
         rdp_session_stop(slot->rdp);
         slot->rdp = NULL;
     }
-    /* audio_routed is scanned by OTHER slots' workers under video_lock when they decide
-     * whether the mixer may be re-pinned; clear it under the same lock or a concurrent
-     * format negotiation can see this stopped slot as still routed and mute itself
-     * instead of re-pinning. (The join above means this slot's own worker is gone.) */
     pthread_mutex_lock(&app->video_lock);
-    native_mixer_set_source_open(&app->mixer, index, false);
+    native_audio_pipeline_close_source(&app->audio_pipeline, index);
     slot->audio_routed = false;
+    slot->audio_sample_rate = 0;
+    slot->audio_channels = 0;
     slot->audio_incompatible_logged = false;
     /* Whatever the cache held belongs to the connection that just died. */
     native_au_snapshot_reset(&slot->snapshot);
@@ -2069,6 +1929,12 @@ static bool native_update_render_size(App *app, SDL_Renderer *renderer) {
     return true;
 }
 
+/* Input mapping uses the renderer OUTPUT size as the window size. On this target they
+ * are the same surface: the webOS window is fullscreen at the compositor resolution and
+ * is created without HIGHDPI, so SDL's logical window coordinates equal renderer output
+ * pixels. A desktop/high-DPI port would have to map input from SDL_GetWindowSize
+ * instead — mouse events and SDL_WarpMouseInWindow live in logical window coordinates,
+ * not pixels. */
 static void native_sync_input_window_size(App *app) {
     if (!app) {
         return;
@@ -2114,6 +1980,9 @@ static void native_drain_pointer_clamp(App *app) {
 static void native_drain_pointer_warp(App *app, SDL_Window *window) {
     if (!app || !window || !atomic_exchange(&app->pointer_warp_pending, false)) {
         return;
+    }
+    if (atomic_load(&app->pointer_warp_slot) != atomic_load(&app->active_index)) {
+        return; /* the outgoing session's warp, published across a switch: stale */
     }
     uint16_t dw = (uint16_t)atomic_load(&app->input.desktop_width);
     uint16_t dh = (uint16_t)atomic_load(&app->input.desktop_height);
@@ -2914,17 +2783,9 @@ static void native_mixer_overlay_set_db(App *app, int slot, int gain_db) {
         gain_db = NATIVE_MIXER_FADER_MAX_DB;
     }
     if (gain_db != (int)app->mixer_gain_db[slot]) {
-        /* Workers re-read this set in native_ensure_mixer_locked (under video_lock) on a
-         * mixer re-pin; the write takes the same lock. The unguarded read above is fine:
-         * the SDL thread is the only writer. The live-gain call stays under video_lock
-         * too — a worker may be destroying/reinitializing app->mixer during a re-pin,
-         * and touching its internal mutex mid-destroy is UB. */
-        pthread_mutex_lock(&app->video_lock);
         app->mixer_gain_db[slot] = (int8_t)gain_db;
-        if (app->mixer.initialized) {
-            native_mixer_set_source_gain(&app->mixer, slot, native_ui_mixer_gain_db_to_q15(gain_db));
-        }
-        pthread_mutex_unlock(&app->video_lock);
+        native_audio_pipeline_set_source_gain(&app->audio_pipeline, slot,
+                                              native_ui_mixer_gain_db_to_q15(gain_db));
     }
     native_mixer_overlay_touch(app);
 }
@@ -3116,23 +2977,21 @@ static void native_present_mixer_overlay_frame(App *app, SDL_Renderer *renderer)
 #if defined(HELLOLG_WITH_PRECONNECT_UI) && HELLOLG_WITH_PRECONNECT_UI
     NativeUiMixer *mixer_ui = native_preconnect_ui_mixer(app->preconnect_ui);
     if (mixer_ui) {
-        /* Snapshot the meter peaks under video_lock: an rdp-worker may be destroying and
-         * reinitializing app->mixer during a format re-pin (it does so under the same
-         * lock), and the render path must never touch a mixer mid-teardown. The MASTER
-         * meters carry the mix OUTPUT — the summed chunk as it leaves for the track. */
+        /* Meter/stat snapshots are atomic and never enter the callback path. */
         int32_t peaks[NATIVE_UI_MIXER_CHANNELS][2] = {{0, 0}};
-        unsigned latency_ms[NATIVE_UI_MIXER_CHANNELS] = {0};
-        pthread_mutex_lock(&app->video_lock);
-        if (app->mixer.initialized) {
-            for (int i = 0; i < NATIVE_SETTINGS_MAX_SESSIONS; i++) {
-                native_mixer_get_source_peaks(&app->mixer, i, &peaks[i][0], &peaks[i][1]);
-                latency_ms[i] = native_mixer_get_source_latency_ms(&app->mixer, i);
+        unsigned queue_ms[NATIVE_SETTINGS_MAX_SESSIONS] = {0};
+        unsigned target_ms[NATIVE_SETTINGS_MAX_SESSIONS] = {0};
+        for (int i = 0; i < NATIVE_SETTINGS_MAX_SESSIONS; i++) {
+            NativeAudioSourceStats stats;
+            native_audio_pipeline_get_source_peaks(&app->audio_pipeline, i, &peaks[i][0], &peaks[i][1]);
+            if (native_audio_pipeline_get_source_stats(&app->audio_pipeline, i, &stats)) {
+                queue_ms[i] = stats.queue_ms;
+                target_ms[i] = stats.target_delay_ms;
             }
-            native_mixer_get_output_peaks(&app->mixer, &peaks[NATIVE_UI_MIXER_MASTER][0],
-                                          &peaks[NATIVE_UI_MIXER_MASTER][1]);
         }
-        pthread_mutex_unlock(&app->video_lock);
-        native_ui_mixer_render(mixer_ui, peaks, latency_ms, app->mixer_gain_db, master_pct,
+        native_audio_pipeline_get_output_peaks(&app->audio_pipeline, &peaks[NATIVE_UI_MIXER_MASTER][0],
+                                               &peaks[NATIVE_UI_MIXER_MASTER][1]);
+        native_ui_mixer_render(mixer_ui, peaks, queue_ms, target_ms, app->mixer_gain_db, master_pct,
                                app->mixer_overlay_selected, connected_mask, SDL_GetTicks());
         app->video_plane_punched = true; /* screen content is ours, not the punch frame */
         return;
@@ -3308,12 +3167,6 @@ static void native_complete_session_switch(App *app, int target) {
             native_session_slot_name(target));
     /* Any switch that actually happens supersedes a deferred one still in flight. */
     app->pending_switch_target = -1;
-    /* A pending recovery request belongs to the OUTGOING owner and goes stale with the
-     * ownership change: draining it after the switch would send a spurious refresh to
-     * the fresh target and arm its watchdog into a needless reconnect on a static
-     * desktop. The old slot needs no recovery either way — backgrounding reconnects it
-     * (snapshot) or suppresses it (resume asks for its own keyframe on return). */
-    atomic_store(&app->video_refresh_needed, false);
     /* Reachable with the overlay up via the auto-switch on a died session. */
     native_mixer_overlay_hide(app);
 
@@ -3332,9 +3185,19 @@ static void native_complete_session_switch(App *app, int target) {
      * desktop that keyframe is the only frame coming — baselining after it would make
      * the watchdog reconnect a successful switch and mislearn refresh_ineffective. */
     unsigned switch_baseline = atomic_load(&target_slot->video_ok_frames);
-    atomic_store(&app->active_index, target);
 
     pthread_mutex_lock(&app->video_lock);
+    /* The active flip and the stale-recovery clear live INSIDE video_lock: on_video_au
+     * publishes video_refresh_needed under the same lock after re-checking the active
+     * slot, so an outgoing worker mid-feed cannot interleave with the switch and leave
+     * a stale request behind. A pending request belongs to the OUTGOING owner and goes
+     * stale with the ownership change: draining it after the switch would send a
+     * spurious refresh to the fresh target and arm its watchdog into a needless
+     * reconnect on a static desktop. The old slot needs no recovery either way —
+     * backgrounding reconnects it (snapshot) or suppresses it (resume asks for its own
+     * keyframe on return). */
+    atomic_store(&app->active_index, target);
+    atomic_store(&app->video_refresh_needed, false);
     if (app->rgba) {
         native_defer_rgba_texture_destroy(app);
         native_rgba_surface_close(app->rgba);
@@ -4098,9 +3961,8 @@ static int native_run_app_loop(App *app, NativeSettings *settings) {
     fprintf(stderr, "[native] SDL loop running at target %u fps\n", (unsigned)loop_fps);
 
 #if defined(HELLOLG_WITH_PRECONNECT_UI) && HELLOLG_WITH_PRECONNECT_UI
-    NativePreconnectUi *ui =
-        native_preconnect_ui_create(window, renderer, settings->sessions, settings->audio_prebuffer_ms,
-                                    settings->audio_codec);
+    NativePreconnectUi *ui = native_preconnect_ui_create(window, renderer, settings->sessions,
+                                                         settings->audio_codec);
     if (!ui) {
         fprintf(stderr, "[native-ui] failed to create pre-connect UI\n");
         SDL_StopTextInput();
@@ -4304,7 +4166,6 @@ static int native_run_app_loop(App *app, NativeSettings *settings) {
         char requested_domain[NATIVE_CONFIG_STRING_MAX];
         uint16_t requested_port = 0;
         uint16_t requested_fps = 0;
-        uint16_t requested_audio_prebuffer_ms = 0;
         uint16_t requested_audio_codec = NATIVE_AUDIO_CODEC_AUTO;
         /* ALWAYS consume the one-shot request: gating the take on slot state would leave
          * a Connect clicked on a still-connecting slot's configurator latched in the UI,
@@ -4312,8 +4173,7 @@ static int native_run_app_loop(App *app, NativeSettings *settings) {
         if (native_preconnect_ui_take_connect(ui, &requested_slot, requested_host, sizeof(requested_host),
                                               &requested_port, requested_username, sizeof(requested_username),
                                               requested_password, sizeof(requested_password), requested_domain,
-                                              sizeof(requested_domain), &requested_fps,
-                                              &requested_audio_prebuffer_ms, &requested_audio_codec)) {
+                                              sizeof(requested_domain), &requested_fps, &requested_audio_codec)) {
             if (requested_slot < 0 || requested_slot >= NATIVE_SETTINGS_MAX_SESSIONS) {
                 requested_slot = NATIVE_SESSION_SLOT_GREEN;
             }
@@ -4341,28 +4201,15 @@ static int native_run_app_loop(App *app, NativeSettings *settings) {
             } else {
                 session->port = requested_port;
                 session->fps = requested_fps;
-                settings->audio_prebuffer_ms = requested_audio_prebuffer_ms;
                 settings->audio_codec = requested_audio_codec;
                 /* Applies to sessions started from now on; live sessions keep their
-                 * negotiated stream until they reconnect. Sample rates may differ across
-                 * codecs (Opus 48k vs grd PCM 44.1k), so a mid-flight change can leave a
-                 * new session muted until the others reconnect too. */
+                 * negotiated stream until they reconnect. Per-source conversion allows
+                 * those streams to use different sample rates in the same mix. */
                 if (app->audio_codec != requested_audio_codec) {
                     fprintf(stderr, "[native-audio] audio codec preference now %s (new connections only)\n",
                             requested_audio_codec == NATIVE_AUDIO_CODEC_PCM ? "pcm" : "auto");
                     app->audio_codec = requested_audio_codec;
                 }
-                /* mixer init state and the prebuffer are video_lock-guarded (workers run
-                 * native_ensure_mixer_locked concurrently). */
-                pthread_mutex_lock(&app->video_lock);
-                if (!app->mixer.initialized) {
-                    app->audio_prebuffer_ms = requested_audio_prebuffer_ms;
-                } else if (app->audio_prebuffer_ms != requested_audio_prebuffer_ms) {
-                    fprintf(stderr,
-                            "[native-audio] audio buffer change to %ums applies after an app restart (mixer already running at %ums)\n",
-                            (unsigned)requested_audio_prebuffer_ms, (unsigned)app->audio_prebuffer_ms);
-                }
-                pthread_mutex_unlock(&app->video_lock);
                 native_config_apply_initial_desktop_hint(settings);
                 char validation_message[128];
                 if (!native_session_config_validate_connect(session, requested_slot, validation_message,
@@ -4563,12 +4410,6 @@ int main(int argc, char **argv) {
         native_shutdown_sdl_runtime();
         return 2;
     }
-    if (pthread_mutex_init(&app.mixer_repin_lock, NULL) != 0) {
-        pthread_mutex_destroy(&app.redaction_lock);
-        pthread_mutex_destroy(&app.video_lock);
-        native_shutdown_sdl_runtime();
-        return 2;
-    }
     atomic_init(&app.active_index, NATIVE_SESSION_SLOT_GREEN);
     for (int i = 0; i < NATIVE_SETTINGS_MAX_SESSIONS; i++) {
         NativeSessionSlot *slot = &app.sessions[i];
@@ -4590,8 +4431,18 @@ int main(int argc, char **argv) {
         app.mixer_gain_db[i] = 0; /* unity */
     }
     atomic_init(&app.video_refresh_needed, false);
-    app.audio_prebuffer_ms = native_settings.audio_prebuffer_ms;
     app.audio_codec = native_settings.audio_codec;
+    if (!native_audio_pipeline_init(&app.audio_pipeline) ||
+        !native_audio_pipeline_pump_start(&app.audio_pipeline, native_audio_pipeline_feed_cb, &app)) {
+        fprintf(stderr, "[native-audio] miniaudio pipeline unavailable; continuing with silent video\n");
+        native_audio_pipeline_destroy(&app.audio_pipeline);
+    } else {
+        for (int i = 0; i < NATIVE_SETTINGS_MAX_SESSIONS; i++) {
+            native_audio_pipeline_set_source_gain(&app.audio_pipeline, i,
+                                                  native_ui_mixer_gain_db_to_q15(app.mixer_gain_db[i]));
+        }
+        fprintf(stderr, "[native-audio] miniaudio graph running at 48000Hz stereo, 480-frame blocks\n");
+    }
     const char *snapshot_force = getenv("HELLOLG_SNAPSHOT_FORCE");
     app.snapshot_force = snapshot_force && snapshot_force[0] != '\0' && strcmp(snapshot_force, "0") != 0;
     if (app.snapshot_force) {
@@ -4624,7 +4475,7 @@ int main(int argc, char **argv) {
         for (int i = 0; i < NATIVE_SETTINGS_MAX_SESSIONS; i++) {
             native_cursor_destroy(&app.sessions[i].cursor);
         }
-        pthread_mutex_destroy(&app.mixer_repin_lock);
+        native_audio_pipeline_destroy(&app.audio_pipeline);
         pthread_mutex_destroy(&app.redaction_lock);
         pthread_mutex_destroy(&app.video_lock);
         native_shutdown_sdl_runtime();
@@ -4639,12 +4490,11 @@ int main(int argc, char **argv) {
 
     native_stop_all_sessions(&app);
     native_luna_volume_stop(&app.luna_volume);
-    /* The pump feeds through video_lock; both are free here, so a join cannot deadlock. */
-    native_mixer_destroy(&app.mixer);
+    /* The pump feeds through video_lock; stop it before destroying that lock. */
+    native_audio_pipeline_destroy(&app.audio_pipeline);
     for (int i = 0; i < NATIVE_SETTINGS_MAX_SESSIONS; i++) {
         native_cursor_destroy(&app.sessions[i].cursor);
     }
-    pthread_mutex_destroy(&app.mixer_repin_lock);
     pthread_mutex_destroy(&app.redaction_lock);
     pthread_mutex_destroy(&app.video_lock);
     native_shutdown_sdl_runtime();

@@ -269,7 +269,7 @@ NativeVideoResult native_video_feed(NativeVideo *video, const uint8_t *data, siz
                 fprintf(stderr, "[native-video] ss4s video feed not ready; dropping access units until decoder is ready\n");
                 video->feed_not_ready_logged = true;
             }
-            return NATIVE_VIDEO_OK;
+            return NATIVE_VIDEO_DROPPED;
         case SS4S_VIDEO_FEED_ERROR:
             fprintf(stderr, "[native-video] ss4s video feed returned error\n");
             video->terminal_error = true;

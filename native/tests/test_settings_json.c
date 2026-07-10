@@ -21,7 +21,7 @@ static void test_defaults(void) {
         assert(s.sessions[i].fps == 60);
     }
     assert(s.width == 1920 && s.height == 1080);
-    assert(s.wheel_step == 60 && s.wheel_scroll_divisor == 1 && s.audio_prebuffer_ms == 60);
+    assert(s.wheel_step == 60 && s.wheel_scroll_divisor == 1);
 }
 
 static void test_legacy_flat_applies_to_green(void) {
@@ -38,7 +38,7 @@ static void test_legacy_flat_applies_to_green(void) {
     assert(strcmp(green->domain, "d") == 0);
     assert(green->fps == 30);
     assert(s.wheel_step == 40);
-    assert(s.audio_prebuffer_ms == 0);
+    assert(s.audio_codec == NATIVE_AUDIO_CODEC_AUTO); /* deprecated buffer value is ignored */
     /* Yellow slot untouched by a legacy document. */
     assert(s.sessions[NATIVE_SESSION_SLOT_YELLOW].host[0] == '\0');
     assert(s.sessions[NATIVE_SESSION_SLOT_YELLOW].fps == 60);
@@ -75,7 +75,7 @@ static void test_v2_sessions_array(void) {
     assert(strcmp(s.sessions[NATIVE_SESSION_SLOT_YELLOW].password, "yp") == 0);
     assert(strcmp(s.sessions[NATIVE_SESSION_SLOT_YELLOW].domain, "yd") == 0);
     assert(s.sessions[NATIVE_SESSION_SLOT_YELLOW].fps == 30);
-    assert(s.wheel_step == 55 && s.wheel_scroll_divisor == 2 && s.audio_prebuffer_ms == 150);
+    assert(s.wheel_step == 55 && s.wheel_scroll_divisor == 2);
 }
 
 static void test_v2_slot_tags_out_of_order(void) {
@@ -196,6 +196,7 @@ static void test_has_rdp_key(void) {
     assert(!native_settings_json_has_rdp_key("{ \"unrelated\": 1 }"));
     assert(native_settings_json_has_rdp_key("{ \"sessions\": [] }"));
     assert(native_settings_json_has_rdp_key("{ \"wheelStep\": 60 }"));
+    assert(native_settings_json_has_rdp_key("{ \"audioPrebufferMs\": 60 }"));
 }
 
 static void test_save_load_round_trip(void) {
@@ -212,7 +213,6 @@ static void test_save_load_round_trip(void) {
     s.sessions[1].fps = 120;
     s.wheel_step = 33;
     s.wheel_scroll_divisor = 3;
-    s.audio_prebuffer_ms = 220;
     s.audio_codec = NATIVE_AUDIO_CODEC_PCM;
 
     char template_path[] = "/tmp/gnomecast-settings-test-XXXXXX";
@@ -230,13 +230,13 @@ static void test_save_load_round_trip(void) {
     size_t len = fread(buffer, 1, sizeof(buffer) - 1, file);
     fclose(file);
     buffer[len] = '\0';
+    assert(strstr(buffer, "audioPrebufferMs") == NULL);
 
     NativeSettings loaded = make_defaults();
     assert(native_settings_apply_json(&loaded, buffer, "round-trip"));
     assert(memcmp(&loaded.sessions, &s.sessions, sizeof(s.sessions)) == 0);
     assert(loaded.wheel_step == s.wheel_step);
     assert(loaded.wheel_scroll_divisor == s.wheel_scroll_divisor);
-    assert(loaded.audio_prebuffer_ms == s.audio_prebuffer_ms);
     assert(loaded.audio_codec == NATIVE_AUDIO_CODEC_PCM);
 
     assert(unlink(template_path) == 0);

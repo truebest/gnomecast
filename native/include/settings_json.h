@@ -11,7 +11,7 @@
  *
  *   v2 (written):  { "sessions": [ { "slot": "green", "host": ..., "port": n, "username": ...,
  *                    "password": ..., "domain": ..., "fps": n }, { "slot": "yellow", ... } ],
- *                    "wheelStep": n, "wheelScrollDivisor": n, "audioPrebufferMs": n }
+ *                    "wheelStep": n, "wheelScrollDivisor": n, "audioCodec": "auto" }
  *   legacy (read): the old flat single-session object (host/port/username/password/domain/
  *                  fps/wheelStep/...) — applied to the green slot.
  *
@@ -39,8 +39,8 @@ typedef struct NativeSessionConfig {
 
 /* Global audio codec preference ("audioCodec" JSON key). AUTO advertises Opus+PCM and
  * the server picks Opus (~96kbps, in-process decode); PCM advertises PCM only for a
- * lossless stream (~1.4Mbps per session). Global, not per-slot: the mix runs at one
- * sample rate (Opus decodes at 48kHz, grd's PCM is 44.1kHz). */
+ * lossless stream (~1.4Mbps per session). Global, not per-slot; per-source converters
+ * normalize simultaneous 44.1/48 kHz streams into the fixed 48 kHz graph. */
 #define NATIVE_AUDIO_CODEC_AUTO 0
 #define NATIVE_AUDIO_CODEC_PCM 1
 
@@ -51,7 +51,6 @@ typedef struct NativeSettings {
     uint16_t height;
     uint16_t wheel_step;
     uint16_t wheel_scroll_divisor;
-    uint16_t audio_prebuffer_ms;
     uint16_t audio_codec; /* NATIVE_AUDIO_CODEC_* */
 } NativeSettings;
 
@@ -59,6 +58,9 @@ typedef struct NativeSettings {
 const char *native_session_slot_name(int slot);
 
 void native_settings_defaults(NativeSettings *settings);
+
+/* One-release compatibility notice shared by JSON and CLI parsing. */
+void native_settings_warn_deprecated_audio_prebuffer(void);
 
 /* Low-level JSON helpers (shared with main.c's launch-parameter handling).
  * native_json_read_* return 1 = read, 0 = key absent, -1 = present but invalid. */

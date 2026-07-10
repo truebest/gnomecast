@@ -74,6 +74,30 @@ static void test_scaled_geometry(void) {
     /* Hotspot clamped inside the scaled shape. */
     native_cursor_scaled_geometry(2, 2, 1, 1, 3840, 2160, 1920, 1080, &w, &h, &hx, &hy);
     assert(w == 1 && h == 1 && hx == 0 && hy == 0);
+
+    /* A hostile/degenerate tiny desktop must not balloon a legal shape past the cap:
+     * 384px over a 16x9 "desktop" would map to 46080px, whose w*h*4 allocation size
+     * overflows 32-bit size_t. Hotspots are RESCALED by the cap ratio, not clamped to
+     * the edge: 45960/46080 of the width stays 1021/1024, not 1023. */
+    native_cursor_scaled_geometry(NATIVE_CURSOR_MAX_DIM, NATIVE_CURSOR_MAX_DIM, NATIVE_CURSOR_MAX_DIM - 1,
+                                  NATIVE_CURSOR_MAX_DIM - 1, 16, 9, 1920, 1080, &w, &h, &hx, &hy);
+    assert(w == NATIVE_CURSOR_MAX_SCALED_DIM && h == NATIVE_CURSOR_MAX_SCALED_DIM);
+    assert(hx == 1021 && hy == 1021);
+    assert((size_t)w * (size_t)h * 4u <= 4u * 1024u * 1024u); /* alloc stays bounded */
+
+    /* A centered hotspot stays centered through the cap (192/384 -> 512/1024). */
+    native_cursor_scaled_geometry(NATIVE_CURSOR_MAX_DIM, NATIVE_CURSOR_MAX_DIM, 192, 192, 16, 9, 1920, 1080, &w, &h,
+                                  &hx, &hy);
+    assert(w == NATIVE_CURSOR_MAX_SCALED_DIM && h == NATIVE_CURSOR_MAX_SCALED_DIM);
+    assert(hx == 512 && hy == 512);
+
+    /* Extreme ratio saturating cursor_scale_dim (1px "desktop"): both the mapped size
+     * and hotspot hit UINT16_MAX, so the capped hotspot must come from the ORIGINAL
+     * shape geometry — 192/384 is still the center, not the far edge. */
+    native_cursor_scaled_geometry(NATIVE_CURSOR_MAX_DIM, NATIVE_CURSOR_MAX_DIM, 192, 192, 1, 1, 1920, 1080, &w, &h,
+                                  &hx, &hy);
+    assert(w == NATIVE_CURSOR_MAX_SCALED_DIM && h == NATIVE_CURSOR_MAX_SCALED_DIM);
+    assert(hx == 512 && hy == 512);
 }
 
 static void test_submit_state_machine(void) {

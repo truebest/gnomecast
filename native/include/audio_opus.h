@@ -4,10 +4,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* Thin per-session libopus decoder for the audio mixer: rdpsnd delivers encoded Opus
+/* Thin per-session libopus decoder for the audio pipeline: rdpsnd delivers encoded Opus
  * packets (grd prefers Opus over PCM when the client offers both — ~96kbps instead of
  * ~1.4Mbps raw), and mixing needs raw samples, so each session decodes on its own
- * rdp-worker thread before pushing into the mixer ring. libopus decode is cheap (~1-2%
+ * rdp-worker thread before pushing into its source ring. libopus decode is cheap (~1-2%
  * of one ARM core per 48kHz stereo stream, NEON-optimized).
  *
  * Builds without HELLOLG_WITH_OPUS stub out to "unavailable": open returns NULL and the

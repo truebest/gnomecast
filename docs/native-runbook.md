@@ -23,16 +23,32 @@ the TV remote's color buttons in the remote's own order: red, green, yellow, blu
 - **Audio is mixed from ALL connected sessions** — a backgrounded session keeps playing
   its sound. The client advertises Opus 48k + PCM; gnome-remote-desktop prefers Opus
   (~96kbps per session instead of ~1.4Mbps raw), each session decodes it in-process via
-  libopus on its own worker thread, and the native mixer sums the PCM (per-source jitter
-  prebuffer = `audioPrebufferMs`, saturating sum, ring capacity = the latency cap,
-  ~1.4s). PCM-only servers keep working unchanged; builds with `HELLOLG_WITH_OPUS=OFF`
-  mute Opus sessions with a log.
+  libopus on its own worker thread, and the headless miniaudio graph sums float PCM at
+  48kHz stereo in 480-frame (10ms) blocks. Each session has its own SPSC ring and dynamic
+  converter, so 44.1kHz PCM and 48kHz Opus can play simultaneously. NDL receives paced
+  S16LE from the graph pump. PCM-only servers keep working unchanged; builds with
+  `HELLOLG_WITH_OPUS=OFF` mute Opus sessions with a log.
 - **Audio quality** is a global setting (`audioCodec`, also a pre-connect UI dropdown and
   the `--audio-codec` CLI flag): `auto` (default) lets the server pick Opus; `pcm` offers
   the server PCM only, trading ~1.4Mbps per session for a lossless stream. It applies to
-  connections made after the change. Note grd's PCM is 44.1kHz while Opus decodes at
-  48kHz — with no resampler the mix runs at one rate, so sessions negotiated under the
-  OTHER preference stay muted until they reconnect.
+  connections made after the change. grd's PCM is 44.1kHz while Opus decodes at 48kHz;
+  the per-source converters handle both concurrently without re-pinning the sink.
+- **Adaptive delay is always enabled and has no user control.** Every source starts at
+  60ms, ranges from 40–150ms, and derives its target from a rolling 10s histogram of
+  relative arrival/capture-time variation (`p95 + 20ms`, 5ms buckets). RDPEA timestamp
+  wrap is handled; zero/repeated timestamps fall back to decoded duration. A gap over
+  500ms is a talkspurt boundary and re-primes at least 60ms rather than polluting the
+  jitter estimate. New peaks and underruns raise the target immediately; stable delivery
+  can lower it by at most 10ms per five seconds, never below 40ms.
+- Queue error beyond 10ms changes each source's SRC ratio smoothly, capped at +/-0.5%
+  by a 50ms error, with a slow drift term for mismatched producer/DAC clocks. A backlog
+  over target by 80ms fades out for 5ms, drops old frames to `target + 20ms`, resets the
+  converter, and fades in for 5ms. Underrun inserts silence and re-buffers only that
+  source. The 1.5s ring is an emergency limit, not normal latency; producer overflow
+  requests a consumer-side trim and never moves the consumer cursor.
+- The mixer overlay shows `queue/target ms` above every session. Detailed p95 jitter,
+  SRC ppm, underrun, hard-correction, and overflow counters are logged as one snapshot no
+  more often than every three seconds.
 - A backgrounded session's graphics are paused server-side via TS_SUPPRESS_OUTPUT_PDU.
   Because grd resumes with a delta frame and rejects Refresh Rect, switching back forces
   a fresh IDR by re-submitting the Display Control monitor layout (grd rebuilds its
@@ -99,7 +115,8 @@ the TV remote's color buttons in the remote's own order: red, green, yellow, blu
   luna-send-pub subprocess: fork()ing the app while the NDL/OMX pipeline (re)loads
   races its in-process decoder state (black screens observed live), and a pipe-spawned
   subscriber cannot deliver events anyway (block-buffered stdout, no stdbuf on the TV).
-  Volume-change SUBSCRIPTIONS DO NOT WORK for a dev-mode app on webOS 24 — probed live:
+  Volume-change SUBSCRIPTIONS DO NOT WORK for a dev-mode app on webOS TV Lite
+  (webOS 23 generation, internal release 8.x) — probed live:
   com.webos.audio/getVolume accepts the subscribe but the DYNAMIC service idles out and
   takes it along ("com.webos.audio is not running"; zero events even while alive);
   master/getVolume subscribe → "Message status unknown"; apiadapter (the route external
@@ -115,7 +132,7 @@ the TV remote's color buttons in the remote's own order: red, green, yellow, blu
   first reading after launch is the baseline, so nothing pops at startup. No mouse or
   keyboard input reaches the RDP session while the panel is up; the grab and the
   session's cursor shape come back when it closes. Levels are per launch (not persisted), survive reconnects
-  and codec re-pins, and disconnected slots show dimmed knobs whose level applies once
+  and source format resets, and disconnected slots show dimmed knobs whose level applies once
   they connect. On the RemoteFX RGBA fallback path the overlay cannot be drawn over the
   stream, so the button keeps its old badge-flash behavior there.
 - If the ACTIVE session drops while another one is alive, video auto-switches to a
@@ -151,7 +168,6 @@ Both slots can be configured with the v2 shape (this is also what the app persis
   ],
   "wheelStep": 60,
   "wheelScrollDivisor": 1,
-  "audioPrebufferMs": 60,
   "audioCodec": "auto"
 }
 ```
@@ -169,14 +185,18 @@ Explicit webOS launch params or CLI flags override loaded settings (flat launch/
 target the green slot). Set `HELLOLG_IGNORE_SAVED_CONFIG=1` for a one-off launch that
 ignores saved UI settings.
 
+`audioPrebufferMs` and `--audio-prebuffer-ms` are accepted for one compatibility release,
+ignored, and produce one deprecation warning. Persisted JSON no longer writes the field;
+old value `0` does not disable buffering.
+
 ## Local Build And Test
 
 Targeted local loop:
 
 ```sh
-cc -fsyntax-only -Inative/include \
+cc -fsyntax-only -Inative/include -Ithird_party/miniaudio \
   native/src/main.c native/src/media_ss4s.c native/src/video_ss4s.c \
-  native/src/audio_ss4s.c native/src/audio_mixer.c native/src/audio_opus.c \
+  native/src/audio_ss4s.c native/src/audio_pipeline.c native/src/audio_opus.c \
   native/src/video_rgba_sdl.c native/src/au_snapshot.c \
   native/src/h264_annexb.c native/src/input_sdl.c native/src/cursor_sdl.c \
   native/src/rdp_ffi_stub.c native/src/config_paths.c native/src/settings_json.c
@@ -251,6 +271,20 @@ The native app id is `com.truebest.gnomecast.native`. The native package must co
 native executable and native `appinfo.json`; package verification rejects browser/runtime files such as
 `*.html`, `*.js`, `package.json`, and historical `app/` or `service/` trees.
 
+## Audio Device Acceptance
+
+NDL/ss4s is the selected production sink. Accept it on TV with
+30 minutes of 4K/60 video plus continuous audio, at least two audible sessions, stable
+target returning to no more than 60ms, no underrun for jitter within the current target,
+and recovery from gaps above 150ms without permanent backlog. CPU regression must stay
+within 5 percentage points and RSS within 4MB.
+
+An independent SDL callback sink was considered but is not part of the rollout: retaining
+NDL avoids qualifying a second webOS device path and keeps audio behavior consistent with
+the already proven TV media stack. Do not add an SDL audio sink or a custom NDL `ma_device`
+backend without a new explicit design decision. WSOLA/PLC remains deferred unless the
+current +/-0.5% SRC and rare fade/drop corrections prove insufficient.
+
 ## Triage
 
 - Config failures: verify `native/config.local.json` exists and is readable; do not print it.
@@ -303,9 +337,15 @@ Implemented:
 - Rust `native` feature exporting FFI lifecycle, input symbols, direct TCP/TLS/CredSSP
   worker scaffold, AVC420 callbacks, and native RemoteFX/bitmap callbacks.
 - C FFI stub for local scaffold builds; product webOS builds require the Rust staticlib.
-- Pinned `third_party/ss4s` and `third_party/commons` submodules with provenance and license staging.
+- Pinned `third_party/ss4s`/`commons` submodules and vendored miniaudio 0.11.25 with
+  provenance and license staging.
 - ss4s NDL/SMP hardware-module selection, dummy backend rejection, and H.264 feed boundary.
-- H.264 AVC length-prefixed to Annex-B normalization, including AU size caps.
+- H.264 framing normalization, including AU size caps. NOTE: the wire carries BOTH
+  framings — the nominal RDPEGFX shape is AVC length-prefixed (converted to Annex-B),
+  but gnome-remote-desktop delivers Annex-B outright (passed through). Any code
+  classifying AUs must handle both — use the `h264_annexb.h` scanners, never a
+  hand-rolled parser (a length-prefix-only IDR check once silently killed snapshot
+  switching in the field).
 - Native RGBA surface helper for RemoteFX/bitmap dirty rectangles.
 - CTests for ABI layout, H.264 scanning/conversion/keyframe detection, and input helpers.
 - SDL/webOS fullscreen event loop and input dispatch in product builds.
@@ -319,6 +359,8 @@ Implemented:
   KVM-style input switching, mixed PCM audio from all connected sessions,
   suppress-output backgrounding, Display-Control-based keyframe refresh with a
   reconnect watchdog, v2 persisted settings with legacy fallback.
+- Headless miniaudio float graph with independent source rates, adaptive jitter/drift
+  control, gain/meters, and S16 NDL pump.
 
 Not yet implemented or not yet TV-verified:
 
@@ -327,6 +369,7 @@ Not yet implemented or not yet TV-verified:
 - Multi-RDP on-device verification: color-button scancodes during streaming, switch
   latency, simultaneous audio mix, RSS with two sessions, background session surviving a
   switch (Phase 0 device checks from the multi-RDP plan).
+- Miniaudio/NDL device acceptance described above.
 
 ## Third-Party Provenance
 

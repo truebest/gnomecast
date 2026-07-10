@@ -16,7 +16,7 @@
  * screens (child inherits driver/SVP handles), and a pipe-spawned subscriber cannot
  * deliver events anyway (block-buffered stdout, no stdbuf on the TV). In-process LS2
  * calls carry no fork. Volume-change SUBSCRIPTIONS do not exist for a dev-mode app on
- * webOS 24 — every endpoint was probed live and refused or went dark (the exact dead
+ * this platform — every endpoint was probed live and refused or went dark (the exact dead
  * ends are documented in luna_volume.c) — so callers keep the cache live by polling
  * getVolume: the one-shots are cheap and each call wakes the dozing dynamic service.
  *
@@ -25,9 +25,12 @@
  * volumeUp/Down/setMuted for third parties). If a firmware ever rejects them, the
  * module just stays unavailable and the MASTER fader dims — nothing else breaks.
  *
- * set() coalesces: the loop thread always sends the LATEST requested value, so a fader
- * drag produces a bounded trickle of bus calls. The cache updates optimistically on
- * set() (snappy knob) and authoritatively from get replies. */
+ * set() coalesces with at most ONE call in flight: the newest requested value is sent
+ * when the bus is idle, otherwise it chains from the in-flight call's reply — a fader
+ * drag can never queue a backlog of setVolume calls. The cache updates optimistically
+ * on set() (snappy knob) and authoritatively from getVolume replies ONLY: a set
+ * confirmation echoes an older value whenever sets chain, and writing it back would
+ * visibly yank the knob backward mid-drag. */
 
 typedef struct NativeLunaVolume {
     void *impl; /* transport state (LS2 loop thread on webOS; NULL on host builds) */

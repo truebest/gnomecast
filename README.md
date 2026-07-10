@@ -10,9 +10,11 @@
   Progressive/bitmap decoding in Rust, presented as RGBA through SDL.
 - **Audio**: MS-RDPEA over the `AUDIO_PLAYBACK_DVC` dynamic channel (the transport
   gnome-remote-desktop uses). Opus 48 kHz stereo is negotiated preferentially and
-  hardware-decoded by the TV; 16-bit PCM is the fallback. A configurable jitter prebuffer
-  (0–300 ms slider, default 100 ms) smooths bursty delivery. Audio is strictly best-effort:
-  failures degrade to silent video, never to a dropped session.
+  decoded in-process through libopus; 16-bit PCM is the fallback. A headless miniaudio
+  graph mixes all sessions at 48 kHz stereo and independently resamples 44.1/48 kHz
+  sources. Its always-on adaptive jitter controller tracks burst/HOL delay and clock
+  drift; there is no manual buffer setting. NDL/ss4s remains the PCM sink. Audio is
+  strictly best-effort: failures degrade to silent video, never to a dropped session.
 - **Input**: the USB mouse and keyboard are read straight from the kernel evdev layer
   (`/dev/input`, `EVIOCGRAB`), below the webOS compositor, so physical input reaches the RDP
   server untouched by the TV's SDL/Wayland munging — no synthesized Back on right-click, no
@@ -29,7 +31,7 @@
   cursor plane above the hardware video with zero extra presents. The grabbed mouse drives it
   by warping the OS pointer to the logical position; visibility follows the server's pointer
   state.
-- **Pre-connect UI**: an on-TV LVGL settings screen (host, credentials, fps, audio prebuffer)
+- **Pre-connect UI**: an on-TV LVGL settings screen (host, credentials, fps, audio codec)
   with persisted settings.
 - **Network autodetection**: the client answers connect-time and continuous RTT
   measurements over the MCS message channel — gnome-remote-desktop refuses audio
@@ -119,6 +121,7 @@ browser runtime fallback paths.
 - `docs/build-environment.md` — host and webOS toolchain setup;
 - `docs/audio-rdpsnd-design-notes.md` — audio design record: protocol findings
   (gnome-remote-desktop specifics), codec strategy, and live bring-up gotchas;
+- `docs/future-work.md` — deferred design ideas and their acceptance criteria;
 - `third_party/PROVENANCE.md` and `third_party/IronRDP/PROVENANCE.md` — pinned dependency
   provenance and the IronRDP fork delta.
 
