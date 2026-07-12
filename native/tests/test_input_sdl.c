@@ -221,6 +221,14 @@ static void test_linux_keycode_to_rdp(void) {
         assert(!extended);
     }
 
+    /* A remote center button is semantically the main Enter key. In builds without
+     * the pre-connect HUB it reaches this mapper instead of being intercepted. */
+    scancode = 0xff;
+    extended = true;
+    assert(native_input_linux_keycode_to_rdp(352, &scancode, &extended)); /* KEY_OK */
+    assert(scancode == 0x1c);
+    assert(!extended);
+
     /* E0-extended keys map via the explicit table. */
     struct {
         uint32_t code;
@@ -249,7 +257,7 @@ static void test_linux_keycode_to_rdp(void) {
     }
 
     /* Codes with no RDP scancode: code 0, the extended-range gap (101 = KEY_LINEFEED,
-     * 119 = KEY_PAUSE), and media/consumer keys above the table. */
+     * 119 = KEY_PAUSE), and unrelated media/consumer keys. */
     assert(!native_input_linux_keycode_to_rdp(0, &scancode, &extended));
     assert(!native_input_linux_keycode_to_rdp(101, &scancode, &extended));
     assert(!native_input_linux_keycode_to_rdp(119, &scancode, &extended));

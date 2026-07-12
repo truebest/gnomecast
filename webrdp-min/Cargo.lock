@@ -368,7 +368,7 @@ version = "0.1.1"
 
 [[package]]
 name = "ironrdp-connector"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "ironrdp-core",
  "ironrdp-error",
@@ -381,14 +381,14 @@ dependencies = [
 
 [[package]]
 name = "ironrdp-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ironrdp-error",
 ]
 
 [[package]]
 name = "ironrdp-displaycontrol"
-version = "0.6.0"
+version = "0.8.0"
 dependencies = [
  "ironrdp-core",
  "ironrdp-dvc",
@@ -399,7 +399,7 @@ dependencies = [
 
 [[package]]
 name = "ironrdp-dvc"
-version = "0.6.0"
+version = "0.8.0"
 dependencies = [
  "ironrdp-core",
  "ironrdp-pdu",
@@ -409,7 +409,7 @@ dependencies = [
 
 [[package]]
 name = "ironrdp-egfx"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "bit_field",
  "bitflags",
@@ -426,7 +426,7 @@ version = "0.2.0"
 
 [[package]]
 name = "ironrdp-graphics"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "bit_field",
  "bitflags",
@@ -441,7 +441,7 @@ dependencies = [
 
 [[package]]
 name = "ironrdp-pdu"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "bit_field",
  "bitflags",
@@ -462,7 +462,7 @@ dependencies = [
 
 [[package]]
 name = "ironrdp-rdpsnd"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "bitflags",
  "ironrdp-core",
@@ -473,7 +473,7 @@ dependencies = [
 
 [[package]]
 name = "ironrdp-session"
-version = "0.9.0"
+version = "0.11.0"
 dependencies = [
  "ironrdp-bulk",
  "ironrdp-connector",
@@ -489,7 +489,7 @@ dependencies = [
 
 [[package]]
 name = "ironrdp-svc"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "bitflags",
  "ironrdp-core",

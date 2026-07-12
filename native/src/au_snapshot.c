@@ -6,6 +6,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "clog.h"
+
+clog_define(g_native_log_video, cLogLevelInfo, cLogFlags_Default, "video.snapshot", NULL);
+
 bool native_au_snapshot_arm(NativeAuSnapshot *snap) {
     if (!snap) {
         return false;
@@ -51,7 +55,7 @@ typedef enum NativeAuIdrScan {
 } NativeAuIdrScan;
 
 static NativeAuIdrScan au_snapshot_scan_idr(const uint8_t *data, size_t len) {
-    /* The SAME dual-framing detection the decoder feed runs (video_ss4s.c): the nominal
+    /* The SAME dual-framing detection the decoder adapter runs (ndl_adapter/video_ndl.c): the nominal
      * RDPEGFX shape is AVC length-prefixed, but gnome-remote-desktop delivers Annex-B.
      * Reusing the feed's parsers keeps the invariant "the snapshot seeds exactly from
      * what the decoder can play". */
@@ -79,11 +83,10 @@ bool native_au_snapshot_append(NativeAuSnapshot *snap, const uint8_t *data, size
             static bool logged = false;
             if (!logged) {
                 logged = true;
-                fprintf(stderr,
-                        "[native-snapshot] keyframe AU framing unparseable (len=%zu, head %02x%02x%02x%02x%02x); "
-                        "trusting the transport keyframe flag\n",
-                        len, data[0], len > 1 ? data[1] : 0, len > 2 ? data[2] : 0, len > 3 ? data[3] : 0,
-                        len > 4 ? data[4] : 0);
+                clog(cLogLevelWarning,
+                     "keyframe AU framing unparseable (len=%zu, head %02x%02x%02x%02x%02x); trusting the transport keyframe flag",
+                     len, data[0], len > 1 ? data[1] : 0, len > 2 ? data[2] : 0,
+                     len > 3 ? data[3] : 0, len > 4 ? data[4] : 0);
             }
         }
         /* Only the newest IDR group can seed a decoder; older content is obsolete. */

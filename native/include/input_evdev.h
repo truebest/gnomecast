@@ -30,6 +30,10 @@ typedef struct NativeMouseEv {
 typedef struct NativeKeyboardEv {
     uint16_t code; /* Linux input event code (KEY_*) */
     bool down;     /* press (also autorepeat) vs release */
+    /* True only for a TV-remote virtual node (RCU / LGE Network Input). This
+     * lets app-level remote shortcuts coexist with the same keys on a physical
+     * USB keyboard, which must keep flowing to RDP. */
+    bool from_remote;
 } NativeKeyboardEv;
 
 #define NATIVE_EVDEV_MOUSE_RING 512u
@@ -56,6 +60,7 @@ typedef struct NativeEvdevInput {
 } NativeEvdevInput;
 
 bool native_evdev_input_probe_keyboard(void);
+bool native_evdev_input_probe_mouse(void);
 bool native_evdev_input_start(NativeEvdevInput *input);
 void native_evdev_input_stop(NativeEvdevInput *input);
 bool native_evdev_input_active(const NativeEvdevInput *input);

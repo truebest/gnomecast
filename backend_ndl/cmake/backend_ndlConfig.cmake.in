@@ -1,0 +1,9 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+if(@BACKEND_NDL_ENABLE@)
+  find_dependency(Threads)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/backend_ndlTargets.cmake")
+check_required_components(backend_ndl)

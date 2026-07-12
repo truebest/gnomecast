@@ -2,6 +2,10 @@
 
 #include <string.h>
 
+#include "clog.h"
+
+clog_define(g_native_log_h264, cLogLevelInfo, cLogFlags_Default, "video.h264", NULL);
+
 static uint32_t read_be32(const uint8_t *p) {
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
 }
@@ -19,6 +23,8 @@ static void scan_nal_type(uint8_t nal_header, NativeH264Info *info) {
 
 NativeH264Result native_h264_avc_annexb_size(const uint8_t *data, size_t len, NativeH264Info *info, size_t *out_len) {
     if (!data || !out_len) {
+        clog_limited(cLogLevelWarning, 2, 5000, "invalid AVC scan arguments (data=%s out_len=%s)",
+                     data ? "set" : "NULL", out_len ? "set" : "NULL");
         return NATIVE_H264_INVALID;
     }
 
@@ -30,14 +36,20 @@ NativeH264Result native_h264_avc_annexb_size(const uint8_t *data, size_t len, Na
     size_t pos = 0;
     while (pos < len) {
         if (len - pos < 4) {
+            clog_limited(cLogLevelDebug, 2, 5000, "AVC probe rejected %zu-byte AU: truncated length at offset %zu",
+                         len, pos);
             return NATIVE_H264_INVALID;
         }
         uint32_t nal_len = read_be32(data + pos);
         pos += 4;
         if (nal_len == 0 || nal_len > len - pos) {
+            clog_limited(cLogLevelDebug, 2, 5000,
+                         "AVC probe rejected %zu-byte AU: invalid NAL length %u at offset %zu", len,
+                         (unsigned)nal_len, pos - 4);
             return NATIVE_H264_INVALID;
         }
         if (SIZE_MAX - *out_len < 4 || SIZE_MAX - *out_len - 4 < nal_len) {
+            clog_limited(cLogLevelWarning, 2, 5000, "AVC-to-Annex-B size overflow for %zu-byte AU", len);
             return NATIVE_H264_INVALID;
         }
         scan_nal_type(data[pos], dst_info);
@@ -45,11 +57,16 @@ NativeH264Result native_h264_avc_annexb_size(const uint8_t *data, size_t len, Na
         *out_len += 4 + (size_t)nal_len;
         pos += nal_len;
     }
-    return dst_info->nal_count ? NATIVE_H264_OK : NATIVE_H264_INVALID;
+    if (!dst_info->nal_count) {
+        clog_limited(cLogLevelDebug, 2, 5000, "AVC probe rejected empty access unit");
+        return NATIVE_H264_INVALID;
+    }
+    return NATIVE_H264_OK;
 }
 
 NativeH264Result native_h264_scan_avc(const uint8_t *data, size_t len, NativeH264Info *info) {
     if (!info) {
+        clog_limited(cLogLevelWarning, 2, 5000, "invalid AVC scan arguments (info=NULL)");
         return NATIVE_H264_INVALID;
     }
 
@@ -83,6 +100,8 @@ static bool find_annexb_prefix(const uint8_t *data, size_t len, size_t pos, size
 
 NativeH264Result native_h264_scan_annexb(const uint8_t *data, size_t len, NativeH264Info *info) {
     if (!data || !info) {
+        clog_limited(cLogLevelWarning, 2, 5000, "invalid Annex-B scan arguments (data=%s info=%s)",
+                     data ? "set" : "NULL", info ? "set" : "NULL");
         return NATIVE_H264_INVALID;
     }
 
@@ -107,13 +126,19 @@ NativeH264Result native_h264_scan_annexb(const uint8_t *data, size_t len, Native
         pos = next_prefix_pos;
     }
 
-    return info->nal_count ? NATIVE_H264_OK : NATIVE_H264_INVALID;
+    if (!info->nal_count) {
+        clog_limited(cLogLevelDebug, 2, 5000, "Annex-B probe found no NAL units in %zu-byte AU", len);
+        return NATIVE_H264_INVALID;
+    }
+    return NATIVE_H264_OK;
 }
 
 NativeH264Result native_h264_avc_to_annexb(const uint8_t *data, size_t len, uint8_t *out, size_t out_cap, size_t *out_len) {
     static const uint8_t start_code[4] = {0x00, 0x00, 0x00, 0x01};
 
     if (!data || !out || !out_len) {
+        clog_limited(cLogLevelWarning, 2, 5000, "invalid AVC conversion arguments (data=%s out=%s out_len=%s)",
+                     data ? "set" : "NULL", out ? "set" : "NULL", out_len ? "set" : "NULL");
         return NATIVE_H264_INVALID;
     }
     *out_len = 0;
@@ -124,6 +149,8 @@ NativeH264Result native_h264_avc_to_annexb(const uint8_t *data, size_t len, uint
         return size_result;
     }
     if (needed > out_cap) {
+        clog_limited(cLogLevelWarning, 2, 5000, "AVC conversion needs %zu bytes, output capacity is %zu", needed,
+                     out_cap);
         return NATIVE_H264_OUTPUT_TOO_SMALL;
     }
 

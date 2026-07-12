@@ -6,6 +6,7 @@
 
 #define LV_COLOR_DEPTH 32
 #define LV_COLOR_SCREEN_TRANSP 1
+#define LV_GRADIENT_OPACITY 1
 
 #define LV_MEM_CUSTOM 1
 #define LV_MEM_CUSTOM_INCLUDE <stdlib.h>

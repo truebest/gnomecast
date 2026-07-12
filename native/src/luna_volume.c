@@ -8,6 +8,16 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(HELLOLG_WITH_LS2) && HELLOLG_WITH_LS2
+#include <glib.h>
+#include <luna-service2/lunaservice.h>
+#include <pthread.h>
+#endif
+
+#include "clog.h"
+
+clog_define(g_native_log_luna, cLogLevelInfo, cLogFlags_Default, "luna.volume", NULL);
+
 bool native_luna_volume_parse(const char *json, int *volume, bool *muted) {
     if (!json) {
         return false;
@@ -48,10 +58,6 @@ unsigned native_luna_volume_reply_seq(const NativeLunaVolume *lv) {
 }
 
 #if defined(HELLOLG_WITH_LS2) && HELLOLG_WITH_LS2
-
-#include <glib.h>
-#include <luna-service2/lunaservice.h>
-#include <pthread.h>
 
 typedef struct NativeLunaVolumeImpl {
     NativeLunaVolume *owner;
@@ -153,7 +159,7 @@ static void luna_volume_send_set(NativeLunaVolumeImpl *impl) {
     LSErrorInit(&error);
     if (!LSCallOneReply(impl->handle, "luna://com.webos.audio/setVolume", payload, luna_volume_set_reply_cb, impl,
                         &impl->set_token, &error)) {
-        fprintf(stderr, "[native-luna] setVolume call failed: %s\n", error.message ? error.message : "?");
+        clog(cLogLevelWarning, "setVolume call failed: %s", error.message ? error.message : "?");
         LSErrorFree(&error);
         /* Not in flight; the next set (or the poll) recovers the knob. */
         return;
@@ -210,7 +216,7 @@ static gboolean luna_volume_refresh_cb(gpointer data) {
     LSErrorInit(&error);
     if (!LSCallOneReply(impl->handle, "luna://com.webos.audio/getVolume", "{}", luna_volume_get_reply_cb, impl,
                         &impl->get_token, &error)) {
-        fprintf(stderr, "[native-luna] getVolume call failed: %s\n", error.message ? error.message : "?");
+        clog(cLogLevelWarning, "getVolume call failed: %s", error.message ? error.message : "?");
         LSErrorFree(&error);
         return G_SOURCE_REMOVE;
     }
@@ -235,11 +241,11 @@ static void *luna_volume_thread(void *arg) {
     /* Anonymous client — the ONLY identity the dev-mode jail permits (verified live:
      * a named LSRegister answers "Invalid permissions"). */
     if (!LSRegister(NULL, &impl->handle, &error)) {
-        fprintf(stderr, "[native-luna] LSRegister failed: %s\n", error.message ? error.message : "?");
+        clog(cLogLevelWarning, "LSRegister failed: %s", error.message ? error.message : "?");
         LSErrorFree(&error);
         impl->handle = NULL;
     } else if (!LSGmainAttach(impl->handle, impl->loop, &error)) {
-        fprintf(stderr, "[native-luna] LSGmainAttach failed: %s\n", error.message ? error.message : "?");
+        clog(cLogLevelWarning, "LSGmainAttach failed: %s", error.message ? error.message : "?");
         LSErrorFree(&error);
         LSErrorInit(&error);
         (void)LSUnregister(impl->handle, &error);

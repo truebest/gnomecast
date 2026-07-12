@@ -18,7 +18,17 @@ _Static_assert(RDP_STATE_STOPPED == 9, "RDP_STATE_STOPPED value changed");
 _Static_assert(RDP_AUDIO_CODEC_OPUS == 1, "RDP_AUDIO_CODEC_OPUS value changed");
 _Static_assert(RDP_AUDIO_CODEC_PCM_S16LE == 2, "RDP_AUDIO_CODEC_PCM_S16LE value changed");
 
+_Static_assert(RDP_LOG_TRACE == 0, "RDP_LOG_TRACE value changed");
+_Static_assert(RDP_LOG_DEBUG == 1, "RDP_LOG_DEBUG value changed");
+_Static_assert(RDP_LOG_INFO == 2, "RDP_LOG_INFO value changed");
+_Static_assert(RDP_LOG_NOTICE == 3, "RDP_LOG_NOTICE value changed");
+_Static_assert(RDP_LOG_WARNING == 4, "RDP_LOG_WARNING value changed");
+_Static_assert(RDP_LOG_ERROR == 5, "RDP_LOG_ERROR value changed");
+_Static_assert(RDP_LOG_FATAL == 6, "RDP_LOG_FATAL value changed");
+
 _Static_assert(sizeof(RdpState) == sizeof(int), "RdpState must stay C-int sized for the FFI ABI");
+_Static_assert(sizeof(RdpLogLevel) == sizeof(int),
+               "RdpLogLevel must stay C-int sized for the FFI ABI");
 _Static_assert(sizeof(((RdpConfig *)0)->host) == sizeof(const char *), "RdpConfig.host must be a pointer");
 _Static_assert(sizeof(((RdpConfig *)0)->port) == sizeof(uint16_t), "RdpConfig.port must stay uint16_t");
 _Static_assert(sizeof(((RdpConfig *)0)->width) == sizeof(uint16_t), "RdpConfig.width must stay uint16_t");
@@ -42,16 +52,18 @@ _Static_assert(sizeof(RdpConfig) == 48, "RdpConfig size changed");
 
 _Static_assert(offsetof(RdpCallbacks, ctx) == 0, "RdpCallbacks.ctx offset changed");
 _Static_assert(offsetof(RdpCallbacks, on_state) == 8, "RdpCallbacks.on_state offset changed");
-_Static_assert(offsetof(RdpCallbacks, on_log) == 16, "RdpCallbacks.on_log offset changed");
-_Static_assert(offsetof(RdpCallbacks, on_desktop_size) == 24, "RdpCallbacks.on_desktop_size offset changed");
-_Static_assert(offsetof(RdpCallbacks, on_video_au) == 32, "RdpCallbacks.on_video_au offset changed");
-_Static_assert(offsetof(RdpCallbacks, on_bitmap_update) == 40, "RdpCallbacks.on_bitmap_update offset changed");
-_Static_assert(offsetof(RdpCallbacks, on_audio_format) == 48, "RdpCallbacks.on_audio_format offset changed");
-_Static_assert(offsetof(RdpCallbacks, on_audio_data) == 56, "RdpCallbacks.on_audio_data offset changed");
-_Static_assert(offsetof(RdpCallbacks, on_pointer_bitmap) == 64, "RdpCallbacks.on_pointer_bitmap offset changed");
-_Static_assert(offsetof(RdpCallbacks, on_pointer_position) == 72, "RdpCallbacks.on_pointer_position offset changed");
-_Static_assert(offsetof(RdpCallbacks, on_pointer_state) == 80, "RdpCallbacks.on_pointer_state offset changed");
-_Static_assert(sizeof(RdpCallbacks) == 88, "RdpCallbacks size changed");
+_Static_assert(offsetof(RdpCallbacks, on_log_enabled) == 16,
+               "RdpCallbacks.on_log_enabled offset changed");
+_Static_assert(offsetof(RdpCallbacks, on_log) == 24, "RdpCallbacks.on_log offset changed");
+_Static_assert(offsetof(RdpCallbacks, on_desktop_size) == 32, "RdpCallbacks.on_desktop_size offset changed");
+_Static_assert(offsetof(RdpCallbacks, on_video_au) == 40, "RdpCallbacks.on_video_au offset changed");
+_Static_assert(offsetof(RdpCallbacks, on_bitmap_update) == 48, "RdpCallbacks.on_bitmap_update offset changed");
+_Static_assert(offsetof(RdpCallbacks, on_audio_format) == 56, "RdpCallbacks.on_audio_format offset changed");
+_Static_assert(offsetof(RdpCallbacks, on_audio_data) == 64, "RdpCallbacks.on_audio_data offset changed");
+_Static_assert(offsetof(RdpCallbacks, on_pointer_bitmap) == 72, "RdpCallbacks.on_pointer_bitmap offset changed");
+_Static_assert(offsetof(RdpCallbacks, on_pointer_position) == 80, "RdpCallbacks.on_pointer_position offset changed");
+_Static_assert(offsetof(RdpCallbacks, on_pointer_state) == 88, "RdpCallbacks.on_pointer_state offset changed");
+_Static_assert(sizeof(RdpCallbacks) == 96, "RdpCallbacks size changed");
 #elif UINTPTR_MAX == UINT32_MAX
 _Static_assert(offsetof(RdpConfig, host) == 0, "RdpConfig.host offset changed");
 _Static_assert(offsetof(RdpConfig, port) == 4, "RdpConfig.port offset changed");
@@ -66,16 +78,18 @@ _Static_assert(sizeof(RdpConfig) == 28, "RdpConfig size changed");
 
 _Static_assert(offsetof(RdpCallbacks, ctx) == 0, "RdpCallbacks.ctx offset changed");
 _Static_assert(offsetof(RdpCallbacks, on_state) == 4, "RdpCallbacks.on_state offset changed");
-_Static_assert(offsetof(RdpCallbacks, on_log) == 8, "RdpCallbacks.on_log offset changed");
-_Static_assert(offsetof(RdpCallbacks, on_desktop_size) == 12, "RdpCallbacks.on_desktop_size offset changed");
-_Static_assert(offsetof(RdpCallbacks, on_video_au) == 16, "RdpCallbacks.on_video_au offset changed");
-_Static_assert(offsetof(RdpCallbacks, on_bitmap_update) == 20, "RdpCallbacks.on_bitmap_update offset changed");
-_Static_assert(offsetof(RdpCallbacks, on_audio_format) == 24, "RdpCallbacks.on_audio_format offset changed");
-_Static_assert(offsetof(RdpCallbacks, on_audio_data) == 28, "RdpCallbacks.on_audio_data offset changed");
-_Static_assert(offsetof(RdpCallbacks, on_pointer_bitmap) == 32, "RdpCallbacks.on_pointer_bitmap offset changed");
-_Static_assert(offsetof(RdpCallbacks, on_pointer_position) == 36, "RdpCallbacks.on_pointer_position offset changed");
-_Static_assert(offsetof(RdpCallbacks, on_pointer_state) == 40, "RdpCallbacks.on_pointer_state offset changed");
-_Static_assert(sizeof(RdpCallbacks) == 44, "RdpCallbacks size changed");
+_Static_assert(offsetof(RdpCallbacks, on_log_enabled) == 8,
+               "RdpCallbacks.on_log_enabled offset changed");
+_Static_assert(offsetof(RdpCallbacks, on_log) == 12, "RdpCallbacks.on_log offset changed");
+_Static_assert(offsetof(RdpCallbacks, on_desktop_size) == 16, "RdpCallbacks.on_desktop_size offset changed");
+_Static_assert(offsetof(RdpCallbacks, on_video_au) == 20, "RdpCallbacks.on_video_au offset changed");
+_Static_assert(offsetof(RdpCallbacks, on_bitmap_update) == 24, "RdpCallbacks.on_bitmap_update offset changed");
+_Static_assert(offsetof(RdpCallbacks, on_audio_format) == 28, "RdpCallbacks.on_audio_format offset changed");
+_Static_assert(offsetof(RdpCallbacks, on_audio_data) == 32, "RdpCallbacks.on_audio_data offset changed");
+_Static_assert(offsetof(RdpCallbacks, on_pointer_bitmap) == 36, "RdpCallbacks.on_pointer_bitmap offset changed");
+_Static_assert(offsetof(RdpCallbacks, on_pointer_position) == 40, "RdpCallbacks.on_pointer_position offset changed");
+_Static_assert(offsetof(RdpCallbacks, on_pointer_state) == 44, "RdpCallbacks.on_pointer_state offset changed");
+_Static_assert(sizeof(RdpCallbacks) == 48, "RdpCallbacks size changed");
 #else
 #error "Unsupported pointer width for RDP FFI layout test"
 #endif

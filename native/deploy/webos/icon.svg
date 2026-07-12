@@ -1,48 +1,43 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="200" height="200" viewBox="0 0 200 200">
   <defs>
-    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#5AB6F2"/>
-      <stop offset="100%" stop-color="#1B5FBF"/>
+    <linearGradient id="background" x1="24" y1="18" x2="176" y2="190" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#171b24"/>
+      <stop offset="0.55" stop-color="#0d1016"/>
+      <stop offset="1" stop-color="#07080b"/>
     </linearGradient>
+    <radialGradient id="redGlow" cx="0" cy="0" r="1" gradientTransform="translate(52 117) rotate(4) scale(89 82)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#e94646" stop-opacity="0.23"/>
+      <stop offset="1" stop-color="#e94646" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="blueGlow" cx="0" cy="0" r="1" gradientTransform="translate(153 113) rotate(176) scale(84 79)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#408dea" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#408dea" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="cubeShadow" x="15" y="16" width="170" height="178" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="12" stdDeviation="10" flood-color="#000000" flood-opacity="0.62"/>
+    </filter>
+    <filter id="floorBlur" x="28" y="143" width="144" height="46" filterUnits="userSpaceOnUse">
+      <feGaussianBlur stdDeviation="7"/>
+    </filter>
     <clipPath id="roundedSquare">
-      <rect x="0" y="0" width="200" height="200" rx="38" ry="38"/>
+      <rect width="200" height="200" rx="38"/>
     </clipPath>
   </defs>
 
   <g clip-path="url(#roundedSquare)">
-    <rect x="0" y="0" width="200" height="200" fill="url(#bg)"/>
+    <rect width="200" height="200" fill="url(#background)"/>
+    <rect width="200" height="200" fill="url(#redGlow)"/>
+    <rect width="200" height="200" fill="url(#blueGlow)"/>
 
-    <!-- cast / broadcast arcs, radiating from bottom-right corner -->
-    <g stroke="#FFFFFF" fill="none" stroke-linecap="round">
-      <circle cx="200" cy="200" r="46" stroke-width="9" opacity="0.95"/>
-      <circle cx="200" cy="200" r="70" stroke-width="9" opacity="0.65"/>
-      <circle cx="200" cy="200" r="94" stroke-width="9" opacity="0.35"/>
+    <ellipse cx="100" cy="166" rx="57" ry="9" fill="#000000" fill-opacity="0.5" filter="url(#floorBlur)"/>
+    <g filter="url(#cubeShadow)" stroke="#050609" stroke-opacity="0.5" stroke-width="1.5" stroke-linejoin="round">
+      <!-- Canonical frame from the HTML cube animation: rotateX(-26deg) rotateY(-45deg). -->
+      <path d="M100 31.66 163.64 59.55 100 87.45 36.36 59.55Z" fill="#2a303c"/>
+      <path d="M36.36 59.55 100 87.45 100 168.34 36.36 140.45Z" fill="#e94646"/>
+      <path d="M100 87.45 163.64 59.55 163.64 140.45 100 168.34Z" fill="#408dea"/>
     </g>
-    <circle cx="200" cy="200" r="9" fill="#FFFFFF"/>
+    <path d="M100 32.5 162.7 59.9 100 87.1 37.3 59.9Z" fill="none" stroke="#eef1f7" stroke-opacity="0.13" stroke-width="1.2" stroke-linejoin="round"/>
 
-    <!-- gnome silhouette -->
-    <g>
-      <!-- hat -->
-      <path d="M 100 34
-               C 84 34 60 78 52 100
-               C 74 92 128 92 150 100
-               C 142 78 116 34 100 34 Z"
-            fill="#FFFFFF"/>
-      <circle cx="100" cy="102" r="9" fill="#FFFFFF"/>
-
-      <!-- body / beard -->
-      <path d="M 58 104
-               C 54 132 62 160 100 166
-               C 138 160 146 132 142 104
-               C 118 114 82 114 58 104 Z"
-            fill="#F3F7FC"/>
-
-      <!-- eyes -->
-      <circle cx="86" cy="120" r="5.5" fill="#1B5FBF"/>
-      <circle cx="114" cy="120" r="5.5" fill="#1B5FBF"/>
-
-      <!-- nose -->
-      <circle cx="100" cy="130" r="5" fill="#E8794F"/>
-    </g>
+    <rect x="1" y="1" width="198" height="198" rx="37" fill="none" stroke="#ffffff" stroke-opacity="0.1" stroke-width="2"/>
   </g>
 </svg>

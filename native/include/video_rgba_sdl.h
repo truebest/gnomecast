@@ -18,7 +18,10 @@ typedef enum NativeRgbaResult {
     NATIVE_RGBA_OK = 0,
     NATIVE_RGBA_INVALID = 1,
     NATIVE_RGBA_NOMEM = 2,
-    NATIVE_RGBA_UNSUPPORTED = 3
+    NATIVE_RGBA_UNSUPPORTED = 3,
+    /* The cached frame is still valid, but this draw was skipped while the SDL
+     * texture is recreated after a transient renderer failure. */
+    NATIVE_RGBA_RETRY = 4
 } NativeRgbaResult;
 
 NativeRgbaSurface *native_rgba_surface_open(uint16_t width, uint16_t height);
@@ -31,6 +34,10 @@ uint16_t native_rgba_surface_height(const NativeRgbaSurface *surface);
 int native_rgba_surface_has_frame(const NativeRgbaSurface *surface);
 
 #if defined(HELLOLG_WITH_SDL) && HELLOLG_WITH_SDL
+/* Draws the cached frame into the renderer's window backbuffer without presenting it.
+ * Callers can composite translucent UI in the same backbuffer, then present once. */
+NativeRgbaResult native_rgba_surface_render(NativeRgbaSurface *surface, SDL_Renderer *renderer,
+                                            uint16_t viewport_width, uint16_t viewport_height);
 NativeRgbaResult native_rgba_surface_present(NativeRgbaSurface *surface, SDL_Renderer *renderer, uint16_t viewport_width,
                                              uint16_t viewport_height);
 /* Detaches and returns the surface's SDL texture (if any) without calling any SDL API,

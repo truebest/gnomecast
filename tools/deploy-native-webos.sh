@@ -134,6 +134,9 @@ if not isinstance(config, dict):
     raise SystemExit("config root must be a JSON object")
 
 params = {}
+if isinstance(config.get("name"), str):
+    params["name"] = config["name"]
+
 for key in ("host", "username", "password", "domain"):
     if key not in config:
         continue
@@ -161,7 +164,7 @@ if "relativeMouse" in config:
         raise SystemExit("config field relativeMouse must be a boolean")
     params["relativeMouse"] = value
 
-print(json.dumps(params, separators=(",", ":")))
+print(json.dumps(params, ensure_ascii=False, separators=(",", ":")))
 PY
 )" || fail "failed to prepare launch parameters from $config_path"
 

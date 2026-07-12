@@ -10,9 +10,9 @@
 /* Volume-mixer overlay: one channel per session slot — a dBFS fader (bottom stop = full
  * mute, an unmarked +6 dB headroom above the 0 line) over an L/R pair of live post-fader
  * volume meters. This module owns everything visual: the LVGL screen shown over the
- * punched video plane (preconnect-UI builds; the screen shares the preconnect display)
- * and the raw-SDL fallback panel, plus the dB fader model the input handling in main.c
- * shares. Opening/closing, key routing and the per-slot gain storage stay in main.c. */
+ * punched video plane (preconnect-UI builds; the screen shares the preconnect display),
+ * plus the dB fader model the input handling in main.c shares. Opening/closing, key
+ * routing and the per-slot gain storage stay in main.c. */
 
 /* Fader model: 3 dB steps from -60 (= mute) up to +6; the overlay auto-hides after this
  * long without a key press. Meters: instant attack, steady dB/s release, with a floor
@@ -31,6 +31,17 @@
  * buttons also move. It never touches the app's own mix gains. */
 #define NATIVE_UI_MIXER_CHANNELS (NATIVE_SETTINGS_MAX_SESSIONS + 1)
 #define NATIVE_UI_MIXER_MASTER NATIVE_SETTINGS_MAX_SESSIONS
+/* Every session channel (not the MASTER) carries a console-style M / D / S button row
+ * at the channel bottom; the channel's identity color is a slim stripe inlaid in the
+ * white fader knob.
+ * M (lights red) mutes the channel; S (lights yellow) solos it — while any S is lit
+ * only soloed channels reach the mix, and mute wins on a muted+soloed channel; both are
+ * pointer-only latching buttons with runtime state (never persisted). D (lights blue)
+ * is the notification-duck trigger, always shown relative to the ACTIVE session: lit =
+ * this channel's audio ducks the on-screen session -12 dB. D is inert (extra-dim) on
+ * the active channel itself, toggles by click or by OK/ENTER on a selected background
+ * channel, persists per session (duckTriggers), and re-renders from the new session's
+ * mask on every screen switch. Ducking is opt-in: all masks default to 0. */
 /* One remote VOL press moves the system volume by 3 (observed live) — the fader steps
  * in the same stride so key and fader volumes land on the same grid. */
 #define NATIVE_UI_MIXER_MASTER_STEP_PCT 3
@@ -43,27 +54,20 @@ int32_t native_ui_mixer_gain_db_to_q15(int gain_db);
 #if defined(HELLOLG_WITH_SDL) && HELLOLG_WITH_SDL
 #include <SDL.h>
 
-/* Raw-SDL fallback panel for builds without the LVGL preconnect UI: latch-drawn (the
- * caller repaints on interaction only) rails + capsule knob per channel, tick marks, no
- * meters. Clears the window to the transparent punch and presents one frame. Bit i of
- * `connected_mask` marks slot i's session ACTIVE (bit NATIVE_UI_MIXER_MASTER = system
- * volume known; dimmed otherwise). `master_pct` positions the MASTER knob (0..100;
- * out-of-range clamps to the bottom stop). */
-void native_ui_mixer_draw_fallback(SDL_Renderer *renderer, const int8_t *gain_db, int master_pct, int selected,
-                                   unsigned connected_mask);
-
 #if defined(HELLOLG_WITH_PRECONNECT_UI) && HELLOLG_WITH_PRECONNECT_UI
 
 typedef struct NativeUiMixer NativeUiMixer;
 
 /* Created (and destroyed) by the preconnect UI, whose LVGL display the overlay screen
- * shares — create() picks it up via lv_disp_get_default(), so it must run after that
+ * shares - create() picks it up via lv_disp_get_default(), so it must run after that
  * display is registered. The host must keep the screen texture current across resizes
  * (set_texture); main.c drives show/hide/render via native_preconnect_ui_mixer(). All
- * functions are NULL-tolerant so a failed create degrades to the fallback panel. */
+ * functions are NULL-tolerant; a failed create means the overlay remains unavailable. */
 NativeUiMixer *native_ui_mixer_create(SDL_Renderer *renderer);
 void native_ui_mixer_destroy(NativeUiMixer *mixer);
 void native_ui_mixer_set_texture(NativeUiMixer *mixer, SDL_Texture *texture);
+/* Updates the four source-strip labels from persisted profile names/hosts. */
+void native_ui_mixer_set_profiles(NativeUiMixer *mixer, const NativeSessionConfig *sessions);
 
 /* Loads the overlay screen, remembering the active one to restore on hide, and drops the
  * display background so only the panel paints — the video plane fills the rest. */
@@ -80,17 +84,28 @@ bool native_ui_mixer_active(const NativeUiMixer *mixer);
  * value per SLOT channel and are shown as `queue/target ms` in the channel header,
  * refreshed at ~4 Hz; the MASTER has no queue and shows none. `gain_db` holds
  * NATIVE_SETTINGS_MAX_SESSIONS fader positions; `master_pct` the system volume (0..100,
- * <0 = unknown); `now_ticks` = SDL_GetTicks(). */
+ * <0 = unknown); `now_ticks` = SDL_GetTicks(). `active_slot`/`duck_mask` drive the
+ * color-bar duck buttons: filled = that channel ducks the active session, hollow
+ * outline = it does not (active/MASTER bars always render filled). */
 void native_ui_mixer_render(NativeUiMixer *mixer, const int32_t (*peaks)[2], const unsigned *queue_ms,
                             const unsigned *target_ms, const int8_t *gain_db, int master_pct, int selected,
-                            unsigned connected_mask, uint32_t now_ticks);
+                            unsigned connected_mask, int active_slot, unsigned duck_mask,
+                            unsigned mute_mask, unsigned solo_mask, uint32_t now_ticks);
 
-/* Pointer support (LVGL panel layout; pure arithmetic, window coordinates). hit_test:
- * true when (x,y) lands inside the panel, with *slot the channel under x (or -1 over
- * padding/gaps) and *on_fader whether y is on the fader track (a click there jumps the
- * knob; elsewhere it only selects). fader_db_at: the fader value for y — clamped to the
+/* Pointer support (LVGL floating-console layout; pure arithmetic, window coordinates).
+ * hit_test: true when (x,y) lands inside the rounded console, with *slot the channel (or -1 over
+ * padding/gaps) and *zone the control under (x,y): the fader track (a click there jumps
+ * the knob; elsewhere it only selects), or — in the bottom controls band — the M plate,
+ * the duck switch, or the S plate. fader_db_at: the fader value for y — clamped to the
  * track and snapped onto the 3 dB steps — for click-jump and drag. */
-bool native_ui_mixer_hit_test(int win_w, int win_h, int x, int y, int *slot, bool *on_fader);
+typedef enum NativeUiMixerHit {
+    NATIVE_UI_MIXER_HIT_BODY = 0, /* inside the channel, on no control: select only */
+    NATIVE_UI_MIXER_HIT_FADER,
+    NATIVE_UI_MIXER_HIT_DUCK,
+    NATIVE_UI_MIXER_HIT_MUTE,
+    NATIVE_UI_MIXER_HIT_SOLO,
+} NativeUiMixerHit;
+bool native_ui_mixer_hit_test(int win_w, int win_h, int x, int y, int *slot, NativeUiMixerHit *zone);
 int native_ui_mixer_fader_db_at(int win_h, int y);
 
 /* The MASTER fader value for y: system volume 0..100, clamped to the track (integer

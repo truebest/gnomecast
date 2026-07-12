@@ -5,42 +5,73 @@ of the surrounding code; do not over-engineer.
 
 ## Project
 
-`gnomecast` is a native webOS RDP client for LG TVs that casts a GNOME desktop
-(gnome-remote-desktop) to the TV with hardware-decoded video and native audio. It is a C11/CMake
-shell (`native/`) around a Rust RDP core (`webrdp-min/`), linked through a C ABI
-(`native/include/rdp_ffi.h`).
+`gnomecast` is a native webOS RDP client for LG TVs that casts up to four simultaneous
+GNOME desktops (gnome-remote-desktop) to the TV with hardware-decoded video and native
+mixed audio. It is a C11/CMake shell (`native/`) around a Rust RDP core (`webrdp-min/`),
+linked through a C ABI (`native/include/rdp_ffi.h`).
 
-- **Video**: AVC420/H.264 over RDPEGFX, decoded by the TV hardware video plane via `ss4s`
-  (NDL/SMP). Servers without H.264 fall back to native RemoteFX/bitmap decoding in Rust,
+- **Multi-RDP / HUB**: four RDP session slots map to the remote's red/green/yellow/blue
+  buttons. One slot owns the video plane and KVM-style input at a time; the rest stay
+  connected in the background (graphics suppressed server-side, audio still mixed). The
+  remote's OK button opens the HUB card browser to switch, edit, or connect a slot. See
+  `docs/native-runbook.md` for the full navigation/switching/backgrounding model
+  (deferred switching, IDR-snapshot backgrounding, the audio mixer overlay).
+- **Video**: AVC420/H.264 over RDPEGFX, decoded by the TV hardware video plane via the
+  in-house NDL DirectMedia backend (`backend_ndl`, dlopen of `libNDL_directmedia.so.1`).
+  Servers without H.264 fall back to native RemoteFX/bitmap decoding in Rust,
   presented as RGBA through SDL. If neither native path works, report a terminal native
   error — never fall back to Web/MSE/WebCodecs/RDCleanPath or the removed browser app.
-- **Audio**: MS-RDPEA over `AUDIO_PLAYBACK_DVC`; Opus preferred, 16-bit PCM fallback;
-  strictly best-effort (failures degrade to silent video, never a dropped session).
+- **Audio**: MS-RDPEA over `AUDIO_PLAYBACK_DVC`; Opus preferred, 16-bit PCM fallback; a
+  headless miniaudio engine mixes all connected slots with adaptive jitter/drift control.
+  Strictly best-effort (failures degrade to silent video, never a dropped session).
 - **Input**: the USB mouse and keyboard are read from grabbed `/dev/input` (evdev,
   `EVIOCGRAB`) below the compositor; the SDL path is a fallback for the compositor pointer
   (Magic Remote) only. The grab follows window focus so a webOS overlay (TV menu) stays usable.
 
 Stack: C11 + CMake (native shell, decoder boundary, CTests), Rust 2021 (`webrdp-min`
-`staticlib` + C ABI), pinned git submodules under `third_party/` (IronRDP fork, ss4s,
-commons, LVGL, miniaudio), and the webOS buildroot toolchain + `ares` CLI for packaging.
+`staticlib` + C ABI), pinned git submodules under `third_party/` (IronRDP fork,
+LVGL, miniaudio), and the webOS buildroot toolchain + `ares` CLI for packaging. NDL test
+headers live with the standalone backend under `backend_ndl/tests/support/libndl-media/`;
+libopus builds from the own recipe in `native/cmake/ExternalOPUS.cmake`.
 
 ## Key paths
 
-- `native/src/main.c` — webOS lifecycle, config, RDP callbacks, SDL event loop, presentation.
+- `native/src/main.c` — webOS lifecycle, config, RDP callbacks, SDL event loop, presentation,
+  and the HUB/multi-slot switching state machine.
+- `native/include/ui_host.h`, `ui_slot_palette.h`, `ui_profile_name.h`, `ui_fonts.h` — the
+  HUB card browser: layout/navigation, per-slot color palette, profile name editing, and
+  the pre-generated IBM Plex/JetBrains Mono font data.
 - `native/src/input_evdev.c` / `.h` — unified raw `/dev/input` mouse+keyboard reader (grabbed).
 - `native/src/input_sdl.c` / `.h` — RDP fast-path input: window↔desktop coordinate mapping and
   the Linux-keycode / SDL-scancode → RDP scancode maps.
 - `native/src/cursor_sdl.c` / `.h` — server-driven cursor on the platform cursor plane.
-- `native/src/media_ss4s.c`, `video_ss4s.c`, `audio_ss4s.c` — the shared ss4s player and its
-  video/audio tracks.
-- `native/src/audio_pipeline.c` / `.h` — headless miniaudio graph, per-source adaptive
+- `backend_ndl/` — standalone MIT C11 DirectMedia library: public API, dlopen/symbol table,
+  atomic combined-track state machine, callbacks, host tests, and installable CMake package.
+- `native/include/audio_backend.h`, `media_backend.h`, `video_backend.h` — the adapter
+  interface `ndl_adapter/` implements; a future non-NDL backend would implement these instead.
+- `native/src/ndl_adapter/` (`audio_ndl.c`, `media_ndl.c`, `video_ndl.c`) — gnomecast-specific
+  adapters over `backend_ndl`; own RDP codecs, H.264 framing, keyframe recovery, and
+  best-effort audio.
+- `native/src/au_snapshot.c` / `.h` — compressed-AU snapshot cache used to re-enter a
+  backgrounded session's H.264 delta chain without a visible reconnect (IDR-snapshot
+  backgrounding — see the runbook's Multi-RDP section for the trade-offs).
+- `native/include/clog.h`, `native/src/category_log.c` — file-scoped category logging:
+  one `clog_define(...)` per C file, then lowercase `clog(level, ...)` calls.
+- `native/src/rdp_log.c` / `.h` — bridges Rust/IronRDP tracing events into `clog` as the
+  `rdp.rust` category, across the synchronous FFI callback.
+- `native/src/audio_pipeline.c` / `.h` — headless miniaudio engine, per-source adaptive
   SPSC buffering/resampling, meters, and the NDL PCM pump.
+- `native/src/audio_opus.c` / `.h` — Opus decode for RDP audio sources.
+- `native/src/luna_volume.c` / `.h` — webOS Luna-bus (`luna://com.webos.audio`) system
+  volume bridge for the mixer overlay's MASTER fader; polled, since LS2 volume-change
+  subscriptions do not work for a dev-mode app on this device (see the runbook).
 - `native/src/h264_annexb.c` — H.264 framing scanners/conversion (AVC length-prefixed
   AND Annex-B — grd sends the latter); the only parsers to use for classifying AUs.
 - `native/src/video_rgba_sdl.c` — RemoteFX/bitmap RGBA surface.
 - `native/src/ui_preconnect.c` — on-TV LVGL pre-connect settings screen.
-- `native/src/ui_mixer.c` / `.h` — the volume-mixer overlay: dBFS faders + live L/R meters
-  (LVGL screen on the preconnect display, plus a raw-SDL fallback and the dB gain model).
+- `native/src/ui_mixer.c` / `native/include/ui_mixer.h` — the volume-mixer overlay: dBFS
+  faders + live L/R meters (LVGL screen on the preconnect display, plus a raw-SDL fallback
+  and the dB gain model).
 - `native/include/rdp_ffi.h` — the C↔Rust ABI contract.
 - `webrdp-min/src/native.rs` — Rust native worker / C ABI implementation.
 - `native/CMakeLists.txt` — native target, options, CTests, webOS package.
@@ -56,12 +87,7 @@ reintroduce them.
 Local checks before committing native changes (these mirror CI):
 
 ```sh
-cc -fsyntax-only -Inative/include -Ithird_party/miniaudio \
-  native/src/main.c native/src/media_ss4s.c native/src/video_ss4s.c \
-  native/src/audio_ss4s.c native/src/audio_pipeline.c native/src/audio_opus.c \
-  native/src/video_rgba_sdl.c \
-  native/src/h264_annexb.c native/src/input_sdl.c native/src/cursor_sdl.c native/src/ui_mixer.c \
-  native/src/rdp_ffi_stub.c native/src/config_paths.c native/src/settings_json.c
+./tools/syntax-check-native.sh
 cargo test --manifest-path webrdp-min/Cargo.toml --features native --locked native::tests::
 cmake -S native -B /tmp/gnomecast-native-build && cmake --build /tmp/gnomecast-native-build
 ctest --test-dir /tmp/gnomecast-native-build --output-on-failure
@@ -93,13 +119,25 @@ webOS. Toolchain default
 - Callback byte lifetimes are synchronous — copy `on_video_au` / bitmap bytes before returning
   if you retain them.
 - RDPEGFX AVC data arrives in BOTH framings: nominally length-prefixed H.264, but
-  gnome-remote-desktop delivers Annex-B directly. Feed ss4s Annex-B (convert or pass
-  through); classify AUs only with the `h264_annexb.h` scanners, which handle both.
-- Product webOS builds set `HELLOLG_WITH_SS4S=ON`, `HELLOLG_WITH_SDL=ON`, and
-  `HELLOLG_LINK_RDP_FFI=ON`.
+  gnome-remote-desktop delivers Annex-B directly. Feed the NDL backend Annex-B (convert or
+  pass through); classify AUs only with the `h264_annexb.h` scanners, which handle both.
+- Product webOS builds set `HELLOLG_WITH_NDL=ON`, `HELLOLG_WITH_SDL=ON`, and
+  `HELLOLG_LINK_RDP_FFI=ON`. The binary dlopens `libNDL_directmedia.so.1` at runtime — it
+  must never carry a DT_NEEDED on it (verify_package_root enforces this).
 - C: C11, 4-space indent, small file-local helpers, explicit error returns, ASCII. Native
   symbols use `native_*` / subsystem prefixes; exported ABI symbols use `rdp_*`. Rust: `cargo
   fmt`. Shell: `#!/usr/bin/env bash` + `set -euo pipefail`.
+- Every production C translation unit under `native/src/` uses exactly one file-scoped
+  `clog_define(...)` and at least one `clog(...)` or rate-limited `clog_limited(...)` call.
+  Exceptions are the `category_log.c` logger engine and generated font sources. The standalone
+  `backend_ndl` library keeps its callback logger; the native adapter forwards it as
+  `media.ndl`.
+- Do not bypass `clog` with direct stderr writes, `perror`, `SDL_Log`, Rust `eprintln!`, or a
+  stderr tracing subscriber. Rust logging crosses the synchronous RDP callback bridge as
+  `rdp.rust`. `GNOMECAST_LOG` is the only runtime level control; do not restore
+  `WEBRDP_LOG`, `GNOMECAST_NDL_LOG`, or `/tmp/gnomecast-ndl-debug`.
+- Do not log per-frame, per-pointer-motion, or per-audio-block success. Put noisy diagnostics
+  below `info` and rate-limit repeated hot-path failures with `clog_limited`.
 - Keep generated artifacts out of the repo (`native/config.local.json`, build dirs, logs,
   `*.ipk`).
 
@@ -118,5 +156,6 @@ webOS. Toolchain default
 
 - Do not reintroduce Web/MSE/WebCodecs/RDCleanPath or the deleted browser/Luna trees, and do
   not package `app/` or `service/` into the native target.
-- Do not use dummy/software ss4s video backends for acceptance.
+- Do not substitute a software H.264 decoder for acceptance; the NDL hardware path is
+  required on the TV.
 - Do not log passwords or local config contents.

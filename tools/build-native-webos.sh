@@ -44,6 +44,17 @@ verify_package_root() {
   [[ -f "$root/appinfo.json" ]] || fail "missing appinfo.json in staged package"
   [[ -f "$root/bin/gnomecast-native" ]] || fail "missing bin/gnomecast-native in staged package"
   [[ -f "$root/icon.png" ]] || fail "missing icon.png in staged package"
+  [[ -f "$root/licenses/THIRD_PARTY_PROVENANCE.md" ]] || fail "missing third-party provenance"
+  [[ -f "$root/licenses/IBMPlex-OFL-1.1.txt" ]] || fail "missing IBM Plex OFL notice"
+  [[ -f "$root/licenses/JetBrainsMono-OFL-1.1.txt" ]] || fail "missing JetBrains Mono OFL notice"
+  grep -Fq 'Copyright © 2017 IBM Corp.' "$root/licenses/IBMPlex-OFL-1.1.txt" ||
+    fail "IBM Plex OFL copyright notice is incomplete"
+  grep -Fq 'Copyright 2020 The JetBrains Mono Project Authors' "$root/licenses/JetBrainsMono-OFL-1.1.txt" ||
+    fail "JetBrains Mono OFL copyright notice is incomplete"
+  grep -Fq 'SIL OPEN FONT LICENSE Version 1.1' "$root/licenses/IBMPlex-OFL-1.1.txt" ||
+    fail "IBM Plex OFL text is incomplete"
+  grep -Fq 'SIL OPEN FONT LICENSE Version 1.1' "$root/licenses/JetBrainsMono-OFL-1.1.txt" ||
+    fail "JetBrains Mono OFL text is incomplete"
 
   python3 - "$root/appinfo.json" <<'PY'
 import json
@@ -72,13 +83,12 @@ PY
   if grep -Fq "SDL event loop is not compiled in" < <(strings "$root/bin/gnomecast-native"); then
     fail "native binary was built without SDL; product packages require HELLOLG_WITH_SDL=ON"
   fi
-  [[ -d "$root/lib" ]] || fail "missing lib/ with packaged ss4s hardware modules"
-  [[ -f "$root/lib/ss4s_modules.ini" ]] || fail "missing lib/ss4s_modules.ini"
-  local hardware_module_match
-  hardware_module_match="$(find "$root/lib" -maxdepth 1 -type f \
-    \( -name 'ss4s-ndl-webos5*.so*' -o -name 'ss4s-ndl-webos4*.so*' -o -name 'ss4s-ndl-esplayer*.so*' -o -name 'ss4s-smp-webos*.so*' \) \
-    -print -quit)"
-  [[ -n "$hardware_module_match" ]] || fail "missing allowed ss4s webOS hardware module under lib/"
+  if grep -Fq "NDL backend is not linked" < <(strings "$root/bin/gnomecast-native"); then
+    fail "native binary was built without the NDL backend; product packages require HELLOLG_WITH_NDL=ON"
+  fi
+  if ! grep -Fq "loaded NDL library" < <(strings "$root/bin/gnomecast-native"); then
+    fail "native binary lacks the NDL dlopen marker; HELLOLG_WITH_NDL build expected"
+  fi
 
   for forbidden in app service; do
     [[ ! -e "$root/$forbidden" ]] || fail "forbidden historical runtime tree included: $forbidden/"
@@ -88,16 +98,18 @@ PY
   web_runtime_match="$(find "$root" -type f \( -name '*.html' -o -name '*.js' -o -name 'package.json' \) -print -quit)"
   [[ -z "$web_runtime_match" ]] || fail "web/browser runtime file included: ${web_runtime_match#$root/}"
 
-  local dummy_match
-  dummy_match="$(find "$root" -type f \( -name '*ss4s-dummy*' -o -name '*dummy*' \) -print -quit)"
-  [[ -z "$dummy_match" ]] || fail "dummy/software ss4s backend included: ${dummy_match#$root/}"
-
-  if [[ -d "$root/lib" && -n "$(find "$root/lib" -maxdepth 1 -type f -name 'ss4s-*.so*' -print -quit)" ]]; then
-    command -v readelf >/dev/null 2>&1 || fail "readelf is required to verify ss4s module RUNPATH"
-    local dynamic_tags
-    dynamic_tags="$(readelf -d "$root/bin/gnomecast-native")" || fail "failed to inspect native binary dynamic tags"
+  command -v readelf >/dev/null 2>&1 || fail "readelf is required to verify native binary dynamic tags"
+  local dynamic_tags
+  dynamic_tags="$(readelf -d "$root/bin/gnomecast-native")" || fail "failed to inspect native binary dynamic tags"
+  # The NDL library must be dlopen-ed, never a hard DT_NEEDED: the binary has to
+  # stay loadable when the firmware library is absent (probe log + clean failure).
+  if grep -Eq 'NEEDED.*libNDL_directmedia' <<<"$dynamic_tags"; then
+    fail "native binary must not link libNDL_directmedia directly; backend_ndl dlopens it"
+  fi
+  # The packaged libopus lives in lib/ next to the binary.
+  if [[ -n "$(find "$root/lib" -maxdepth 1 -type f -name 'libopus.so*' -print -quit 2>/dev/null)" ]]; then
     if ! grep -Eq '\((RPATH|RUNPATH)\).*\$ORIGIN/\.\./lib' <<<"$dynamic_tags"; then
-      fail "native binary RUNPATH/RPATH must include \$ORIGIN/../lib so ss4s can dlopen packaged modules"
+      fail "native binary RUNPATH/RPATH must include \$ORIGIN/../lib to find the packaged libopus"
     fi
   fi
 
@@ -146,10 +158,10 @@ if [[ "$skip_build" != "1" ]]; then
   [[ -f "$toolchain" ]] || fail "webOS toolchain file not found: $toolchain (set WEBOS_TOOLCHAIN_FILE=/path/to/toolchainfile.cmake)"
   sdk="$(cd "$(dirname "$toolchain")/../.." && pwd)"
 
-  if [[ ! -f "$repo_root/third_party/IronRDP/Cargo.toml" || ! -f "$repo_root/third_party/ss4s/CMakeLists.txt" ||
-        ! -f "$repo_root/third_party/commons/CMakeLists.txt" || ! -f "$repo_root/third_party/lvgl/CMakeLists.txt" ||
+  if [[ ! -f "$repo_root/third_party/IronRDP/Cargo.toml" ||
+        ! -f "$repo_root/third_party/lvgl/CMakeLists.txt" ||
         ! -f "$repo_root/third_party/miniaudio/miniaudio.c" || ! -f "$repo_root/third_party/miniaudio/miniaudio.h" ]]; then
-    fail "native submodules are not initialized; run: git submodule update --init third_party/IronRDP third_party/ss4s third_party/commons third_party/lvgl third_party/miniaudio"
+    fail "native submodules are not initialized; run: git submodule update --init third_party/IronRDP third_party/lvgl third_party/miniaudio"
   fi
 
   rustup target add "$target"
@@ -164,7 +176,7 @@ if [[ "$skip_build" != "1" ]]; then
     -B "$build_dir" \
     -DCMAKE_TOOLCHAIN_FILE="$toolchain" \
     -DCMAKE_BUILD_TYPE="$build_type" \
-    -DHELLOLG_WITH_SS4S=ON \
+    -DHELLOLG_WITH_NDL=ON \
     -DHELLOLG_WITH_SDL=ON \
     -DHELLOLG_WITH_PRECONNECT_UI=ON \
     -DHELLOLG_LINK_RDP_FFI=ON \

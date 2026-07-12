@@ -11,23 +11,14 @@ mod der;
 pub mod native;
 mod ntlm;
 
+#[cfg(feature = "native")]
 pub(crate) fn init_logging() {
     use std::sync::Once;
+    use tracing_subscriber::prelude::*;
+
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        // stderr is what the webOS shell redirects into the on-TV log file. Protocol
-        // debug traces (per-PDU, per-RTT-ping) are too chatty for normal operation;
-        // opt in with WEBRDP_LOG=debug when triaging.
-        let level = match std::env::var("WEBRDP_LOG").as_deref() {
-            Ok("debug") => tracing::Level::DEBUG,
-            Ok("trace") => tracing::Level::TRACE,
-            _ => tracing::Level::INFO,
-        };
-        let _ = tracing_subscriber::fmt()
-            .with_max_level(level)
-            .without_time()
-            .with_ansi(false)
-            .with_writer(std::io::stderr)
-            .try_init();
+        let subscriber = tracing_subscriber::registry().with(native::CallbackLogLayer);
+        let _ = tracing::subscriber::set_global_default(subscriber);
     });
 }

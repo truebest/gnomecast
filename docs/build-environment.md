@@ -1,114 +1,110 @@
-# Build Environment Setup
+# Build environment
 
-This note is for setting up `gnomecast` on a new machine or container for the native-only webOS target.
+The native webOS build is reproducible through the repository
+[Dockerfile](../Dockerfile). CI uses the prebuilt image pinned in
+[bitbucket-pipelines.yml](../bitbucket-pipelines.yml); those two files are the source of
+truth for tool versions and system dependencies.
 
-## Base Linux Packages
+For package, install, launch, and device-triage procedures, see the
+[native webOS runbook](native-runbook.md).
+
+## Recommended: container build
+
+After initializing the repository dependencies as described below, build the environment
+locally and run the product build from the repository root:
 
 ```sh
-sudo apt install -y git build-essential cmake pkg-config curl
+docker build -t gnomecast-webos-build .
+docker run --rm -v "$PWD:/workspace" -w /workspace \
+  gnomecast-webos-build bash -lc './tools/build-native-webos.sh'
 ```
 
-Required commands:
+The Dockerfile installs the webOS buildroot toolchain, target SDL2 support, a static
+libevdev 1.13.6 in the target sysroot, Rust, Node, and the webOS CLI. CI avoids rebuilding
+that environment on every run by using the public image named in
+`bitbucket-pipelines.yml`.
 
-- `git`
-- `cc`
-- `cmake`
-- `ctest`
-- `pkg-config`
+## Manual host setup
 
-## Node And webOS CLI
-
-Node/npm are used for the webOS CLI, not for product app code.
+The reference environment is Ubuntu 24.04 with these host packages:
 
 ```sh
-curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.5/install.sh | bash
-source ~/.bashrc
-nvm install 22
-nvm use 22
-nvm alias default 22
-npm install -g @webos-tools/cli@3.2.4
+sudo apt update
+sudo apt install -y --no-install-recommends \
+  ca-certificates curl xz-utils tar git openssh-client build-essential \
+  cmake pkg-config python3 file binutils
 ```
 
-Expected commands:
+Install the remaining tools at the versions used by the Dockerfile:
+
+- stable Rust through `rustup`, including `rustfmt`;
+- Rust target `armv7-unknown-linux-gnueabi`;
+- Node.js 20.20.2 and `@webos-tools/cli` 3.2.4;
+- the openlgtv `arm-webos-linux-gnueabi` buildroot SDK used by the Dockerfile;
+- target SDL2 and static libevdev in that SDK's sysroot.
+
+The Rust setup is:
 
 ```sh
-ares-package
-ares-install
-ares-launch
-ares-setup-device
-ares-inspect
-ares-device-info
-```
-
-## Rust
-
-Install Rust through `rustup`:
-
-```sh
+rustup toolchain install stable --profile minimal
 rustup default stable
+rustup component add rustfmt
+rustup target add armv7-unknown-linux-gnueabi
 ```
 
-## Repository Dependencies
-
-From the repository root:
+After installing Node.js 20.20.2:
 
 ```sh
-git submodule update --init third_party/IronRDP third_party/ss4s third_party/commons third_party/lvgl third_party/miniaudio
+npm install -g @webos-tools/cli@3.2.4
+ares-package --version
 ```
 
-Pinned native third-party revisions are recorded in `third_party/PROVENANCE.md`.
-
-Run the local native smoke commands:
-
-```sh
-cc -fsyntax-only -Inative/include -Ithird_party/miniaudio \
-  native/src/main.c native/src/media_ss4s.c native/src/video_ss4s.c \
-  native/src/audio_ss4s.c native/src/audio_pipeline.c native/src/audio_opus.c \
-  native/src/video_rgba_sdl.c \
-  native/src/h264_annexb.c native/src/input_sdl.c native/src/cursor_sdl.c \
-  native/src/rdp_ffi_stub.c native/src/config_paths.c native/src/settings_json.c
-cargo test --manifest-path webrdp-min/Cargo.toml --features native native::tests::
-cmake -S native -B /tmp/gnomecast-native-build
-cmake --build /tmp/gnomecast-native-build
-ctest --test-dir /tmp/gnomecast-native-build --output-on-failure
-```
-
-## webOS Native Cross-Build
-
-The native webOS product cross-build requires:
-
-- webOS buildroot toolchain;
-- SDL2 for the target;
-- initialized `third_party/IronRDP`, `third_party/ss4s`, `third_party/commons`,
-  `third_party/lvgl`, and `third_party/miniaudio`;
-- Rust target support for `armv7-unknown-linux-gnueabi`.
-
-Default toolchain path expected by `tools/build-native-webos.sh`:
+For a manual SDK installation, follow the download, relocation, and libevdev sysroot
+steps in the Dockerfile rather than maintaining a second recipe here. The build helper
+looks for the toolchain file in this order:
 
 ```text
+$WEBOS_TOOLCHAIN_FILE
+$HOME/.local/opt/arm-webos-linux-gnueabi_sdk-buildroot/share/buildroot/toolchainfile.cmake
 /opt/arm-webos-linux-gnueabi_sdk-buildroot/share/buildroot/toolchainfile.cmake
 ```
 
-If installed elsewhere:
+## Repository setup
+
+Initialize the pinned dependencies from the repository root:
+
+```sh
+git submodule update --init third_party/IronRDP third_party/lvgl third_party/miniaudio
+```
+
+Their pinned revisions and licenses are recorded in
+[third-party provenance](../third_party/PROVENANCE.md).
+
+## Verify the setup
+
+Run the canonical local checks from the
+[native webOS runbook](native-runbook.md#local-build-and-test), then complete one full
+cross-build. The host CMake build does not exercise the webOS SDL/LVGL/evdev product
+paths, so it cannot validate the environment by itself.
+
+## webOS cross-build
+
+With the SDK and webOS CLI available, build and package the application with:
+
+```sh
+./tools/build-native-webos.sh
+```
+
+If the SDK is installed elsewhere:
 
 ```sh
 WEBOS_TOOLCHAIN_FILE=/path/to/toolchainfile.cmake ./tools/build-native-webos.sh
 ```
 
-Do not use the generic Rust target `arm-unknown-linux-gnueabi` for TV packages; it can emit legacy CP15 barrier instructions that crash as `Illegal instruction` on ARMv8 webOS.
+The script builds the Rust static library, configures the required NDL/SDL/LVGL/RDP-FFI
+product options, verifies the staged native-only package, and writes the IPK under
+`dist/native-webos/`.
 
-Deploy and launch:
-
-```sh
-ARES_DEVICE=<tv-device> HELLOLG_NATIVE_CONFIG=native/config.local.json \
-  ./tools/deploy-native-webos.sh
-```
-
-## Minimal Local Verification
-
-```sh
-git submodule update --init third_party/IronRDP third_party/ss4s third_party/commons third_party/lvgl third_party/miniaudio
-cmake -S native -B /tmp/gnomecast-native-build
-cmake --build /tmp/gnomecast-native-build
-ctest --test-dir /tmp/gnomecast-native-build --output-on-failure
-```
+Always use the Rust target `armv7-unknown-linux-gnueabi`. The generic
+`arm-unknown-linux-gnueabi` target can emit CP15 barrier instructions that fail with
+`Illegal instruction` on ARMv8 webOS devices, and the build helper rejects it.

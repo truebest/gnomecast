@@ -3,6 +3,10 @@
 #include <stddef.h>
 #include <string.h>
 
+#include "clog.h"
+
+clog_define(g_native_log_input, cLogLevelInfo, cLogFlags_Default, "input.sdl", NULL);
+
 static uint16_t clamp_dimension(uint16_t value) {
     return value == 0 ? 1 : value;
 }
@@ -13,6 +17,7 @@ static bool native_input_ready(const NativeInput *input) {
 
 void native_input_init(NativeInput *input, RdpSession *session, uint16_t desktop_width, uint16_t desktop_height) {
     if (!input) {
+        clog_limited(cLogLevelWarning, 2, 5000, "cannot initialize NULL input state");
         return;
     }
     memset(input, 0, sizeof(*input));
@@ -24,20 +29,29 @@ void native_input_init(NativeInput *input, RdpSession *session, uint16_t desktop
     atomic_init(&input->window_height, 1u);
     native_input_set_desktop_size(input, desktop_width, desktop_height);
     native_input_set_window_size(input, desktop_width, desktop_height);
+    clog(cLogLevelDebug, "initialized SDL input (session=%s desktop=%ux%u)", session ? "set" : "unset",
+         (unsigned)clamp_dimension(desktop_width), (unsigned)clamp_dimension(desktop_height));
 }
 
 void native_input_set_session(NativeInput *input, RdpSession *session) {
     if (!input) {
         return;
     }
+    RdpSession *previous = input->session;
     input->session = session;
+    if (previous != session) {
+        clog(cLogLevelDebug, "SDL input session %s", session ? "attached" : "detached");
+    }
 }
 
 void native_input_set_active(NativeInput *input, bool active) {
     if (!input) {
         return;
     }
-    atomic_store(&input->active, active);
+    bool was_active = atomic_exchange(&input->active, active);
+    if (was_active != active) {
+        clog(cLogLevelDebug, "SDL input %s", active ? "activated" : "deactivated");
+    }
 }
 
 bool native_input_is_active(const NativeInput *input) {
@@ -48,16 +62,26 @@ void native_input_set_desktop_size(NativeInput *input, uint16_t desktop_width, u
     if (!input) {
         return;
     }
-    atomic_store(&input->desktop_width, clamp_dimension(desktop_width));
-    atomic_store(&input->desktop_height, clamp_dimension(desktop_height));
+    uint16_t width = clamp_dimension(desktop_width);
+    uint16_t height = clamp_dimension(desktop_height);
+    unsigned previous_width = atomic_exchange(&input->desktop_width, width);
+    unsigned previous_height = atomic_exchange(&input->desktop_height, height);
+    if (previous_width != width || previous_height != height) {
+        clog(cLogLevelDebug, "desktop input extent=%ux%u", (unsigned)width, (unsigned)height);
+    }
 }
 
 void native_input_set_window_size(NativeInput *input, uint16_t window_width, uint16_t window_height) {
     if (!input) {
         return;
     }
-    atomic_store(&input->window_width, clamp_dimension(window_width));
-    atomic_store(&input->window_height, clamp_dimension(window_height));
+    uint16_t width = clamp_dimension(window_width);
+    uint16_t height = clamp_dimension(window_height);
+    unsigned previous_width = atomic_exchange(&input->window_width, width);
+    unsigned previous_height = atomic_exchange(&input->window_height, height);
+    if (previous_width != width || previous_height != height) {
+        clog(cLogLevelDebug, "window input extent=%ux%u", (unsigned)width, (unsigned)height);
+    }
 }
 
 void native_input_map_point(const NativeInput *input, int window_x, int window_y, uint16_t *rdp_x, uint16_t *rdp_y) {
@@ -221,7 +245,12 @@ bool native_input_linux_keycode_to_rdp(uint32_t code, uint8_t *rdp_scancode, boo
             scancode = 0x5d;
             is_extended = true;
             break;
+        case 352: /* KEY_OK (remote center button) -> main Enter */
+            scancode = 0x1c;
+            break;
         default:
+            clog_limited(cLogLevelTrace, 4, 5000, "no RDP scancode mapping for Linux keycode %u",
+                         (unsigned)code);
             return false;
         }
     }

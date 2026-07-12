@@ -9,8 +9,9 @@
 /* Application settings model + hand-rolled JSON (de)serialization, split out of main.c so
  * the multi-session config logic is host-testable. Two persisted formats are understood:
  *
- *   v2 (written):  { "sessions": [ { "slot": "green", "host": ..., "port": n, "username": ...,
- *                    "password": ..., "domain": ..., "fps": n }, { "slot": "yellow", ... } ],
+ *   current (written): { "sessions": [ { "slot": "green", "name": ..., "host": ..., "port": n,
+ *                    "username": ..., "password": ..., "domain": ..., "fps": n },
+ *                    { "slot": "yellow", ... } ],
  *                    "wheelStep": n, "wheelScrollDivisor": n, "audioCodec": "auto" }
  *   legacy (read): the old flat single-session object (host/port/username/password/domain/
  *                  fps/wheelStep/...) — applied to the green slot.
@@ -28,13 +29,25 @@
 #define NATIVE_SESSION_SLOT_YELLOW 2
 #define NATIVE_SESSION_SLOT_BLUE 3
 
+/* Highest valid duck_mask value: every other slot ducks this one (own bit ignored). */
+#define NATIVE_SETTINGS_DUCK_MASK_ALL ((1u << NATIVE_SETTINGS_MAX_SESSIONS) - 1u)
+
 typedef struct NativeSessionConfig {
+    /* Optional human-facing profile label. Empty keeps the color/host fallback used by
+     * callers and by settings written before the field was introduced. */
+    char name[NATIVE_SETTINGS_STRING_MAX];
     char host[NATIVE_SETTINGS_STRING_MAX];
     char username[NATIVE_SETTINGS_STRING_MAX];
     char password[NATIVE_SETTINGS_STRING_MAX];
     char domain[NATIVE_SETTINGS_STRING_MAX];
     uint16_t port;
     uint16_t fps;
+    /* Which slots' audio ducks THIS session -12 dB while it is on screen ("duckTriggers"
+     * JSON key, bit = slot index, own bit ignored; default: nobody — ducking is opt-in).
+     * Toggled from the mixer overlay's channel color-bar buttons, shown relative to the
+     * active session. (Renamed from a short-lived "duckMask" key whose builds wrote an
+     * all-on default; the old key is deliberately ignored so those masks reset.) */
+    uint16_t duck_mask;
 } NativeSessionConfig;
 
 /* Global audio codec preference ("audioCodec" JSON key). AUTO advertises Opus+PCM and
@@ -74,12 +87,12 @@ int native_json_read_bool(const char *json, const char *key, bool *out);
 bool native_settings_json_has_rdp_key(const char *json);
 
 /* Applies a JSON document over *settings (unknown keys ignored, absent keys keep their
- * current values). Auto-detects the v2 "sessions" array vs the legacy flat object; flat
+ * current values). Auto-detects the "sessions" array format vs the legacy flat object; flat
  * documents apply to the green slot. Returns false (settings untouched) on malformed
  * values; `source` is used for error logging. */
 bool native_settings_apply_json(NativeSettings *settings, const char *json, const char *source);
 
-/* Serializes v2 JSON to an open stream. Returns false on write error. */
+/* Serializes the current session-array JSON to an open stream. Returns false on write error. */
 bool native_settings_write_json(const NativeSettings *settings, FILE *file);
 
 /* Atomic save (0600 temp file + rename), mirroring the old persisted-config writer. */

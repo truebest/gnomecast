@@ -18,6 +18,10 @@
 #define HELLOLG_CURSOR_HAVE_WEBOS_VISIBILITY 0
 #endif
 
+#include "clog.h"
+
+clog_define(g_native_log_cursor, cLogLevelInfo, cLogFlags_Default, "cursor", NULL);
+
 _Static_assert(NATIVE_CURSOR_HIDDEN == RDP_POINTER_STATE_HIDDEN,
                "NATIVE_CURSOR_HIDDEN must match the FFI constant");
 _Static_assert(NATIVE_CURSOR_DEFAULT == RDP_POINTER_STATE_DEFAULT,
@@ -233,10 +237,10 @@ void native_cursor_scaled_geometry(uint16_t shape_w, uint16_t shape_h, uint16_t 
 static void native_cursor_log_state(uint32_t state) {
     static unsigned log_count = 0;
     if (log_count < 8) {
-        fprintf(stderr, "[native-cursor] server pointer %s\n",
-                state == NATIVE_CURSOR_HIDDEN ? "hidden" : "default");
+        clog(cLogLevelDebug, "server pointer %s",
+             state == NATIVE_CURSOR_HIDDEN ? "hidden" : "default");
     } else if (log_count == 8) {
-        fprintf(stderr, "[native-cursor] further pointer state logs suppressed\n");
+        clog(cLogLevelDebug, "further pointer state logs suppressed");
     }
     log_count++;
 }
@@ -305,14 +309,17 @@ static void native_cursor_apply_shape(NativeCursor *cursor, uint8_t *rgba, uint1
         cursor->cursor = sdl_cursor;
         native_cursor_set_visible(cursor, true);
         if (log_count < 8) {
-            fprintf(stderr, "[native-cursor] server cursor %ux%u hotspot %u,%u", (unsigned)width,
-                    (unsigned)height, (unsigned)hot_x, (unsigned)hot_y);
             if (pixels == scaled) {
-                fprintf(stderr, " (scaled to %ux%u)", (unsigned)dst_w, (unsigned)dst_h);
+                clog(cLogLevelDebug,
+                     "server cursor %ux%u hotspot %u,%u (scaled to %ux%u)", (unsigned)width,
+                     (unsigned)height, (unsigned)hot_x, (unsigned)hot_y, (unsigned)dst_w,
+                     (unsigned)dst_h);
+            } else {
+                clog(cLogLevelDebug, "server cursor %ux%u hotspot %u,%u", (unsigned)width,
+                     (unsigned)height, (unsigned)hot_x, (unsigned)hot_y);
             }
-            fputc('\n', stderr);
         } else if (log_count == 8) {
-            fprintf(stderr, "[native-cursor] further cursor shape logs suppressed\n");
+            clog(cLogLevelDebug, "further cursor shape logs suppressed");
         }
         log_count++;
     } else {
@@ -330,7 +337,7 @@ static void native_cursor_apply_shape(NativeCursor *cursor, uint8_t *rgba, uint1
         native_cursor_set_visible(cursor, true);
         if (!cursor->color_cursor_unavailable) {
             cursor->color_cursor_unavailable = true;
-            fprintf(stderr, "[native-cursor] color cursor unavailable: %s\n", SDL_GetError());
+            clog(cLogLevelWarning, "color cursor unavailable: %s", SDL_GetError());
         }
     }
     if (surface) {

@@ -15,6 +15,10 @@
 
 #include "config_paths.h"
 
+#include "clog.h"
+
+clog_define(g_native_log_config, cLogLevelInfo, cLogFlags_Default, "config.settings", NULL);
+
 const char *native_session_slot_name(int slot) {
     switch (slot) {
     case NATIVE_SESSION_SLOT_RED:
@@ -35,6 +39,7 @@ void native_settings_defaults(NativeSettings *settings) {
     for (int i = 0; i < NATIVE_SETTINGS_MAX_SESSIONS; i++) {
         settings->sessions[i].port = 3389;
         settings->sessions[i].fps = 60;
+        settings->sessions[i].duck_mask = 0; /* ducking is opt-in, per channel */
     }
     (void)snprintf(settings->sessions[NATIVE_SESSION_SLOT_GREEN].host,
                    sizeof(settings->sessions[NATIVE_SESSION_SLOT_GREEN].host), "127.0.0.1");
@@ -48,8 +53,8 @@ void native_settings_defaults(NativeSettings *settings) {
 void native_settings_warn_deprecated_audio_prebuffer(void) {
     static bool warned;
     if (!warned) {
-        fprintf(stderr,
-                "[native-audio] audioPrebufferMs/--audio-prebuffer-ms is deprecated and ignored; adaptive buffering is always enabled\n");
+        clog(cLogLevelWarning,
+             "audioPrebufferMs/--audio-prebuffer-ms is deprecated and ignored; adaptive buffering is always enabled");
         warned = true;
     }
 }
@@ -199,10 +204,26 @@ int native_json_read_bool(const char *json, const char *key, bool *out) {
 static bool apply_json_string(const char *json, const char *key, char *dest, size_t cap, const char *source) {
     int result = native_json_read_string(json, key, dest, cap);
     if (result < 0) {
-        fprintf(stderr, "[native] invalid string value for config field %s in %s\n", key, source);
+        clog(cLogLevelError, "invalid string value for config field %s in %s", key, source);
         return false;
     }
     return true;
+}
+
+/* "name" used to be an unknown field in flat config and webOS launch JSON. Keep
+ * non-string values compatible with those documents instead of rejecting all of
+ * their otherwise valid RDP settings. A string is an intentional profile label and
+ * remains strictly validated (including its length and JSON escapes). */
+static bool apply_session_name_json(NativeSessionConfig *session, const char *json, const char *source) {
+    const char *value = native_json_find_value(json, "name");
+    if (!value) {
+        return true;
+    }
+    if (*value != '"') {
+        clog(cLogLevelWarning, "ignoring non-string config field name in %s", source);
+        return true;
+    }
+    return apply_json_string(json, "name", session->name, sizeof(session->name), source);
 }
 
 static bool apply_json_u16(const char *json, const char *key, uint16_t min_value, uint16_t max_value, uint16_t *dest,
@@ -210,7 +231,7 @@ static bool apply_json_u16(const char *json, const char *key, uint16_t min_value
     uint16_t value = 0;
     int result = native_json_read_u16(json, key, min_value, max_value, &value);
     if (result < 0) {
-        fprintf(stderr, "[native] invalid numeric value for config field %s in %s\n", key, source);
+        clog(cLogLevelError, "invalid numeric value for config field %s in %s", key, source);
         return false;
     }
     if (result > 0) {
@@ -219,14 +240,16 @@ static bool apply_json_u16(const char *json, const char *key, uint16_t min_value
     return true;
 }
 
-/* Session-object fields shared by the legacy flat format and the v2 array entries. */
+/* Session-object fields shared by the legacy flat format and session-array entries. */
 static bool apply_session_json(NativeSessionConfig *session, const char *json, const char *source) {
-    return apply_json_string(json, "host", session->host, sizeof(session->host), source) &&
+    return apply_session_name_json(session, json, source) &&
+           apply_json_string(json, "host", session->host, sizeof(session->host), source) &&
            apply_json_string(json, "username", session->username, sizeof(session->username), source) &&
            apply_json_string(json, "password", session->password, sizeof(session->password), source) &&
            apply_json_string(json, "domain", session->domain, sizeof(session->domain), source) &&
            apply_json_u16(json, "port", 1, UINT16_MAX, &session->port, source) &&
-           apply_json_u16(json, "fps", 1, 240, &session->fps, source);
+           apply_json_u16(json, "fps", 1, 240, &session->fps, source) &&
+           apply_json_u16(json, "duckTriggers", 0, NATIVE_SETTINGS_DUCK_MASK_ALL, &session->duck_mask, source);
 }
 
 static bool apply_audio_codec_json(NativeSettings *settings, const char *json, const char *source) {
@@ -245,7 +268,7 @@ static bool apply_audio_codec_json(NativeSettings *settings, const char *json, c
             return true;
         }
     }
-    fprintf(stderr, "[native] invalid value for config field audioCodec in %s\n", source);
+    clog(cLogLevelError, "invalid value for config field audioCodec in %s", source);
     return false;
 }
 
@@ -253,7 +276,7 @@ static bool apply_global_json(NativeSettings *settings, const char *json, const 
     uint16_t ignored_prebuffer = 0;
     int deprecated = native_json_read_u16(json, "audioPrebufferMs", 0, 1000, &ignored_prebuffer);
     if (deprecated < 0) {
-        fprintf(stderr, "[native] invalid value for deprecated config field audioPrebufferMs in %s\n", source);
+        clog(cLogLevelError, "invalid value for deprecated config field audioPrebufferMs in %s", source);
         return false;
     }
     if (deprecated > 0) {
@@ -358,13 +381,13 @@ static bool apply_sessions_array(NativeSettings *settings, const char *json, con
             return true; /* clean end of array (possibly empty) */
         }
         if (found < 0) {
-            fprintf(stderr, "[native] malformed sessions array in %s\n", source);
+            clog(cLogLevelError, "malformed sessions array in %s", source);
             return false;
         }
 
         char *object_json = (char *)malloc(len + 1);
         if (!object_json) {
-            fprintf(stderr, "[native] failed to allocate session config buffer for %s\n", source);
+            clog(cLogLevelError, "failed to allocate session config buffer for %s", source);
             return false;
         }
         memcpy(object_json, start, len);
@@ -375,7 +398,7 @@ static bool apply_sessions_array(NativeSettings *settings, const char *json, con
         if (slot >= 0) {
             ok = apply_session_json(&settings->sessions[slot], object_json, source);
         } else {
-            fprintf(stderr, "[native] ignoring session entry %zu with unknown slot in %s\n", index, source);
+            clog(cLogLevelWarning, "ignoring session entry %zu with unknown slot in %s", index, source);
         }
         free(object_json);
         if (!ok) {
@@ -385,16 +408,20 @@ static bool apply_sessions_array(NativeSettings *settings, const char *json, con
 }
 
 bool native_settings_json_has_rdp_key(const char *json) {
-    static const char *keys[] = {"sessions", "host",      "username",           "password",
-                                 "domain",   "port",      "width",              "height",
-                                 "fps",      "wheelStep", "wheelScrollDivisor", "audioPrebufferMs",
-                                 "audioCodec"};
+    static const char *keys[] = {"sessions",          "host",       "username",   "password",
+                                 "domain",            "port",       "width",      "height",
+                                 "fps",               "wheelStep",  "wheelScrollDivisor",
+                                 "audioPrebufferMs", "audioCodec", "duckTriggers"};
     for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
         if (native_json_find_value(json, keys[i])) {
             return true;
         }
     }
-    return false;
+    /* `name` is common application metadata in legacy launch documents. Only a
+     * string denotes the newer profile-label setting; non-string values retain the
+     * old behavior of an ignored unknown field. */
+    const char *name = native_json_find_value(json, "name");
+    return name && *name == '"';
 }
 
 bool native_settings_apply_json(NativeSettings *settings, const char *json, const char *source) {
@@ -405,11 +432,11 @@ bool native_settings_apply_json(NativeSettings *settings, const char *json, cons
         /* "sessions" present but not an array (typo, null, truncated document): treat as
          * malformed rather than silently falling back to the legacy parser — a corrupt
          * higher-priority persisted file must not mask valid lower-priority candidates. */
-        fprintf(stderr, "[native] malformed 'sessions' value (not an array) in %s\n", source);
+        clog(cLogLevelError, "malformed 'sessions' value (not an array) in %s", source);
         return false;
     }
     if (sessions_value) {
-        /* v2: per-slot objects + top-level globals. Top-level legacy keys are ignored on
+        /* Session-array format: per-slot objects + top-level globals. Top-level legacy keys are ignored on
          * purpose — the flat lookup is substring-based and would otherwise read the first
          * slot object's fields. */
         if (!apply_sessions_array(&updated, json, source) || !apply_global_json(&updated, json, source)) {
@@ -489,11 +516,15 @@ static bool write_json_string(FILE *file, const char *value) {
 }
 
 static bool write_session_json(const NativeSessionConfig *session, int slot, FILE *file) {
-    return fprintf(file, "    { \"slot\": \"%s\", \"host\": ", native_session_slot_name(slot)) >= 0 &&
-           write_json_string(file, session->host) && fprintf(file, ", \"port\": %u, \"username\": ", (unsigned)session->port) >= 0 &&
+    return fprintf(file, "    { \"slot\": \"%s\", \"name\": ", native_session_slot_name(slot)) >= 0 &&
+           write_json_string(file, session->name) && fprintf(file, ", \"host\": ") >= 0 &&
+           write_json_string(file, session->host) &&
+           fprintf(file, ", \"port\": %u, \"username\": ", (unsigned)session->port) >= 0 &&
            write_json_string(file, session->username) && fprintf(file, ", \"password\": ") >= 0 &&
            write_json_string(file, session->password) && fprintf(file, ", \"domain\": ") >= 0 &&
-           write_json_string(file, session->domain) && fprintf(file, ", \"fps\": %u }", (unsigned)session->fps) >= 0;
+           write_json_string(file, session->domain) &&
+           fprintf(file, ", \"fps\": %u, \"duckTriggers\": %u }", (unsigned)session->fps,
+                   (unsigned)session->duck_mask) >= 0;
 }
 
 bool native_settings_write_json(const NativeSettings *settings, FILE *file) {
@@ -519,7 +550,7 @@ bool native_settings_save_file(const NativeSettings *settings, const char *path)
     char temp_path[NATIVE_PERSISTED_CONFIG_PATH_MAX + 16u];
     int n = snprintf(temp_path, sizeof(temp_path), "%s.tmp", path);
     if (n <= 0 || (size_t)n >= sizeof(temp_path)) {
-        fprintf(stderr, "[native] persisted config path is too long\n");
+        clog(cLogLevelError, "persisted config path is too long");
         return false;
     }
 
@@ -531,14 +562,14 @@ bool native_settings_save_file(const NativeSettings *settings, const char *path)
     (void)unlink(temp_path);
     int temp_fd = open(temp_path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, S_IRUSR | S_IWUSR);
     if (temp_fd < 0) {
-        fprintf(stderr, "[native] failed to create persisted config temp file %s for write: %s\n", temp_path,
-                strerror(errno));
+        clog(cLogLevelError, "failed to create persisted config temp file %s for write: %s", temp_path,
+             strerror(errno));
         return false;
     }
     FILE *file = fdopen(temp_fd, "wb");
     if (!file) {
-        fprintf(stderr, "[native] failed to open persisted config temp file %s for write: %s\n", temp_path,
-                strerror(errno));
+        clog(cLogLevelError, "failed to open persisted config temp file %s for write: %s", temp_path,
+             strerror(errno));
         close(temp_fd);
         (void)unlink(temp_path);
         return false;
@@ -550,15 +581,15 @@ bool native_settings_save_file(const NativeSettings *settings, const char *path)
     }
     if (!ok) {
         remove(temp_path);
-        fprintf(stderr, "[native] failed to write persisted config\n");
+        clog(cLogLevelError, "failed to write persisted config");
         return false;
     }
     if (rename(temp_path, path) != 0) {
         remove(temp_path);
-        fprintf(stderr, "[native] failed to replace persisted config: %s\n", strerror(errno));
+        clog(cLogLevelError, "failed to replace persisted config: %s", strerror(errno));
         return false;
     }
 
-    fprintf(stderr, "[native] saved persisted config: %s\n", path);
+    clog(cLogLevelInfo, "saved persisted config: %s", path);
     return true;
 }

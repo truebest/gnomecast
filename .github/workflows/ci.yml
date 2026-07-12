@@ -35,11 +35,7 @@ jobs:
           cargo test --manifest-path webrdp-min/Cargo.toml --features native --locked native::tests::
 
       - name: Native C syntax check
-        run: |
-          cc -fsyntax-only -Inative/include \
-            native/src/main.c native/src/media_ss4s.c native/src/video_ss4s.c \
-            native/src/audio_ss4s.c native/src/video_rgba_sdl.c native/src/ui_mixer.c \
-            native/src/h264_annexb.c native/src/input_sdl.c native/src/rdp_ffi_stub.c
+        run: ./tools/syntax-check-native.sh
 
       - name: Native CMake build and ctest
         run: |

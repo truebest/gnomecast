@@ -5,18 +5,22 @@
 //! AVC420/H.264 EGFX for ss4s hardware decode, and also forwards native RemoteFX/bitmap
 //! RGBA updates for servers that cannot provide H.264.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::{c_char, CStr, CString};
+use std::fmt;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use ironrdp_connector::connection_activation::ConnectionActivationState;
+use ironrdp_connector::connection_activation::{
+    ConnectionActivationFactory, ConnectionActivationState,
+};
 use ironrdp_connector::{
     ClientConnector, ClientConnectorState, Config, ConnectionResult, Credentials, DesktopSize,
     Sequence as _,
@@ -49,7 +53,7 @@ use ironrdp_pdu::rdp::suppress_output::SuppressOutputPdu;
 use ironrdp_pdu::PduResult;
 use ironrdp_rdpsnd::pdu as sndpdu;
 use ironrdp_session::image::DecodedImage;
-use ironrdp_session::{fast_path, ActiveStage, ActiveStageOutput};
+use ironrdp_session::{fast_path, ActiveStage, ActiveStageBuilder, ActiveStageOutput};
 use x509_cert::der::Decode as _;
 
 use crate::credssp::CredsspClient;
@@ -83,6 +87,19 @@ pub enum RdpState {
     Stopped = 9,
 }
 
+/// Values shared with the `RdpLogLevel` enum in native/include/rdp_ffi.h.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RdpLogLevel {
+    Trace = 0,
+    Debug = 1,
+    Info = 2,
+    Notice = 3,
+    Warning = 4,
+    Error = 5,
+    Fatal = 6,
+}
+
 #[repr(C)]
 pub struct RdpConfig {
     pub host: *const c_char,
@@ -103,7 +120,10 @@ pub struct RdpConfig {
 pub struct RdpCallbacks {
     pub ctx: *mut core::ffi::c_void,
     pub on_state: Option<extern "C" fn(*mut core::ffi::c_void, RdpState, *const c_char)>,
-    pub on_log: Option<extern "C" fn(*mut core::ffi::c_void, *const c_char)>,
+    pub on_log_enabled:
+        Option<extern "C" fn(*mut core::ffi::c_void, RdpLogLevel, *const c_char) -> bool>,
+    pub on_log:
+        Option<extern "C" fn(*mut core::ffi::c_void, RdpLogLevel, *const c_char, *const c_char)>,
     pub on_desktop_size: Option<extern "C" fn(*mut core::ffi::c_void, u16, u16)>,
     pub on_video_au: Option<extern "C" fn(*mut core::ffi::c_void, *const u8, usize, bool, u64)>,
     pub on_bitmap_update: Option<
@@ -153,17 +173,225 @@ struct CallbackSink {
     callbacks: RdpCallbacks,
 }
 
+const LOG_TARGET_TRANSPORT: &str = "webrdp.transport";
+const LOG_TARGET_SESSION: &str = "webrdp.session";
+const LOG_TARGET_GRAPHICS: &str = "webrdp.graphics";
+const LOG_TARGET_AUDIO: &str = "webrdp.audio";
+
+thread_local! {
+    static CURRENT_CALLBACK_SINK: Cell<Option<CallbackSink>> = const { Cell::new(None) };
+}
+
+struct CallbackSinkGuard {
+    previous: Option<CallbackSink>,
+}
+
+impl CallbackSinkGuard {
+    fn enter(sink: CallbackSink) -> Self {
+        raise_level_ceiling(&sink);
+        Self {
+            previous: CURRENT_CALLBACK_SINK.with(|current| current.replace(Some(sink))),
+        }
+    }
+}
+
+impl Drop for CallbackSinkGuard {
+    fn drop(&mut self) {
+        CURRENT_CALLBACK_SINK.with(|current| current.set(self.previous));
+    }
+}
+
+fn current_callback_sink() -> Option<CallbackSink> {
+    CURRENT_CALLBACK_SINK.with(Cell::get)
+}
+
+/// Most verbose level any callback sink has ever reported deliverable, as a rank
+/// (0 = none, 1 = error … 5 = trace). Levels above the ceiling are pruned at the
+/// callsite instead of paying a per-event FFI check. Raise-only: the C level
+/// configuration is fixed at launch (GNOMECAST_LOG), so a scope-entry probe is
+/// exact, and a sink below the ceiling still rejects its own events in `enabled`.
+static MAX_SINK_LEVEL_RANK: AtomicU8 = AtomicU8::new(0);
+
+/// Probe target for `on_log_enabled`; the C side must answer target-independently
+/// (true if any target could want the level) for the ceiling to be sound.
+const LEVEL_PROBE_TARGET: &str = "webrdp";
+
+fn rdp_level_rank(level: RdpLogLevel) -> u8 {
+    match level {
+        RdpLogLevel::Trace => 5,
+        RdpLogLevel::Debug => 4,
+        RdpLogLevel::Info | RdpLogLevel::Notice => 3,
+        RdpLogLevel::Warning => 2,
+        RdpLogLevel::Error | RdpLogLevel::Fatal => 1,
+    }
+}
+
+fn level_filter_for_rank(rank: u8) -> tracing::level_filters::LevelFilter {
+    use tracing::level_filters::LevelFilter;
+
+    match rank {
+        0 => LevelFilter::OFF,
+        1 => LevelFilter::ERROR,
+        2 => LevelFilter::WARN,
+        3 => LevelFilter::INFO,
+        4 => LevelFilter::DEBUG,
+        _ => LevelFilter::TRACE,
+    }
+}
+
+fn probe_sink_level_rank(sink: &CallbackSink) -> u8 {
+    const PROBE_LEVELS: [RdpLogLevel; 5] = [
+        RdpLogLevel::Trace,
+        RdpLogLevel::Debug,
+        RdpLogLevel::Info,
+        RdpLogLevel::Warning,
+        RdpLogLevel::Error,
+    ];
+    PROBE_LEVELS
+        .into_iter()
+        .filter(|&level| sink.log_enabled(level, LEVEL_PROBE_TARGET))
+        .map(rdp_level_rank)
+        .max()
+        .unwrap_or(0)
+}
+
+fn raise_level_ceiling(sink: &CallbackSink) {
+    let rank = probe_sink_level_rank(sink);
+    let previous = MAX_SINK_LEVEL_RANK.fetch_max(rank, Ordering::AcqRel);
+    let observed_ceiling = previous.max(rank);
+    let raised_ceiling = rank > previous;
+
+    // A newly raised ceiling always requires rebuilding cached Interest values. The
+    // winning fetch_max thread may still be doing that work when another worker sees
+    // the new rank: tracing-core publishes LevelFilter::current() only at the end of
+    // a rebuild, so that observer must perform its own idempotent rebuild while the
+    // published filter lags. Returning from scope entry is therefore the
+    // synchronization point for the first events emitted by the worker.
+    if raised_ceiling
+        || tracing::level_filters::LevelFilter::current() < level_filter_for_rank(observed_ceiling)
+    {
+        tracing::callsite::rebuild_interest_cache();
+    }
+}
+
+fn tracing_log_level(level: &tracing::Level) -> RdpLogLevel {
+    if *level == tracing::Level::ERROR {
+        RdpLogLevel::Error
+    } else if *level == tracing::Level::WARN {
+        RdpLogLevel::Warning
+    } else if *level == tracing::Level::INFO {
+        RdpLogLevel::Info
+    } else if *level == tracing::Level::DEBUG {
+        RdpLogLevel::Debug
+    } else {
+        RdpLogLevel::Trace
+    }
+}
+
+#[derive(Default)]
+struct LogEventVisitor {
+    message: Option<String>,
+    fields: Vec<String>,
+}
+
+impl tracing::field::Visit for LogEventVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+        let value = format!("{value:?}");
+        if field.name() == "message" {
+            self.message = Some(value);
+        } else {
+            self.fields.push(format!("{}={value}", field.name()));
+        }
+    }
+}
+
+impl LogEventVisitor {
+    fn finish(self, fallback: &str) -> String {
+        match (self.message, self.fields.is_empty()) {
+            (Some(message), true) => message,
+            (Some(message), false) => format!("{message} {}", self.fields.join(" ")),
+            (None, false) => self.fields.join(" "),
+            (None, true) => fallback.to_owned(),
+        }
+    }
+}
+
+/// Global tracing layer whose destination is selected per worker thread. Callsites at
+/// levels no sink has ever enabled are `Interest::never()` — rebuilt whenever
+/// `CallbackSinkGuard::enter` lifts the ceiling — and everything else stays
+/// `Interest::sometimes` because different concurrent sessions may enable different
+/// levels and targets through their own C callback tables.
+pub(crate) struct CallbackLogLayer;
+
+impl<S> tracing_subscriber::Layer<S> for CallbackLogLayer
+where
+    S: tracing::Subscriber,
+{
+    fn register_callsite(
+        &self,
+        metadata: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        if rdp_level_rank(tracing_log_level(metadata.level()))
+            > MAX_SINK_LEVEL_RANK.load(Ordering::Relaxed)
+        {
+            return tracing::subscriber::Interest::never();
+        }
+        tracing::subscriber::Interest::sometimes()
+    }
+
+    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+        Some(level_filter_for_rank(
+            MAX_SINK_LEVEL_RANK.load(Ordering::Relaxed),
+        ))
+    }
+
+    fn enabled(
+        &self,
+        metadata: &tracing::Metadata<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        let level = tracing_log_level(metadata.level());
+        if rdp_level_rank(level) > MAX_SINK_LEVEL_RANK.load(Ordering::Relaxed) {
+            return false;
+        }
+        current_callback_sink()
+            .map(|sink| sink.log_enabled(level, metadata.target()))
+            .unwrap_or(false)
+    }
+
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let Some(sink) = current_callback_sink() else {
+            return;
+        };
+        let metadata = event.metadata();
+        let mut visitor = LogEventVisitor::default();
+        event.record(&mut visitor);
+        sink.emit_log(
+            tracing_log_level(metadata.level()),
+            metadata.target(),
+            &visitor.finish(metadata.name()),
+        );
+    }
+}
+
 // The C shell owns `ctx` and guarantees that it outlives the session. Callbacks are invoked
 // synchronously from the worker thread, and byte/string pointers are valid only for the call.
 unsafe impl Send for CallbackSink {}
 unsafe impl Sync for CallbackSink {}
 
 impl CallbackSink {
+    const LOG_TARGET_STACK_CAPACITY: usize = 128;
+
     fn empty() -> Self {
         Self {
             callbacks: RdpCallbacks {
                 ctx: ptr::null_mut(),
                 on_state: None,
+                on_log_enabled: None,
                 on_log: None,
                 on_desktop_size: None,
                 on_video_au: None,
@@ -188,10 +416,42 @@ impl CallbackSink {
         }
     }
 
-    fn log(&self, line: impl AsRef<str>) {
+    fn log_enabled(&self, level: RdpLogLevel, target: &str) -> bool {
+        if self.callbacks.on_log.is_none() {
+            return false;
+        }
+        let Some(cb) = self.callbacks.on_log_enabled else {
+            return true;
+        };
+        // Called per surviving tracing event: keep it allocation-free. Targets are
+        // short module paths; anything unusual falls back to a heap CString.
+        let bytes = target.as_bytes();
+        let mut buf = [0u8; Self::LOG_TARGET_STACK_CAPACITY];
+        if Self::log_target_uses_stack(target) {
+            buf[..bytes.len()].copy_from_slice(bytes);
+            cb(self.callbacks.ctx, level, buf.as_ptr().cast())
+        } else {
+            let target = cstring_lossy(target);
+            cb(self.callbacks.ctx, level, target.as_ptr())
+        }
+    }
+
+    fn log_target_uses_stack(target: &str) -> bool {
+        let bytes = target.as_bytes();
+        bytes.len() < Self::LOG_TARGET_STACK_CAPACITY && !bytes.contains(&0)
+    }
+
+    fn emit_log(&self, level: RdpLogLevel, target: &str, line: &str) {
         if let Some(cb) = self.callbacks.on_log {
+            let target = cstring_lossy(target);
             let line = cstring_lossy(line.as_ref());
-            cb(self.callbacks.ctx, line.as_ptr());
+            cb(self.callbacks.ctx, level, target.as_ptr(), line.as_ptr());
+        }
+    }
+
+    fn log(&self, level: RdpLogLevel, target: &str, arguments: fmt::Arguments<'_>) {
+        if self.log_enabled(level, target) {
+            self.emit_log(level, target, &arguments.to_string());
         }
     }
 
@@ -590,13 +850,19 @@ impl GraphicsPipelineHandler for NativeGfxHandler {
     //   such a server appears, implement the ops on the RGBA canvas instead of failing.
     //
     // The dispatcher matches these PDUs explicitly, so they never reach on_unhandled_pdu;
-    // the trait defaults are silent no-ops. Trace them (WEBRDP_LOG=debug) to stay observable.
+    // the trait defaults are silent no-ops. Trace them through the C logging bridge to stay
+    // observable when the corresponding target is enabled.
     fn on_solid_fill(&mut self, pdu: &SolidFillPdu) {
-        tracing::debug!(surface_id = pdu.surface_id, "ignoring EGFX SolidFill");
+        tracing::debug!(
+            target: LOG_TARGET_GRAPHICS,
+            surface_id = pdu.surface_id,
+            "ignoring EGFX SolidFill"
+        );
     }
 
     fn on_surface_to_surface(&mut self, pdu: &SurfaceToSurfacePdu) {
         tracing::debug!(
+            target: LOG_TARGET_GRAPHICS,
             src = pdu.source_surface_id,
             dst = pdu.destination_surface_id,
             "ignoring EGFX SurfaceToSurface"
@@ -605,6 +871,7 @@ impl GraphicsPipelineHandler for NativeGfxHandler {
 
     fn on_cache_to_surface(&mut self, pdu: &CacheToSurfacePdu) {
         tracing::debug!(
+            target: LOG_TARGET_GRAPHICS,
             slot = pdu.cache_slot,
             surface_id = pdu.surface_id,
             "ignoring EGFX CacheToSurface"
@@ -634,9 +901,13 @@ fn make_display_control(width: u16, height: u16, sink: CallbackSink) -> DisplayC
         let (width, height) =
             MonitorLayoutEntry::adjust_display_size(u32::from(width), u32::from(height));
         if u64::from(width) * u64::from(height) > caps.max_monitor_area() {
-            sink.log(format!(
-                "display: {width}x{height} exceeds the server's max monitor area; keeping the server layout"
-            ));
+            sink.log(
+                RdpLogLevel::Warning,
+                LOG_TARGET_GRAPHICS,
+                format_args!(
+                    "display: {width}x{height} exceeds the server's max monitor area; keeping the server layout"
+                ),
+            );
             return Ok(Vec::new());
         }
         let layout = match DisplayControlMonitorLayout::new_single_primary_monitor(
@@ -644,15 +915,19 @@ fn make_display_control(width: u16, height: u16, sink: CallbackSink) -> DisplayC
         ) {
             Ok(layout) => layout,
             Err(e) => {
-                sink.log(format!(
-                    "display: failed to build {width}x{height} monitor layout: {e}"
-                ));
+                sink.log(
+                    RdpLogLevel::Error,
+                    LOG_TARGET_GRAPHICS,
+                    format_args!("display: failed to build {width}x{height} monitor layout: {e}"),
+                );
                 return Ok(Vec::new());
             }
         };
-        sink.log(format!(
-            "display: requesting server resolution {width}x{height}"
-        ));
+        sink.log(
+            RdpLogLevel::Info,
+            LOG_TARGET_GRAPHICS,
+            format_args!("display: requesting server resolution {width}x{height}"),
+        );
         Ok(vec![Box::new(DisplayControlPdu::from(layout)) as DvcMessage])
     })
 }
@@ -768,25 +1043,36 @@ impl RdpsndDvcHandler {
                 .collect();
             if pcm_only.is_empty() {
                 self.callbacks.log(
-                    "audio: PCM requested but the server offers no playable PCM; \
-                     keeping the default format list"
-                        .to_owned(),
+                    RdpLogLevel::Warning,
+                    LOG_TARGET_AUDIO,
+                    format_args!(
+                        "audio: PCM requested but the server offers no playable PCM; \
+                         keeping the default format list"
+                    ),
                 );
             } else {
                 formats = pcm_only;
             }
         }
         if formats.is_empty() {
-            self.callbacks.log(format!(
-                "audio: server offered {server_count} formats but none are playable; audio stays disabled"
-            ));
+            self.callbacks.log(
+                RdpLogLevel::Warning,
+                LOG_TARGET_AUDIO,
+                format_args!(
+                    "audio: server offered {server_count} formats but none are playable; audio stays disabled"
+                ),
+            );
         } else {
-            self.callbacks.log(format!(
-                "audio: accepting {} of {} server formats (protocol version {:?})",
-                formats.len(),
-                server_count,
-                pdu.version
-            ));
+            self.callbacks.log(
+                RdpLogLevel::Info,
+                LOG_TARGET_AUDIO,
+                format_args!(
+                    "audio: accepting {} of {} server formats (protocol version {:?})",
+                    formats.len(),
+                    server_count,
+                    pdu.version
+                ),
+            );
         }
         self.client_formats = formats.clone();
         self.last_format = None;
@@ -825,10 +1111,14 @@ impl RdpsndDvcHandler {
                 self.callbacks.audio_data(&pdu.data, pdu.audio_timestamp);
             }
         } else if !self.bad_format_logged {
-            self.callbacks.log(format!(
-                "audio: wave references unknown client format {}; dropping audio data",
-                pdu.format_no
-            ));
+            self.callbacks.log(
+                RdpLogLevel::Warning,
+                LOG_TARGET_AUDIO,
+                format_args!(
+                    "audio: wave references unknown client format {}; dropping audio data",
+                    pdu.format_no
+                ),
+            );
             self.bad_format_logged = true;
         }
         // Confirm even dropped waves, promptly: the server estimates render latency from
@@ -860,9 +1150,11 @@ impl DvcProcessor for RdpsndDvcHandler {
         let pdu = match sndpdu::ServerAudioOutputPdu::decode(&mut cursor) {
             Ok(pdu) => pdu,
             Err(e) => {
-                self.callbacks.log(format!(
-                    "audio: failed to decode audio output PDU: {e}; audio disabled"
-                ));
+                self.callbacks.log(
+                    RdpLogLevel::Error,
+                    LOG_TARGET_AUDIO,
+                    format_args!("audio: failed to decode audio output PDU: {e}; audio disabled"),
+                );
                 self.stopped = true;
                 return Ok(Vec::new());
             }
@@ -881,10 +1173,14 @@ impl DvcProcessor for RdpsndDvcHandler {
                 } else {
                     u16::try_from(pdu.data.len().saturating_add(8)).unwrap_or(0)
                 };
-                self.callbacks.log(format!(
-                    "audio: training received ({} payload bytes)",
-                    pdu.data.len()
-                ));
+                self.callbacks.log(
+                    RdpLogLevel::Debug,
+                    LOG_TARGET_AUDIO,
+                    format_args!(
+                        "audio: training received ({} payload bytes)",
+                        pdu.data.len()
+                    ),
+                );
                 vec![Self::reply(sndpdu::ClientAudioOutputPdu::TrainingConfirm(
                     sndpdu::TrainingConfirmPdu {
                         timestamp: pdu.timestamp,
@@ -894,21 +1190,30 @@ impl DvcProcessor for RdpsndDvcHandler {
             }
             sndpdu::ServerAudioOutputPdu::Wave2(pdu) => self.handle_wave2(pdu),
             sndpdu::ServerAudioOutputPdu::Volume(pdu) => {
-                self.callbacks.log(format!(
-                    "audio: ignoring server volume change {:#06x}/{:#06x} (TV remote controls volume)",
-                    pdu.volume_left, pdu.volume_right
-                ));
+                self.callbacks.log(
+                    RdpLogLevel::Debug,
+                    LOG_TARGET_AUDIO,
+                    format_args!(
+                        "audio: ignoring server volume change {:#06x}/{:#06x} (TV remote controls volume)",
+                        pdu.volume_left, pdu.volume_right
+                    ),
+                );
                 Vec::new()
             }
             sndpdu::ServerAudioOutputPdu::Pitch(pdu) => {
-                self.callbacks.log(format!(
-                    "audio: ignoring server pitch change {:#010x}",
-                    pdu.pitch
-                ));
+                self.callbacks.log(
+                    RdpLogLevel::Debug,
+                    LOG_TARGET_AUDIO,
+                    format_args!("audio: ignoring server pitch change {:#010x}", pdu.pitch),
+                );
                 Vec::new()
             }
             sndpdu::ServerAudioOutputPdu::Close => {
-                self.callbacks.log("audio: server closed the audio stream");
+                self.callbacks.log(
+                    RdpLogLevel::Info,
+                    LOG_TARGET_AUDIO,
+                    format_args!("audio: server closed the audio stream"),
+                );
                 // Re-fire on_audio_format when a new stream starts later.
                 self.last_format = None;
                 Vec::new()
@@ -917,8 +1222,13 @@ impl DvcProcessor for RdpsndDvcHandler {
             | sndpdu::ServerAudioOutputPdu::WaveEncrypt(_)
             | sndpdu::ServerAudioOutputPdu::CryptKey(_) => {
                 if !self.legacy_wave_logged {
-                    self.callbacks
-                        .log("audio: ignoring legacy/encrypted wave PDU (protocol version < 8)");
+                    self.callbacks.log(
+                        RdpLogLevel::Warning,
+                        LOG_TARGET_AUDIO,
+                        format_args!(
+                            "audio: ignoring legacy/encrypted wave PDU (protocol version < 8)"
+                        ),
+                    );
                     self.legacy_wave_logged = true;
                 }
                 Vec::new()
@@ -928,8 +1238,11 @@ impl DvcProcessor for RdpsndDvcHandler {
     }
 
     fn close(&mut self, _channel_id: u32) {
-        self.callbacks
-            .log("audio: AUDIO_PLAYBACK_DVC channel closed");
+        self.callbacks.log(
+            RdpLogLevel::Notice,
+            LOG_TARGET_AUDIO,
+            format_args!("audio: AUDIO_PLAYBACK_DVC channel closed"),
+        );
     }
 }
 
@@ -940,8 +1253,10 @@ struct NativeWorker {
     stop: Arc<AtomicBool>,
     gfx: Arc<Mutex<NativeGfxState>>,
     inbuf: Vec<u8>,
-    reactivation:
-        Option<Box<ironrdp_connector::connection_activation::ConnectionActivationSequence>>,
+    // Retained from the connect result to drive the Deactivation-Reactivation Sequence
+    // locally: produces a fresh `ConnectionActivationSequence` on each Server Deactivate
+    // All PDU (the x224 processor no longer owns one; see ConnectionResult::activation_factory).
+    activation_factory: Option<ConnectionActivationFactory>,
     next_pts90k: u64,
     frame_pts_step: u64,
     // Input events drained off the channel by poll_stop while the worker is busy (notably
@@ -974,7 +1289,7 @@ impl NativeWorker {
             stop,
             gfx: Arc::new(Mutex::new(NativeGfxState::default())),
             inbuf: Vec::new(),
-            reactivation: None,
+            activation_factory: None,
             next_pts90k: 0,
             frame_pts_step: 90_000 / fps,
             pending_input: Vec::new(),
@@ -998,9 +1313,13 @@ impl NativeWorker {
                         && !self.stop.load(Ordering::SeqCst)
                         && e.message.contains("disconnect provider ultimatum") =>
                 {
-                    self.callbacks.log(format!(
-                        "server closed the session (attempt {attempt}/{MAX_SESSION_ATTEMPTS}); reconnecting"
-                    ));
+                    self.callbacks.log(
+                        RdpLogLevel::Notice,
+                        LOG_TARGET_SESSION,
+                        format_args!(
+                            "server closed the session (attempt {attempt}/{MAX_SESSION_ATTEMPTS}); reconnecting"
+                        ),
+                    );
                     self.reset_session_state();
                     thread::sleep(Duration::from_millis(1000));
                 }
@@ -1013,7 +1332,7 @@ impl NativeWorker {
     /// Clears per-session accumulated state so a reconnect starts clean.
     fn reset_session_state(&mut self) {
         self.inbuf.clear();
-        self.reactivation = None;
+        self.activation_factory = None;
         self.next_pts90k = 0;
         self.pending_input.clear();
         // A suppress/resume queued while the failed session was still handshaking is the
@@ -1105,7 +1424,11 @@ impl NativeWorker {
                     stream
                         .set_write_timeout(Some(WRITE_TIMEOUT))
                         .map_err(|e| NativeError::network(format!("set write timeout: {e}")))?;
-                    self.callbacks.log(format!("connected TCP to {addr}"));
+                    self.callbacks.log(
+                        RdpLogLevel::Info,
+                        LOG_TARGET_TRANSPORT,
+                        format_args!("connected TCP to {addr}"),
+                    );
                     return Ok(Some(stream));
                 }
                 Err(e) => last_error = Some(format!("{addr}: {e}")),
@@ -1357,7 +1680,18 @@ impl NativeWorker {
             format!("active {}x{} native AVC420/RemoteFX", desktop_w, desktop_h),
         );
 
-        let mut active = ActiveStage::new(result);
+        self.activation_factory = Some(result.activation_factory);
+        let mut active = ActiveStageBuilder {
+            static_channels: result.static_channels,
+            user_channel_id: result.user_channel_id,
+            io_channel_id: result.io_channel_id,
+            message_channel_id: result.message_channel_id,
+            share_id: result.share_id,
+            compression_type: result.compression_type,
+            enable_server_pointer: result.enable_server_pointer,
+            pointer_software_rendering: result.pointer_software_rendering,
+        }
+        .build();
         let mut image = DecodedImage::new(PixelFormat::RgbA32, desktop_w, desktop_h);
 
         // Discard any input poll_stop buffered during the pre-connect phase; the C side does
@@ -1399,7 +1733,7 @@ impl NativeWorker {
                 let outputs = active
                     .process(&mut image, info.action, &frame)
                     .map_err(|e| NativeError::protocol(format!("active stage process: {e}")))?;
-                let mut deactivate = None;
+                let mut deactivate = false;
                 for output in outputs {
                     match output {
                         ActiveStageOutput::ResponseFrame(frame) => {
@@ -1417,7 +1751,7 @@ impl NativeWorker {
                                 reason.description()
                             )));
                         }
-                        ActiveStageOutput::DeactivateAll(seq) => deactivate = Some(seq),
+                        ActiveStageOutput::DeactivateAll => deactivate = true,
                         ActiveStageOutput::GraphicsUpdate(rect) => {
                             // Classic slow-path/fast-path bitmap updates (servers without
                             // EGFX/H.264) are decoded by IronRDP directly into `image`; forward
@@ -1464,8 +1798,7 @@ impl NativeWorker {
                 }
                 self.drain_gfx()?;
 
-                if let Some(seq) = deactivate {
-                    self.reactivation = Some(seq);
+                if deactivate {
                     self.drive_reactivation(&mut tls, &mut active, &mut image)?;
                 }
             }
@@ -1567,14 +1900,18 @@ impl NativeWorker {
                     .encode_static(&mut buf, pdu)
                     .map_err(|e| NativeError::protocol(format!("suppress output encode: {e}")))?;
                 self.write_all(tls, buf.filled(), "suppress output")?;
-                self.callbacks.log(format!(
-                    "display updates {} by client request",
-                    if allow_display {
-                        "resumed"
-                    } else {
-                        "suppressed"
-                    }
-                ));
+                self.callbacks.log(
+                    RdpLogLevel::Info,
+                    LOG_TARGET_SESSION,
+                    format_args!(
+                        "display updates {} by client request",
+                        if allow_display {
+                            "resumed"
+                        } else {
+                            "suppressed"
+                        }
+                    ),
+                );
             }
             ControlCommand::RequestRefresh => {
                 // gnome-remote-desktop disables TS_REFRESH_RECT_PDU (FreeRDP_RefreshRect =
@@ -1613,12 +1950,21 @@ impl NativeWorker {
                         NativeError::protocol(format!("refresh layout DVC encode: {e}"))
                     })?;
                     self.write_all(tls, &frame, "refresh monitor layout")?;
-                    self.callbacks
-                        .log("refresh requested: re-submitted monitor layout for a fresh keyframe");
+                    self.callbacks.log(
+                        RdpLogLevel::Info,
+                        LOG_TARGET_GRAPHICS,
+                        format_args!(
+                            "refresh requested: re-submitted monitor layout for a fresh keyframe"
+                        ),
+                    );
                 } else {
                     self.callbacks.log(
-                        "refresh requested but the display-control channel is unavailable; \
-                         relying on Refresh Rect only",
+                        RdpLogLevel::Warning,
+                        LOG_TARGET_GRAPHICS,
+                        format_args!(
+                            "refresh requested but the display-control channel is unavailable; \
+                             relying on Refresh Rect only"
+                        ),
                     );
                 }
 
@@ -1641,15 +1987,14 @@ impl NativeWorker {
         active: &mut ActiveStage,
         image: &mut DecodedImage,
     ) -> Result<(), NativeError> {
-        let mut seq = match self.reactivation.take() {
-            Some(seq) => seq,
-            None => return Ok(()),
-        };
+        let factory = self
+            .activation_factory
+            .as_ref()
+            .ok_or_else(|| NativeError::protocol("deactivate-all with no activation factory"))?;
+        let mut seq = factory.create();
         let mut out = WriteBuf::new();
         loop {
             if let ConnectionActivationState::Finalized {
-                io_channel_id,
-                user_channel_id,
                 desktop_size,
                 share_id,
                 enable_server_pointer,
@@ -1660,8 +2005,8 @@ impl NativeWorker {
                     DecodedImage::new(PixelFormat::RgbA32, desktop_size.width, desktop_size.height);
                 active.set_fastpath_processor(
                     fast_path::ProcessorBuilder {
-                        io_channel_id,
-                        user_channel_id,
+                        io_channel_id: seq.io_channel_id(),
+                        user_channel_id: seq.user_channel_id(),
                         share_id,
                         enable_server_pointer,
                         pointer_software_rendering,
@@ -1935,6 +2280,7 @@ fn worker_main(
     stop: Arc<AtomicBool>,
 ) {
     crate::init_logging();
+    let _callback_sink_guard = CallbackSinkGuard::enter(callbacks);
     let mut worker = NativeWorker::new(config, callbacks, rx, stop);
     match worker.run() {
         Ok(()) => {}
@@ -2266,11 +2612,24 @@ mod tests {
     }
 
     #[test]
+    fn log_level_values_match_header() {
+        assert_eq!(RdpLogLevel::Trace as u32, 0);
+        assert_eq!(RdpLogLevel::Debug as u32, 1);
+        assert_eq!(RdpLogLevel::Info as u32, 2);
+        assert_eq!(RdpLogLevel::Notice as u32, 3);
+        assert_eq!(RdpLogLevel::Warning as u32, 4);
+        assert_eq!(RdpLogLevel::Error as u32, 5);
+        assert_eq!(RdpLogLevel::Fatal as u32, 6);
+        assert_eq!(size_of::<RdpLogLevel>(), size_of::<u32>());
+    }
+
+    #[test]
     fn retry_folds_pending_suppress_into_latch() {
         let (_tx, rx) = std::sync::mpsc::sync_channel::<WorkerCommand>(4);
         let callbacks = RdpCallbacks {
             ctx: core::ptr::null_mut(),
             on_state: None,
+            on_log_enabled: None,
             on_log: None,
             on_desktop_size: None,
             on_video_au: None,
@@ -2338,6 +2697,9 @@ mod tests {
         );
         assert_eq!(offset_of!(RdpCallbacks, ctx), 0);
         assert!(offset_of!(RdpCallbacks, on_state) > offset_of!(RdpCallbacks, ctx));
+        assert!(offset_of!(RdpCallbacks, on_log_enabled) > offset_of!(RdpCallbacks, on_state));
+        assert!(offset_of!(RdpCallbacks, on_log) > offset_of!(RdpCallbacks, on_log_enabled));
+        assert!(offset_of!(RdpCallbacks, on_desktop_size) > offset_of!(RdpCallbacks, on_log));
         assert!(offset_of!(RdpCallbacks, on_video_au) > offset_of!(RdpCallbacks, on_desktop_size));
         assert!(offset_of!(RdpCallbacks, on_bitmap_update) > offset_of!(RdpCallbacks, on_video_au));
         assert!(
@@ -2357,6 +2719,319 @@ mod tests {
             offset_of!(RdpCallbacks, on_pointer_state)
                 > offset_of!(RdpCallbacks, on_pointer_position)
         );
+        assert_eq!(
+            size_of::<RdpCallbacks>(),
+            12 * size_of::<*mut core::ffi::c_void>()
+        );
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct CapturedLog {
+        level: RdpLogLevel,
+        target: String,
+        message: String,
+    }
+
+    struct LogCapture {
+        enabled: bool,
+        checks: Vec<(RdpLogLevel, String)>,
+        logs: Vec<CapturedLog>,
+    }
+
+    impl Default for LogCapture {
+        fn default() -> Self {
+            Self {
+                enabled: true,
+                checks: Vec::new(),
+                logs: Vec::new(),
+            }
+        }
+    }
+
+    extern "C" fn capture_log_enabled(
+        ctx: *mut core::ffi::c_void,
+        level: RdpLogLevel,
+        target: *const c_char,
+    ) -> bool {
+        let capture = unsafe { &*(ctx.cast::<Mutex<LogCapture>>()) };
+        let target = unsafe { CStr::from_ptr(target) }
+            .to_string_lossy()
+            .into_owned();
+        let mut capture = capture.lock().unwrap();
+        capture.checks.push((level, target));
+        capture.enabled
+    }
+
+    extern "C" fn capture_log(
+        ctx: *mut core::ffi::c_void,
+        level: RdpLogLevel,
+        target: *const c_char,
+        message: *const c_char,
+    ) {
+        let capture = unsafe { &*(ctx.cast::<Mutex<LogCapture>>()) };
+        let target = unsafe { CStr::from_ptr(target) }
+            .to_string_lossy()
+            .into_owned();
+        let message = unsafe { CStr::from_ptr(message) }
+            .to_string_lossy()
+            .into_owned();
+        capture.lock().unwrap().logs.push(CapturedLog {
+            level,
+            target,
+            message,
+        });
+    }
+
+    fn log_test_sink(capture: *const Mutex<LogCapture>) -> CallbackSink {
+        let mut callbacks = CallbackSink::empty().callbacks;
+        callbacks.ctx = capture.cast_mut().cast();
+        callbacks.on_log_enabled = Some(capture_log_enabled);
+        callbacks.on_log = Some(capture_log);
+        CallbackSink::new(callbacks)
+    }
+
+    #[derive(Default)]
+    struct LevelProbeCapture {
+        max_rank: u8,
+        checks: Vec<(RdpLogLevel, String)>,
+    }
+
+    extern "C" fn capture_level_probe(
+        ctx: *mut core::ffi::c_void,
+        level: RdpLogLevel,
+        target: *const c_char,
+    ) -> bool {
+        let capture = unsafe { &*(ctx.cast::<Mutex<LevelProbeCapture>>()) };
+        let target = unsafe { CStr::from_ptr(target) }
+            .to_string_lossy()
+            .into_owned();
+        let mut capture = capture.lock().unwrap();
+        capture.checks.push((level, target));
+        rdp_level_rank(level) <= capture.max_rank
+    }
+
+    extern "C" fn ignore_log(
+        _ctx: *mut core::ffi::c_void,
+        _level: RdpLogLevel,
+        _target: *const c_char,
+        _message: *const c_char,
+    ) {
+    }
+
+    fn level_probe_sink(capture: *const Mutex<LevelProbeCapture>) -> CallbackSink {
+        let mut callbacks = CallbackSink::empty().callbacks;
+        callbacks.ctx = capture.cast_mut().cast();
+        callbacks.on_log_enabled = Some(capture_level_probe);
+        callbacks.on_log = Some(ignore_log);
+        CallbackSink::new(callbacks)
+    }
+
+    struct CountFormats(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl fmt::Debug for CountFormats {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            f.write_str("formatted")
+        }
+    }
+
+    #[test]
+    fn callback_sink_forwards_all_levels_and_filters_before_formatting() {
+        let capture = Mutex::new(LogCapture::default());
+        let sink = log_test_sink(&capture);
+        let levels = [
+            RdpLogLevel::Trace,
+            RdpLogLevel::Debug,
+            RdpLogLevel::Info,
+            RdpLogLevel::Notice,
+            RdpLogLevel::Warning,
+            RdpLogLevel::Error,
+            RdpLogLevel::Fatal,
+        ];
+        for (index, level) in levels.into_iter().enumerate() {
+            sink.log(level, "webrdp.test", format_args!("message {index}"));
+        }
+
+        let capture_guard = capture.lock().unwrap();
+        assert_eq!(capture_guard.checks.len(), levels.len());
+        assert_eq!(capture_guard.logs.len(), levels.len());
+        for (index, log) in capture_guard.logs.iter().enumerate() {
+            assert_eq!(log.level, levels[index]);
+            assert_eq!(log.target, "webrdp.test");
+            assert_eq!(log.message, format!("message {index}"));
+        }
+        drop(capture_guard);
+
+        capture.lock().unwrap().enabled = false;
+        let formats = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        sink.log(
+            RdpLogLevel::Debug,
+            "webrdp.test",
+            format_args!(
+                "blocked {:?}",
+                CountFormats(std::sync::Arc::clone(&formats))
+            ),
+        );
+        assert_eq!(formats.load(Ordering::SeqCst), 0);
+        assert_eq!(capture.lock().unwrap().logs.len(), levels.len());
+    }
+
+    #[test]
+    fn level_ceiling_rank_mapping_and_sink_probe_cover_every_filter() {
+        use tracing::level_filters::LevelFilter;
+
+        let expected_filters = [
+            LevelFilter::OFF,
+            LevelFilter::ERROR,
+            LevelFilter::WARN,
+            LevelFilter::INFO,
+            LevelFilter::DEBUG,
+            LevelFilter::TRACE,
+        ];
+        for (rank, expected_filter) in expected_filters.into_iter().enumerate() {
+            assert_eq!(level_filter_for_rank(rank as u8), expected_filter);
+
+            let capture = Mutex::new(LevelProbeCapture {
+                max_rank: rank as u8,
+                ..LevelProbeCapture::default()
+            });
+            assert_eq!(
+                probe_sink_level_rank(&level_probe_sink(&capture)),
+                rank as u8
+            );
+
+            let capture = capture.lock().unwrap();
+            assert_eq!(capture.checks.len(), 5);
+            assert!(capture
+                .checks
+                .iter()
+                .all(|(_, target)| target == LEVEL_PROBE_TARGET));
+        }
+    }
+
+    #[test]
+    fn log_enabled_target_buffer_boundaries_are_nul_terminated() {
+        let capture = Mutex::new(LogCapture::default());
+        let sink = log_test_sink(&capture);
+        let stack_target = "s".repeat(CallbackSink::LOG_TARGET_STACK_CAPACITY - 1);
+        let heap_target = "h".repeat(CallbackSink::LOG_TARGET_STACK_CAPACITY);
+        let embedded_nul_target = "left\0right";
+
+        assert!(CallbackSink::log_target_uses_stack(&stack_target));
+        assert!(!CallbackSink::log_target_uses_stack(&heap_target));
+        assert!(!CallbackSink::log_target_uses_stack(embedded_nul_target));
+        assert!(sink.log_enabled(RdpLogLevel::Info, &stack_target));
+        assert!(sink.log_enabled(RdpLogLevel::Info, &heap_target));
+        assert!(sink.log_enabled(RdpLogLevel::Info, embedded_nul_target));
+
+        let capture = capture.lock().unwrap();
+        assert_eq!(capture.checks.len(), 3);
+        assert_eq!(capture.checks[0].1, stack_target);
+        assert_eq!(capture.checks[1].1, heap_target);
+        assert_eq!(capture.checks[2].1, "leftright");
+    }
+
+    #[test]
+    fn tracing_bridge_preserves_metadata_and_clears_worker_sink() {
+        crate::init_logging();
+        let capture = Mutex::new(LogCapture {
+            enabled: false,
+            ..LogCapture::default()
+        });
+        let sink = log_test_sink(&capture);
+        let formats = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let _guard = CallbackSinkGuard::enter(sink);
+            tracing::debug!(
+                target: "webrdp.bridge-test",
+                expensive = ?CountFormats(std::sync::Arc::clone(&formats)),
+                "blocked event"
+            );
+            assert_eq!(formats.load(Ordering::SeqCst), 0);
+            assert!(capture.lock().unwrap().logs.is_empty());
+        }
+
+        // Enablement is probed when a worker scope is entered, so a level flipped
+        // on mid-session applies from the next scope (reconnect) on.
+        capture.lock().unwrap().enabled = true;
+        {
+            let _guard = CallbackSinkGuard::enter(sink);
+            tracing::warn!(
+                target: "webrdp.bridge-test",
+                code = 42_u64,
+                reason = "test",
+                "delivered event"
+            );
+        }
+
+        let logged_before_cleanup = capture.lock().unwrap().logs.len();
+        tracing::info!(target: "webrdp.bridge-test", "outside worker");
+        let capture = capture.lock().unwrap();
+        assert_eq!(capture.logs.len(), logged_before_cleanup);
+        assert_eq!(capture.logs.len(), 1);
+        assert_eq!(capture.logs[0].level, RdpLogLevel::Warning);
+        assert_eq!(capture.logs[0].target, "webrdp.bridge-test");
+        assert_eq!(
+            capture.logs[0].message,
+            "delivered event code=42 reason=\"test\""
+        );
+    }
+
+    #[test]
+    fn tracing_bridge_isolates_parallel_worker_sinks() {
+        crate::init_logging();
+        let first = std::sync::Arc::new(Mutex::new(LogCapture::default()));
+        let second = std::sync::Arc::new(Mutex::new(LogCapture::default()));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        let spawn_worker =
+            |id: u32,
+             capture: std::sync::Arc<Mutex<LogCapture>>,
+             barrier: std::sync::Arc<std::sync::Barrier>| {
+                std::thread::spawn(move || {
+                    let sink = log_test_sink(std::sync::Arc::as_ptr(&capture));
+                    let _guard = CallbackSinkGuard::enter(sink);
+                    barrier.wait();
+                    tracing::info!(target: "webrdp.parallel-test", worker = id, "worker event");
+                })
+            };
+        let first_worker = spawn_worker(
+            1,
+            std::sync::Arc::clone(&first),
+            std::sync::Arc::clone(&barrier),
+        );
+        let second_worker = spawn_worker(2, std::sync::Arc::clone(&second), barrier);
+        first_worker.join().unwrap();
+        second_worker.join().unwrap();
+
+        let first = first.lock().unwrap();
+        let second = second.lock().unwrap();
+        assert_eq!(first.logs.len(), 1);
+        assert_eq!(second.logs.len(), 1);
+        assert_eq!(first.logs[0].message, "worker event worker=1");
+        assert_eq!(second.logs[0].message, "worker event worker=2");
+    }
+
+    #[test]
+    fn sink_probe_lifts_global_level_ceiling() {
+        crate::init_logging();
+        let capture = Mutex::new(LogCapture::default());
+        let sink = log_test_sink(&capture);
+        {
+            let _guard = CallbackSinkGuard::enter(sink);
+        }
+        assert_eq!(MAX_SINK_LEVEL_RANK.load(Ordering::Relaxed), 5);
+        assert_eq!(
+            tracing::level_filters::LevelFilter::current(),
+            tracing::level_filters::LevelFilter::TRACE
+        );
+        // Entering the scope probed each bridged level exactly once.
+        let capture = capture.lock().unwrap();
+        assert_eq!(capture.checks.len(), 5);
+        assert!(capture
+            .checks
+            .iter()
+            .all(|(_, target)| target == LEVEL_PROBE_TARGET));
     }
 
     #[test]
@@ -2727,6 +3402,7 @@ mod tests {
         let callbacks = RdpCallbacks {
             ctx: (&states as *const Mutex<Vec<RdpState>>).cast_mut().cast(),
             on_state: Some(on_state),
+            on_log_enabled: None,
             on_log: None,
             on_desktop_size: None,
             on_video_au: None,
@@ -2780,6 +3456,7 @@ mod tests {
         let callbacks = RdpCallbacks {
             ctx: (capture as *const Mutex<AudioCapture>).cast_mut().cast(),
             on_state: None,
+            on_log_enabled: None,
             on_log: None,
             on_desktop_size: None,
             on_video_au: None,

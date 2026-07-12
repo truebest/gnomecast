@@ -28,6 +28,19 @@ typedef enum RdpAudioCodec {
     RDP_AUDIO_CODEC_PCM_S16LE = 2
 } RdpAudioCodec;
 
+/* Structured logging levels shared with webrdp-min. These values deliberately match
+ * the clog severity ordering, but consumers must still map them explicitly so the two
+ * interfaces can evolve independently. */
+typedef enum RdpLogLevel {
+    RDP_LOG_TRACE = 0,
+    RDP_LOG_DEBUG = 1,
+    RDP_LOG_INFO = 2,
+    RDP_LOG_NOTICE = 3,
+    RDP_LOG_WARNING = 4,
+    RDP_LOG_ERROR = 5,
+    RDP_LOG_FATAL = 6
+} RdpLogLevel;
+
 typedef struct RdpConfig {
     const char *host;
     uint16_t port;
@@ -45,7 +58,12 @@ typedef struct RdpConfig {
 typedef struct RdpCallbacks {
     void *ctx;
     void (*on_state)(void *ctx, RdpState state, const char *detail);
-    void (*on_log)(void *ctx, const char *line);
+    /* Logging callbacks are synchronous. target/message remain valid only for the call.
+     * on_log_enabled lets Rust avoid formatting disabled tracing events. It must answer
+     * by level alone (true if any target could want the level): the worker also probes
+     * it once per level when a session starts to prune disabled callsites. */
+    bool (*on_log_enabled)(void *ctx, RdpLogLevel level, const char *target);
+    void (*on_log)(void *ctx, RdpLogLevel level, const char *target, const char *message);
     void (*on_desktop_size)(void *ctx, uint16_t width, uint16_t height);
     void (*on_video_au)(void *ctx, const uint8_t *data, size_t len, bool is_keyframe, uint64_t pts90k);
     void (*on_bitmap_update)(void *ctx, uint16_t surface_id, uint32_t left, uint32_t top, uint32_t width,

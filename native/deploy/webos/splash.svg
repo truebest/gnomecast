@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1672" height="941" viewBox="0 0 1672 941">
+  <defs>
+    <linearGradient id="background" x1="232" y1="54" x2="1426" y2="941" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#11151c"/>
+      <stop offset="0.58" stop-color="#090b10"/>
+      <stop offset="1" stop-color="#07080b"/>
+    </linearGradient>
+    <radialGradient id="redGlow" cx="0" cy="0" r="1" gradientTransform="translate(664 480) rotate(7) scale(515 392)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#e94646" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#e94646" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="blueGlow" cx="0" cy="0" r="1" gradientTransform="translate(1008 468) rotate(173) scale(500 380)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#408dea" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#408dea" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="cubeShadow" x="15" y="10" width="170" height="200" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="14" stdDeviation="12" flood-color="#000000" flood-opacity="0.72"/>
+    </filter>
+    <filter id="floorBlur" x="582" y="604" width="508" height="118" filterUnits="userSpaceOnUse">
+      <feGaussianBlur stdDeviation="22"/>
+    </filter>
+  </defs>
+
+  <rect width="1672" height="941" fill="url(#background)"/>
+  <rect width="1672" height="941" fill="url(#redGlow)"/>
+  <rect width="1672" height="941" fill="url(#blueGlow)"/>
+  <ellipse cx="836" cy="653" rx="210" ry="26" fill="#000000" fill-opacity="0.48" filter="url(#floorBlur)"/>
+
+  <g transform="translate(596 190) scale(2.4)" filter="url(#cubeShadow)"
+     stroke="#050609" stroke-opacity="0.52" stroke-width="1.5" stroke-linejoin="round">
+    <!-- Same canonical frame and face palette as icon.svg. -->
+    <path d="M100 31.66 163.64 59.55 100 87.45 36.36 59.55Z" fill="#2a303c"/>
+    <path d="M36.36 59.55 100 87.45 100 168.34 36.36 140.45Z" fill="#e94646"/>
+    <path d="M100 87.45 163.64 59.55 163.64 140.45 100 168.34Z" fill="#408dea"/>
+  </g>
+  <path d="M836 268 988.48 334.96 836 400.24 683.52 334.96Z" fill="none"
+        stroke="#eef1f7" stroke-opacity="0.12" stroke-width="3" stroke-linejoin="round"/>
+
+  <g transform="translate(788 702)">
+    <circle cx="0" cy="0" r="7" fill="#e94646"/>
+    <circle cx="32" cy="0" r="7" fill="#37bb62"/>
+    <circle cx="64" cy="0" r="7" fill="#e3b831"/>
+    <circle cx="96" cy="0" r="7" fill="#408dea"/>
+  </g>
+</svg>

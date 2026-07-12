@@ -42,6 +42,7 @@
 #endif
 #include "input_sdl.h"
 #include "rdp_ffi.h"
+#include "rdp_log.h"
 #if defined(HELLOLG_WITH_PRECONNECT_UI) && HELLOLG_WITH_PRECONNECT_UI
 #include "ui_preconnect.h"
 #else
@@ -52,11 +53,15 @@ typedef void NativePreconnectUi;
 #include "audio_opus.h"
 #include "luna_volume.h"
 #include "ui_mixer.h"
-#include "audio_ss4s.h"
-#include "media_ss4s.h"
+#include "ui_slot_palette.h"
+#include "audio_backend.h"
+#include "media_backend.h"
 #include "settings_json.h"
 #include "video_rgba_sdl.h"
-#include "video_ss4s.h"
+#include "video_backend.h"
+#include "clog.h"
+
+clog_define(g_native_log_config, cLogLevelInfo, cLogFlags_Default, "native", NULL);
 
 #define NATIVE_RDP_INITIAL_DESKTOP_WIDTH 1920u
 #define NATIVE_RDP_INITIAL_DESKTOP_HEIGHT 1080u
@@ -129,11 +134,13 @@ typedef struct NativeSessionSlot {
     /* Server-driven cursor. Background sessions keep caching their latest shape here;
      * the SDL thread applies only the active slot's cursor each tick. */
     NativeCursor cursor;
-    /* Audio-pipeline routing (worker thread of this session only). */
+    /* Audio-pipeline routing (worker thread of this session only). The negotiated
+     * format snapshot is atomic because the SDL thread mirrors it into HUB metadata. */
     bool audio_routed;
     bool audio_incompatible_logged;
-    uint32_t audio_sample_rate;
-    uint16_t audio_channels;
+    atomic_uint audio_codec;
+    atomic_uint audio_sample_rate;
+    atomic_uint audio_channels;
     /* Per-session Opus decoder (worker thread; created in on_audio_format, destroyed
      * after the worker is joined in native_stop_slot). NULL for raw-PCM sessions. */
     NativeOpusDecoder *opus_decoder;
@@ -210,7 +217,23 @@ typedef struct App {
     int pending_switch_target;
     /* SDL thread only: when the deferred switch gives up and answers old-style. */
     uint32_t pending_switch_deadline_ticks;
+    /* Mutable bitmap canvas for exactly one stream generation. RemoteFX updates are
+     * dirty rectangles, so reusing it across either a slot switch or a same-slot
+     * reconnect would expose pixels from the previous desktop. Guarded by video_lock. */
     NativeRgbaSurface *rgba;
+    int rgba_owner_slot;
+    unsigned rgba_owner_epoch;
+    /* Frozen RemoteFX desktop that was below HUB when an asynchronous replacement
+     * started. The replacement renders into `rgba`; this separate owner-tagged canvas
+     * remains the compositor background and BACK fallback until that exact replacement
+     * generation reaches ACTIVE and decodes a frame. Its SDL texture is destroyed only
+     * on the SDL thread. Guarded by video_lock. */
+    NativeRgbaSurface *hub_return_rgba;
+    int hub_return_rgba_owner_slot;
+    unsigned hub_return_rgba_owner_epoch;
+    int hub_return_replacement_slot;
+    unsigned hub_return_replacement_epoch;
+    unsigned hub_return_replacement_baseline_frames;
     /* Shared SS4S library/player owner; video and audio attach tracks to it. Guarded by
      * video_lock like the tracks themselves. */
     NativeMedia *media;
@@ -223,16 +246,26 @@ typedef struct App {
     int video_owner_slot;
     unsigned video_owner_epoch;
     /* The single mixed-PCM audio track; all sessions flow through the fixed 48 kHz stereo
-     * graph into it (video_lock). */
+     * engine into it (video_lock). */
     NativeAudio *audio;
-    /* Headless miniaudio graph plus lock-free per-session adaptive sources. Its pump
-     * thread feeds app->audio; the graph format never follows a source format. */
+    /* Headless miniaudio engine plus lock-free per-session adaptive sources. Its pump
+     * thread feeds app->audio; the engine format never follows a source format. */
     NativeAudioPipeline audio_pipeline;
     uint16_t audio_codec;        /* NATIVE_AUDIO_CODEC_*: auto (Opus) or lossless PCM */
     /* Per-slot fader position in dB (NATIVE_MIXER_FADER_MIN_DB..MAX_DB, 3 dB steps,
      * default 0 = unity; the bottom stop mutes). Only the SDL thread writes it (volume
      * overlay). The pipeline gain target is atomic and survives source reopen. */
     int8_t mixer_gain_db[NATIVE_SETTINGS_MAX_SESSIONS];
+    /* Notification ducking (SDL thread): duck_mask[i] = which slots' audio ducks slot i
+     * -12 dB while slot i is on screen (bit = slot index, own bit ignored). Mirrors the
+     * per-session settings duck_mask; the settings pointer is the persistence target for
+     * the overlay's per-channel duck buttons. */
+    uint8_t duck_mask[NATIVE_SETTINGS_MAX_SESSIONS];
+    /* Console M/S state (SDL thread; bit = slot). Runtime-only like the faders — never
+     * persisted; mute wins over solo inside the pipeline. */
+    uint8_t mixer_mute_mask;
+    uint8_t mixer_solo_mask;
+    NativeSettings *settings;
     /* System-volume bridge for the mixer overlay's MASTER fader (luna_volume.h): the
      * fader mirrors and drives the webOS volume, never the app's own mix. */
     NativeLunaVolume luna_volume;
@@ -251,7 +284,7 @@ typedef struct App {
     int decoder_errors;
     bool decoder_keyframe_pending;
     /* Set once the SDL graphics layer has presented a single transparent frame so the
-     * ss4s hardware video plane underneath shows through. Re-presenting a transparent
+     * NDL hardware video plane underneath shows through. Re-presenting a transparent
      * frame every loop tick raced the video plane's own buffer swaps and produced
      * visible flicker, so this latches to "present once, then leave the window alone". */
     bool video_plane_punched;
@@ -265,13 +298,19 @@ typedef struct App {
     bool indicator_drawn;
     /* Volume-mixer overlay over the live stream (SDL thread only): opened by re-pressing
      * the ACTIVE slot's color button; one vertical slider per slot adjusts that mixer
-     * source live. Latch-drawn like the indicator (mixer_overlay_drawn). */
+     * source live. */
     bool mixer_overlay_visible;
-    bool mixer_overlay_drawn;
     int mixer_overlay_selected;
     uint32_t mixer_overlay_hide_ticks;
     /* Left button held on a fader: motion drags the selected knob (SDL thread only). */
     bool mixer_overlay_dragging;
+    /* Pointer button pressed outside the floating console. Dismiss on its release so
+     * that release is consumed before the evdev grab and RDP input are restored. */
+    uint8_t mixer_overlay_dismiss_button;
+    /* OK/ENTER currently held (SDL thread only): evdev autorepeat arrives as extra
+     * down events, and activation must fire once per press, not once per repeat —
+     * a repeated activate would XOR the duck bit and rewrite settings every time. */
+    bool mixer_overlay_ok_held;
     /* Last system volume seen by the auto-raise detector (-1 = no baseline yet) and the
      * next poll tick: com.webos.audio idles out between requests and drops
      * subscriptions, so the cache is kept live by polling getVolume over LS2 —
@@ -291,6 +330,24 @@ typedef struct App {
     /* SDL thread only: latched when the streaming screen's side effects ran (UI hidden,
      * evdev grabbed); cleared when the screen returns to a configurator. */
     bool streaming_visible;
+    /* SDL thread only: the user explicitly opened HUB over a still-active session.
+     * This keeps the normal ACTIVE-state auto-entry from immediately hiding HUB again. */
+    bool hub_visible;
+    /* A grabbed remote confirm press opens HUB on its release. Keeping both edges in
+     * evdev prevents the compositor from inheriting an orphaned release when HUB drops
+     * the grab (some webOS remotes translate that orphan into BACK). */
+    bool hub_open_key_held;
+    /* Session that owned the video plane when HUB opened. BACK returns here even if a
+     * nested setup form temporarily selected or backgrounded another slot. */
+    int hub_return_slot;
+    /* Async Connect/Save-and-connect started from HUB. HUB stays logically open until
+     * this slot reaches ACTIVE, so a failure still lets BACK resume hub_return_slot. */
+    int hub_connect_target;
+    /* SDL-thread logical-session clocks for the HUB's per-slot "Session N min"
+     * metadata. A hidden snapshot/watchdog reconnect belongs to the same user session,
+     * so its transient non-ACTIVE state must not restart this 64-bit monotonic clock. */
+    uint64_t session_started_ms[NATIVE_SETTINGS_MAX_SESSIONS];
+    bool session_runtime_active[NATIVE_SETTINGS_MAX_SESSIONS];
     /* SDL thread only: NumLock was synced to the current active session. Input arming is
      * derived on the SDL thread each tick (worker callbacks must not write shared input
      * state — a demoted slot's stale write could race a switch and strand input off). */
@@ -359,8 +416,6 @@ static void native_update_pointer_window_size(App *app);
 static void native_request_pointer_window_size_update(App *app);
 #endif
 
-static void native_reopen_audio_locked(App *app);
-
 static NativeSessionSlot *native_active_slot(App *app) {
     return &app->sessions[atomic_load(&app->active_index)];
 }
@@ -369,13 +424,35 @@ static bool native_slot_is_active(const NativeSessionSlot *slot) {
     return atomic_load(&slot->app->active_index) == slot->index;
 }
 
+/* A slot may take the screen while ACTIVE, or while its hidden reconnect is filling a
+ * snapshot for a deferred switch. Keep this predicate in one place: navigation must
+ * never select a slot whose worker has already reported a terminal failure. */
+static bool native_slot_is_live_stream_target(const NativeSessionSlot *slot) {
+    return slot && slot->rdp && !atomic_load(&slot->session_failed) &&
+           (atomic_load(&slot->current_state) == (int)RDP_STATE_ACTIVE || slot->snapshot_pending);
+}
+
+/* Points the pipeline's duck controller at the on-screen session with that session's
+ * own trigger mask (SDL thread; every active_index store routes through here right after
+ * the flip) — switching screens restores the combination set for the new session. */
+static void native_duck_retarget(App *app) {
+    int fg = atomic_load(&app->active_index);
+    native_audio_pipeline_set_duck_foreground(&app->audio_pipeline, fg,
+                                              (uint32_t)app->duck_mask[fg] & ~(1u << fg));
+}
+
 /* Monotonic milliseconds for cross-thread timing where SDL_GetTicks is unavailable
- * (worker callbacks compile without SDL). Truncation to 32 bits is fine: only short
- * differences are compared, and unsigned subtraction survives the wrap. */
-static uint32_t native_monotonic_ms(void) {
+ * (worker callbacks compile without SDL). Session runtime uses the full 64-bit value;
+ * the narrow wrapper below is only for short differences, where subtraction is
+ * intentionally wrap-safe. */
+static uint64_t native_monotonic_ms64(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint32_t)((uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+static uint32_t native_monotonic_ms(void) {
+    return (uint32_t)native_monotonic_ms64();
 }
 
 static bool copy_config_string(char *dest, size_t cap, const char *value, const char *field) {
@@ -387,23 +464,44 @@ static bool copy_config_string(char *dest, size_t cap, const char *value, const 
     }
     size_t len = strlen(value);
     if (len >= cap) {
-        fprintf(stderr, "[native] config field %s is too long\n", field);
+        clog(cLogLevelError, "config field %s is too long", field);
         return false;
     }
     memcpy(dest, value, len + 1);
     return true;
 }
 
+static bool native_session_endpoint_changed(const NativeSessionConfig *before,
+                                            const NativeSessionConfig *after) {
+    return strcmp(before->host, after->host) != 0 || before->port != after->port;
+}
+
+static bool native_session_connection_config_changed(const NativeSessionConfig *before,
+                                                      const NativeSessionConfig *after) {
+    return native_session_endpoint_changed(before, after) ||
+           strcmp(before->username, after->username) != 0 ||
+           strcmp(before->password, after->password) != 0 ||
+           strcmp(before->domain, after->domain) != 0 || before->fps != after->fps;
+}
+
+/* Stopping an RDP worker is synchronous: rdp_session_stop() joins it. A worker that is
+ * still resolving/connecting can be inside an uninterruptible libc/TCP timeout, so UI
+ * actions must reject that transition instead of joining it on the SDL thread. */
+static bool native_session_is_still_connecting(const NativeSessionSlot *slot) {
+    return slot && slot->rdp && atomic_load(&slot->current_state) != (int)RDP_STATE_ACTIVE;
+}
+
 static void native_prepare_webos_environment(void) {
     if (!getenv("EGL_PLATFORM") && setenv("EGL_PLATFORM", "wayland", 0) != 0) {
-        fprintf(stderr, "[native] failed to set EGL_PLATFORM=wayland: %s\n", strerror(errno));
+        clog(cLogLevelWarning, "failed to set EGL_PLATFORM=wayland: %s", strerror(errno));
     }
     if (!getenv("XDG_RUNTIME_DIR") && setenv("XDG_RUNTIME_DIR", "/tmp/xdg", 0) != 0) {
-        fprintf(stderr, "[native] failed to set XDG_RUNTIME_DIR=/tmp/xdg: %s\n", strerror(errno));
+        clog(cLogLevelWarning, "failed to set XDG_RUNTIME_DIR=/tmp/xdg: %s", strerror(errno));
     }
-    fprintf(stderr, "[native] webOS env APPID=%s EGL_PLATFORM=%s XDG_RUNTIME_DIR=%s\n", getenv("APPID") ? getenv("APPID") : "(unset)",
-            getenv("EGL_PLATFORM") ? getenv("EGL_PLATFORM") : "(unset)",
-            getenv("XDG_RUNTIME_DIR") ? getenv("XDG_RUNTIME_DIR") : "(unset)");
+    clog(cLogLevelDebug, "webOS env APPID=%s EGL_PLATFORM=%s XDG_RUNTIME_DIR=%s",
+         getenv("APPID") ? getenv("APPID") : "(unset)",
+         getenv("EGL_PLATFORM") ? getenv("EGL_PLATFORM") : "(unset)",
+         getenv("XDG_RUNTIME_DIR") ? getenv("XDG_RUNTIME_DIR") : "(unset)");
 }
 
 static void native_prepare_webos_logging(void) {
@@ -413,7 +511,6 @@ static void native_prepare_webos_logging(void) {
     }
     if (freopen(path, "w", stderr)) {
         setvbuf(stderr, NULL, _IOLBF, 0);
-        fprintf(stderr, "\n[native] --- launch ---\n");
     }
 }
 
@@ -423,7 +520,7 @@ static bool g_sdl_runtime_initialized = false;
 static int native_prepare_sdl_runtime(void) {
     if (!g_sdl_runtime_initialized) {
         if (SDL_Init(0) != 0) {
-            fprintf(stderr, "[native] SDL_Init(0) failed: %s\n", SDL_GetError());
+            clog(cLogLevelError, "SDL_Init(0) failed: %s", SDL_GetError());
             return 4;
         }
         g_sdl_runtime_initialized = true;
@@ -465,15 +562,15 @@ static bool native_config_apply_json_if_present(NativeSettings *settings, const 
         return true;
     }
     if (!native_settings_apply_json(settings, json, source)) {
-        fprintf(stderr, "[native] failed to parse %s\n", source);
+        clog(cLogLevelError, "failed to parse %s", source);
         return false;
     }
-    fprintf(stderr, "[native] loaded %s\n", source);
+    clog(cLogLevelInfo, "loaded %s", source);
     *applied = true;
     return true;
 }
 
-/* Reads the whole file at `path` into a NUL-terminated heap buffer/* Reads the whole file at `path` into a NUL-terminated heap buffer with a single open.
+/* Reads the whole file at `path` into a NUL-terminated heap buffer with a single open.
  *   missing file (open fails):            *existed=false, *out=NULL, returns true
  *   read/size error on an existing file:  *existed=true,  *out=NULL, returns false
  *   success:                              *existed=true,  *out=buffer (caller frees), returns true */
@@ -489,13 +586,13 @@ static bool native_config_read_file(const char *path, char **out, bool *existed)
 
     if (fseek(file, 0, SEEK_END) != 0) {
         fclose(file);
-        fprintf(stderr, "[native] failed to inspect config file: %s\n", path);
+        clog(cLogLevelError, "failed to inspect config file: %s", path);
         return false;
     }
     long size = ftell(file);
     if (size < 0 || (unsigned long)size > NATIVE_CONFIG_MAX_FILE) {
         fclose(file);
-        fprintf(stderr, "[native] config file is too large: %s\n", path);
+        clog(cLogLevelError, "config file is too large: %s", path);
         return false;
     }
     rewind(file);
@@ -503,7 +600,7 @@ static bool native_config_read_file(const char *path, char **out, bool *existed)
     char *json = (char *)calloc((size_t)size + 5, 1);
     if (!json) {
         fclose(file);
-        fprintf(stderr, "[native] failed to allocate config buffer\n");
+        clog(cLogLevelError, "failed to allocate config buffer");
         return false;
     }
 
@@ -511,7 +608,7 @@ static bool native_config_read_file(const char *path, char **out, bool *existed)
     fclose(file);
     if (read_count != (size_t)size) {
         free(json);
-        fprintf(stderr, "[native] failed to read config file: %s\n", path);
+        clog(cLogLevelError, "failed to read config file: %s", path);
         return false;
     }
 
@@ -527,11 +624,11 @@ static bool native_config_load_file_internal(NativeSettings *settings, const cha
     }
     if (!existed) {
         if (required) {
-            fprintf(stderr, "[native] config file not found: %s\n", path);
+            clog(cLogLevelError, "config file not found: %s", path);
             return false;
         }
         if (log_missing) {
-            fprintf(stderr, "[native] config file not found at %s; using defaults and CLI overrides\n", path);
+            clog(cLogLevelInfo, "config file not found at %s; using defaults and CLI overrides", path);
         }
         return true;
     }
@@ -539,10 +636,10 @@ static bool native_config_load_file_internal(NativeSettings *settings, const cha
     bool ok = native_settings_apply_json(settings, json, path);
     free(json);
     if (!ok) {
-        fprintf(stderr, "[native] failed to parse config file: %s\n", path);
+        clog(cLogLevelError, "failed to parse config file: %s", path);
         return false;
     }
-    fprintf(stderr, "[native] loaded config file: %s\n", path);
+    clog(cLogLevelInfo, "loaded config file: %s", path);
     return true;
 }
 
@@ -565,7 +662,7 @@ static void native_config_collect_persisted_candidates(NativeConfigPathCandidate
         (void)native_config_add_candidate_dir(candidates, pref_path, false);
         SDL_free(pref_path);
     } else {
-        fprintf(stderr, "[native] failed to resolve SDL pref path: %s\n", SDL_GetError());
+        clog(cLogLevelWarning, "failed to resolve SDL pref path: %s", SDL_GetError());
     }
 
     const char *appid = getenv("APPID");
@@ -622,14 +719,14 @@ static bool native_config_get_persisted_save_path(char *path, size_t cap) {
     size_t index = 0;
     if (native_config_find_persisted_save_candidate(&candidates, &index)) {
         if (!native_config_copy_path(path, cap, candidates.paths[index])) {
-            fprintf(stderr, "[native] persisted config path is too long\n");
+            clog(cLogLevelError, "persisted config path is too long");
             return false;
         }
-        fprintf(stderr, "[native] using persisted config path: %s\n", path);
+        clog(cLogLevelInfo, "using persisted config path: %s", path);
         return true;
     }
 
-    fprintf(stderr, "[native] no writable persisted config directory found\n");
+    clog(cLogLevelWarning, "no writable persisted config directory found");
     return false;
 }
 
@@ -662,7 +759,8 @@ static NativeConfigLoadOutcome native_config_try_load_candidate(NativeSettings *
 static bool native_config_load_persisted(NativeSettings *settings, bool force_ignore) {
     const char *ignore = getenv("HELLOLG_IGNORE_SAVED_CONFIG");
     if (force_ignore || (ignore && strcmp(ignore, "1") == 0)) {
-        fprintf(stderr, "[native] skipped persisted config because saved settings were disabled for this launch\n");
+        clog(cLogLevelInfo,
+             "skipped persisted config because saved settings were disabled for this launch");
         return true;
     }
 
@@ -686,9 +784,9 @@ static bool native_config_load_persisted(NativeSettings *settings, bool force_ig
                  * vanish without a trace in the log once already. */
                 struct stat st;
                 if (stat(dir, &st) == 0) {
-                    fprintf(stderr,
-                            "[native] persisted-config candidate skipped (dir not private): %s uid=%lu mode=%lo\n",
-                            dir, (unsigned long)st.st_uid, (unsigned long)(st.st_mode & 07777));
+                    clog(cLogLevelWarning,
+                         "persisted-config candidate skipped (dir not private): %s uid=%lu mode=%lo", dir,
+                         (unsigned long)st.st_uid, (unsigned long)(st.st_mode & 07777));
                 }
                 continue;
             }
@@ -699,10 +797,10 @@ static bool native_config_load_persisted(NativeSettings *settings, bool force_ig
             continue;
         }
         if (outcome == NATIVE_CONFIG_LOAD_INVALID) {
-            fprintf(stderr, "[native] ignored invalid persisted config: %s\n", candidates.paths[i]);
+            clog(cLogLevelWarning, "ignored invalid persisted config: %s", candidates.paths[i]);
             continue;
         }
-        fprintf(stderr, "[native] loaded persisted config: %s\n", candidates.paths[i]);
+        clog(cLogLevelInfo, "loaded persisted config: %s", candidates.paths[i]);
         return true;
     }
     return true;
@@ -753,7 +851,7 @@ static bool native_config_apply_launch_json_string(NativeSettings *settings, con
     char nested[NATIVE_CONFIG_MAX_FILE];
     int result = native_json_read_string(json, key, nested, sizeof(nested));
     if (result < 0) {
-        fprintf(stderr, "[native] invalid string value for webOS launch field %s\n", key);
+        clog(cLogLevelError, "invalid string value for webOS launch field %s", key);
         return false;
     }
     if (result == 0) {
@@ -788,12 +886,12 @@ static bool native_config_apply_launch_params(NativeSettings *settings, int argc
             return false;
         }
         if (!arg_applied) {
-            fprintf(stderr, "[native] webOS launch argument %d has no RDP config keys\n", i);
+            clog(cLogLevelWarning, "webOS launch argument %d has no RDP config keys", i);
         }
         applied = applied || arg_applied;
     }
     if (saw_launch_json && !applied) {
-        fprintf(stderr, "[native] webOS launch parameters did not override RDP config\n");
+        clog(cLogLevelWarning, "webOS launch parameters did not override RDP config");
     }
     return true;
 }
@@ -877,7 +975,7 @@ static bool apply_cli_u16(int argc, char **argv, const char *arg_name, uint16_t 
     }
     uint16_t parsed = 0;
     if (!parse_u16_text(value, min_value, max_value, &parsed)) {
-        fprintf(stderr, "[native] invalid value for %s\n", arg_name);
+        clog(cLogLevelError, "invalid value for %s", arg_name);
         return false;
     }
     *dest = parsed;
@@ -897,7 +995,7 @@ static bool apply_cli_audio_codec(int argc, char **argv, NativeSettings *setting
         settings->audio_codec = NATIVE_AUDIO_CODEC_PCM;
         return true;
     }
-    fprintf(stderr, "[native] invalid value for --audio-codec (expected auto or pcm)\n");
+    clog(cLogLevelError, "invalid value for --audio-codec (expected auto or pcm)");
     return false;
 }
 
@@ -942,13 +1040,14 @@ static bool native_config_validate_runtime(const NativeSettings *settings) {
     bool ok = true;
     if (settings->width == 0 || settings->height == 0 || settings->wheel_step == 0 ||
         settings->wheel_scroll_divisor == 0) {
-        fprintf(stderr, "[native] invalid zero value in RDP config\n");
+        clog(cLogLevelError, "invalid zero value in RDP config");
         ok = false;
     }
     for (int slot = 0; slot < NATIVE_SETTINGS_MAX_SESSIONS; slot++) {
         const NativeSessionConfig *session = &settings->sessions[slot];
         if (session->port == 0 || session->fps == 0) {
-            fprintf(stderr, "[native] invalid zero value in %s session config\n", native_session_slot_name(slot));
+            clog(cLogLevelError, "invalid zero value in %s session config",
+                 native_session_slot_name(slot));
             ok = false;
         }
     }
@@ -960,19 +1059,19 @@ static bool native_session_config_validate_connect(const NativeSessionConfig *se
     bool ok = true;
     const char *slot_name = native_session_slot_name(slot);
     if (!session->host[0]) {
-        fprintf(stderr, "[native] missing RDP host for the %s session\n", slot_name);
+        clog(cLogLevelError, "missing RDP host for the %s session", slot_name);
         ok = false;
     }
     if (!session->username[0]) {
-        fprintf(stderr, "[native] missing RDP username for the %s session\n", slot_name);
+        clog(cLogLevelError, "missing RDP username for the %s session", slot_name);
         ok = false;
     }
     if (!session->password[0]) {
-        fprintf(stderr, "[native] missing RDP password for the %s session\n", slot_name);
+        clog(cLogLevelError, "missing RDP password for the %s session", slot_name);
         ok = false;
     }
     if (session->port == 0 || session->fps == 0) {
-        fprintf(stderr, "[native] invalid zero value in %s session config\n", slot_name);
+        clog(cLogLevelError, "invalid zero value in %s session config", slot_name);
         ok = false;
     }
     if (!ok && message && message_cap > 0) {
@@ -999,16 +1098,17 @@ static void native_config_log_effective(const NativeSettings *settings) {
         if (slot != NATIVE_SESSION_SLOT_GREEN && !session->host[0]) {
             continue; /* unconfigured extra slot */
         }
-        fprintf(stderr, "[native] effective %s RDP config host=%s port=%u username=%s password=%s domain=%s fps=%u\n",
-                native_session_slot_name(slot), session->host, (unsigned)session->port,
-                session->username[0] ? "set" : "missing", session->password[0] ? "set" : "missing",
-                session->domain[0] ? "set" : "empty", (unsigned)session->fps);
+        clog(cLogLevelInfo,
+             "effective %s RDP config host=%s port=%u username=%s password=%s domain=%s fps=%u",
+             native_session_slot_name(slot), session->host, (unsigned)session->port,
+             session->username[0] ? "set" : "missing", session->password[0] ? "set" : "missing",
+             session->domain[0] ? "set" : "empty", (unsigned)session->fps);
     }
-    fprintf(stderr,
-            "[native] effective globals desktop=%ux%u wheelStep=%u wheelScrollDivisor=%u audioCodec=%s\n",
-            (unsigned)settings->width, (unsigned)settings->height, (unsigned)settings->wheel_step,
-            (unsigned)settings->wheel_scroll_divisor,
-            settings->audio_codec == NATIVE_AUDIO_CODEC_PCM ? "pcm" : "auto");
+    clog(cLogLevelInfo,
+         "effective globals desktop=%ux%u wheelStep=%u wheelScrollDivisor=%u audioCodec=%s",
+         (unsigned)settings->width, (unsigned)settings->height, (unsigned)settings->wheel_step,
+         (unsigned)settings->wheel_scroll_divisor,
+         settings->audio_codec == NATIVE_AUDIO_CODEC_PCM ? "pcm" : "auto");
 }
 
 static const char *rdp_state_name(RdpState state) {
@@ -1128,13 +1228,13 @@ static void on_state(void *ctx, RdpState state, const char *detail) {
     }
 
     const char *safe_detail = redact_if_sensitive(app, detail);
-    fprintf(stderr, "[native] %s session state=%s(%d)%s%s\n",
-            slot ? native_session_slot_name(slot->index) : "?", rdp_state_name(state), (int)state,
-            safe_detail[0] ? " " : "", safe_detail);
+    clog(cLogLevelInfo, "%s session state=%s(%d)%s%s",
+         slot ? native_session_slot_name(slot->index) : "?", rdp_state_name(state), (int)state,
+         safe_detail[0] ? " " : "", safe_detail);
 
     if (slot && rdp_state_is_terminal_error(state)) {
-        fprintf(stderr, "[native] terminal native error on the %s session: %s\n",
-                native_session_slot_name(slot->index), rdp_state_name(state));
+        clog(cLogLevelError, "terminal native error on the %s session: %s",
+             native_session_slot_name(slot->index), rdp_state_name(state));
         slot_stop_with_state(slot, state, rdp_state_exit_code(state));
     } else if (slot && state == RDP_STATE_STOPPED && atomic_load(&app->exit_code) == 0 &&
                !atomic_load(&slot->session_failed)) {
@@ -1148,7 +1248,6 @@ static void on_state(void *ctx, RdpState state, const char *detail) {
 }
 
 #if defined(HELLOLG_WITH_SDL) && HELLOLG_WITH_SDL
-/* SDL_DestroyTexture() must run on the thread that owns the renderer#if defined(HELLOLG_WITH_SDL) && HELLOLG_WITH_SDL
 /* SDL_DestroyTexture() must run on the thread that owns the renderer (the SDL/main thread),
  * but native_rgba_surface_close()/resize() can be invoked from the RDP worker thread
  * (on_bitmap_update, on_video_au). Call this (while holding video_lock) before either, so
@@ -1163,9 +1262,139 @@ static void native_defer_rgba_texture_destroy(App *app) {
         return;
     }
     if (app->pending_texture_destroy) {
-        fprintf(stderr, "[native] warning: leaking undrained RGBA texture to avoid cross-thread SDL_DestroyTexture\n");
+        clog(cLogLevelWarning,
+             "leaking undrained RGBA texture to avoid cross-thread SDL_DestroyTexture");
     }
     app->pending_texture_destroy = stale;
+}
+
+/* SDL/main thread, while the renderer is still alive. The RDP workers may keep updating
+ * CPU pixels until main joins them after native_run_app_loop(), but no render happens
+ * after this point. Detach every renderer-owned texture so the later CPU-surface teardown
+ * cannot call SDL_DestroyTexture after SDL_DestroyRenderer has invalidated it. */
+static void native_destroy_rgba_renderer_textures(App *app) {
+    if (!app) {
+        return;
+    }
+    pthread_mutex_lock(&app->video_lock);
+    SDL_Texture *rgba_texture = native_rgba_surface_take_texture(app->rgba);
+    SDL_Texture *return_texture = native_rgba_surface_take_texture(app->hub_return_rgba);
+    SDL_Texture *pending_texture = app->pending_texture_destroy;
+    app->pending_texture_destroy = NULL;
+    pthread_mutex_unlock(&app->video_lock);
+
+    if (rgba_texture) {
+        SDL_DestroyTexture(rgba_texture);
+    }
+    if (return_texture) {
+        SDL_DestroyTexture(return_texture);
+    }
+    if (pending_texture) {
+        SDL_DestroyTexture(pending_texture);
+    }
+}
+#endif
+
+/* video_lock protects both RGBA pointers and every owner/context field below. */
+static bool native_rgba_owner_matches(const App *app, int slot, unsigned epoch) {
+    return app && app->rgba && app->rgba_owner_slot == slot && app->rgba_owner_epoch == epoch;
+}
+
+static void native_reset_rgba_owner(App *app) {
+    app->rgba_owner_slot = -1;
+    app->rgba_owner_epoch = 0;
+}
+
+static void native_close_rgba_locked(App *app, bool defer_texture) {
+    if (!app || !app->rgba) {
+        if (app) {
+            native_reset_rgba_owner(app);
+        }
+        return;
+    }
+#if defined(HELLOLG_WITH_SDL) && HELLOLG_WITH_SDL
+    if (defer_texture) {
+        native_defer_rgba_texture_destroy(app);
+    }
+#else
+    (void)defer_texture;
+#endif
+    native_rgba_surface_close(app->rgba);
+    app->rgba = NULL;
+    native_reset_rgba_owner(app);
+}
+
+static void native_clear_hub_return_replacement(App *app) {
+    app->hub_return_replacement_slot = -1;
+    app->hub_return_replacement_epoch = 0;
+    app->hub_return_replacement_baseline_frames = 0;
+}
+
+/* Main/SDL thread only: a return surface may own this renderer's texture, so close it
+ * directly instead of consuming the worker-to-SDL pending texture handoff slot. */
+static void native_close_hub_return_rgba_locked(App *app) {
+    if (!app) {
+        return;
+    }
+    native_rgba_surface_close(app->hub_return_rgba);
+    app->hub_return_rgba = NULL;
+    app->hub_return_rgba_owner_slot = -1;
+    app->hub_return_rgba_owner_epoch = 0;
+    native_clear_hub_return_replacement(app);
+}
+
+/* Freeze the frame that belongs to the session HUB promised BACK would return to.
+ * A retry runs after active_index has already moved to the failed target, so it must
+ * never replace this cache from old_index/current ownership. */
+#if defined(HELLOLG_WITH_SDL) && HELLOLG_WITH_SDL
+static void native_capture_hub_return_rgba_locked(App *app) {
+    if (!app || !app->hub_visible || app->hub_return_rgba) {
+        return;
+    }
+    int return_slot = app->hub_return_slot;
+    if (return_slot < 0 || return_slot >= NATIVE_SETTINGS_MAX_SESSIONS) {
+        return;
+    }
+    unsigned return_epoch = atomic_load(&app->sessions[return_slot].connect_epoch);
+    if (!native_rgba_owner_matches(app, return_slot, return_epoch) ||
+        !native_rgba_surface_has_frame(app->rgba)) {
+        return;
+    }
+    app->hub_return_rgba = app->rgba;
+    app->hub_return_rgba_owner_slot = app->rgba_owner_slot;
+    app->hub_return_rgba_owner_epoch = app->rgba_owner_epoch;
+    app->rgba = NULL;
+    native_reset_rgba_owner(app);
+    native_clear_hub_return_replacement(app);
+}
+
+static void native_arm_hub_return_replacement_locked(App *app, int slot, unsigned epoch,
+                                                      unsigned baseline_frames) {
+    if (!app || !app->hub_return_rgba) {
+        return;
+    }
+    app->hub_return_replacement_slot = slot;
+    app->hub_return_replacement_epoch = epoch;
+    app->hub_return_replacement_baseline_frames = baseline_frames;
+}
+
+/* BACK may resume the frozen canvas only while its worker generation is unchanged.
+ * If backgrounding reconnected that slot, keep the old pixels as a read-only fallback;
+ * its fresh generation will replace them after its first decoded frame. */
+static bool native_promote_hub_return_rgba_locked(App *app, int slot, unsigned epoch) {
+    if (!app || !app->hub_return_rgba || app->hub_return_rgba_owner_slot != slot ||
+        app->hub_return_rgba_owner_epoch != epoch) {
+        return false;
+    }
+    native_close_rgba_locked(app, false);
+    app->rgba = app->hub_return_rgba;
+    app->rgba_owner_slot = app->hub_return_rgba_owner_slot;
+    app->rgba_owner_epoch = app->hub_return_rgba_owner_epoch;
+    app->hub_return_rgba = NULL;
+    app->hub_return_rgba_owner_slot = -1;
+    app->hub_return_rgba_owner_epoch = 0;
+    native_clear_hub_return_replacement(app);
+    return true;
 }
 #endif
 
@@ -1199,16 +1428,25 @@ static void on_bitmap_update(void *ctx, uint16_t surface_id, uint32_t left, uint
         pthread_mutex_unlock(&app->video_lock);
         return;
     }
+    unsigned owner_epoch = atomic_load(&slot->connect_epoch);
+    if (app->rgba && !native_rgba_owner_matches(app, slot->index, owner_epoch)) {
+        /* A dirty rectangle can never be applied to another slot or connection
+         * generation's pixels. Keep any frozen HUB return surface separate and start
+         * this owner on a zeroed canvas. */
+        native_close_rgba_locked(app, true);
+    }
     if (app->video) {
         native_video_close(app->video);
         app->video = NULL;
         app->decoder_keyframe_pending = false;
-        fprintf(stderr, "[native] switching graphics path from ss4s/H.264 to native RemoteFX RGBA\n");
-        /* Closing the video track unloaded the shared pipeline; bring audio back. */
-        native_reopen_audio_locked(app);
+        clog(cLogLevelNotice, "switching graphics path from NDL/H.264 to native RemoteFX RGBA");
     }
     if (!app->rgba) {
         app->rgba = native_rgba_surface_open(desktop_width, desktop_height);
+        if (app->rgba) {
+            app->rgba_owner_slot = slot->index;
+            app->rgba_owner_epoch = owner_epoch;
+        }
     } else if (native_rgba_surface_width(app->rgba) != desktop_width ||
                native_rgba_surface_height(app->rgba) != desktop_height) {
 #if defined(HELLOLG_WITH_SDL) && HELLOLG_WITH_SDL
@@ -1217,6 +1455,7 @@ static void on_bitmap_update(void *ctx, uint16_t surface_id, uint32_t left, uint
         if (native_rgba_surface_resize(app->rgba, desktop_width, desktop_height) != NATIVE_RGBA_OK) {
             native_rgba_surface_close(app->rgba);
             app->rgba = NULL;
+            native_reset_rgba_owner(app);
         }
     }
     NativeRgbaResult result = app->rgba ? native_rgba_surface_apply(app->rgba, left, top, width, height, stride, rgba, len)
@@ -1230,23 +1469,31 @@ static void on_bitmap_update(void *ctx, uint16_t surface_id, uint32_t left, uint
     }
     if (result != NATIVE_RGBA_OK) {
         app->decoder_errors++;
-        fprintf(stderr,
-                "[native] terminal native error: DecoderError; RemoteFX bitmap update failed result=%d surface=%u rect=%ux%u+%u+%u\n",
-                (int)result, (unsigned)surface_id, (unsigned)width, (unsigned)height, (unsigned)left, (unsigned)top);
+        clog(cLogLevelError,
+             "terminal native error: DecoderError; RemoteFX bitmap update failed result=%d surface=%u "
+             "rect=%ux%u+%u+%u",
+             (int)result, (unsigned)surface_id, (unsigned)width, (unsigned)height, (unsigned)left,
+             (unsigned)top);
         slot_stop_with_state(slot, RDP_STATE_DECODER_ERROR, rdp_state_exit_code(RDP_STATE_DECODER_ERROR));
     }
 }
 
-static void on_log(void *ctx, const char *line) {
+static bool on_log_enabled(void *ctx, RdpLogLevel level, const char *target) {
+    (void)ctx;
+    (void)target;
+    return native_rdp_log_is_enabled(level);
+}
+
+static void on_log(void *ctx, RdpLogLevel level, const char *target, const char *message) {
     NativeSessionSlot *slot = (NativeSessionSlot *)ctx;
     App *app = slot ? slot->app : NULL;
-    fprintf(stderr, "[rdp:%s] %s\n", slot ? native_session_slot_name(slot->index) : "?",
-            redact_if_sensitive(app, line));
+    native_rdp_log_emit(level, slot ? native_session_slot_name(slot->index) : "?", target,
+                        redact_if_sensitive(app, message));
 }
 
 /* Fires on the initial MCS/GCC handshake and again on every RDPGFX_RESET_GRAPHICS_PDU, so
  * the real EGFX graphics output size (which can differ from the negotiated session size)
- * stays current for both the ss4s/H.264 and RemoteFX RGBA paths and for pointer mapping. */
+ * stays current for both the NDL/H.264 and RemoteFX RGBA paths and for pointer mapping. */
 static void on_desktop_size(void *ctx, uint16_t width, uint16_t height) {
     NativeSessionSlot *slot = (NativeSessionSlot *)ctx;
     if (!slot) {
@@ -1260,8 +1507,8 @@ static void on_desktop_size(void *ctx, uint16_t width, uint16_t height) {
      * NEW slot, and that server may never send another size update. */
     atomic_store(&slot->desktop_width, width);
     atomic_store(&slot->desktop_height, height);
-    fprintf(stderr, "[native] %s desktop=%ux%u\n", native_session_slot_name(slot->index), (unsigned)width,
-            (unsigned)height);
+    clog(cLogLevelInfo, "%s desktop=%ux%u", native_session_slot_name(slot->index), (unsigned)width,
+         (unsigned)height);
 }
 
 /* Creates the shared SS4S media owner on first use. Caller must hold app->video_lock. */
@@ -1292,8 +1539,8 @@ static NativeMedia *native_ensure_media_locked(App *app) {
     return app->media;
 }
 
-/* NDL sink: the headless miniaudio graph renders one 10 ms S16 block and this
- * callback feeds NDL. The graph render itself is lock-free; only the shared ss4s track
+/* NDL sink: the headless miniaudio engine renders one 10 ms S16 block and this
+ * callback feeds NDL. The engine render itself is lock-free; only the shared NDL track
  * needs the existing media lock. */
 static void native_audio_pipeline_feed_cb(void *ctx, const int16_t *samples, size_t frames) {
     App *app = (App *)ctx;
@@ -1301,9 +1548,9 @@ static void native_audio_pipeline_feed_cb(void *ctx, const int16_t *samples, siz
     if (app->audio) {
         size_t bytes = frames * NATIVE_AUDIO_PIPELINE_CHANNELS * sizeof(int16_t);
         if (native_audio_feed(app->audio, (const uint8_t *)samples, bytes) == NATIVE_AUDIO_ERROR) {
-            /* Mute instead of closing: on the webOS ss4s backends closing the audio track
-             * unloads the shared pipeline and would freeze a live video stream. */
-            fprintf(stderr, "[native-audio] mixed audio feed failed; muting audio\n");
+            /* Mute instead of closing: removing audio would reload the live video track
+             * and force another server keyframe request. */
+            clog(cLogLevelWarning, "mixed audio feed failed; muting audio");
             native_audio_disable(app->audio);
         }
     }
@@ -1325,23 +1572,8 @@ static void native_open_speculative_audio_locked(App *app) {
     app->audio = native_audio_open(app->media, RDP_AUDIO_CODEC_PCM_S16LE, NATIVE_AUDIO_PIPELINE_SAMPLE_RATE,
                                    NATIVE_AUDIO_PIPELINE_CHANNELS);
     if (app->audio) {
-        fprintf(stderr, "[native-audio] opened speculative mixed PCM %uHz %uch track ahead of negotiation\n",
-                NATIVE_AUDIO_PIPELINE_SAMPLE_RATE, NATIVE_AUDIO_PIPELINE_CHANNELS);
-    }
-}
-
-/* Reopens the audio track after something unloaded the shared media pipeline (on the
- * webOS ss4s backends closing either track does that). Cheap for audio: PCM needs no
- * keyframe, so sound resumes right after the reload. Caller must hold app->video_lock. */
-static void native_reopen_audio_locked(App *app) {
-    if (!app || !app->audio || !app->media) {
-        return;
-    }
-    native_audio_close(app->audio);
-    app->audio = native_audio_open(app->media, RDP_AUDIO_CODEC_PCM_S16LE, NATIVE_AUDIO_PIPELINE_SAMPLE_RATE,
-                                   NATIVE_AUDIO_PIPELINE_CHANNELS);
-    if (!app->audio) {
-        fprintf(stderr, "[native-audio] failed to reopen audio after pipeline reload; continuing without audio\n");
+        clog(cLogLevelInfo, "opened speculative mixed PCM %uHz %uch track ahead of negotiation",
+             NATIVE_AUDIO_PIPELINE_SAMPLE_RATE, NATIVE_AUDIO_PIPELINE_CHANNELS);
     }
 }
 
@@ -1369,9 +1601,9 @@ static void on_video_au(void *ctx, const uint8_t *data, size_t len, bool is_keyf
         } else {
             if (slot->snapshot.armed) {
                 if (!native_au_snapshot_append(&slot->snapshot, data, len, is_keyframe, pts90k)) {
-                    fprintf(stderr,
-                            "[native] %s AU snapshot overflowed (server still streaming?); switch-to will reconnect\n",
-                            native_session_slot_name(slot->index));
+                    clog(cLogLevelWarning,
+                         "%s AU snapshot overflowed (server still streaming?); switch-to will reconnect",
+                         native_session_slot_name(slot->index));
                 }
                 /* The quiet-gate timestamp must be public BEFORE readiness: a reader
                  * seeing ready=true with the previous (stale) timestamp could judge the
@@ -1392,7 +1624,7 @@ static void on_video_au(void *ctx, const uint8_t *data, size_t len, bool is_keyf
     /* The slot's desktop size reflects the server's real EGFX graphics output size
      * (on_desktop_size is re-invoked on every RDPGFX_RESET_GRAPHICS_PDU, not just the
      * initial MCS/GCC handshake), which can differ from the negotiated session size, e.g.
-     * a TV whose hardware decoder always runs at panel resolution. Reopen the ss4s decoder
+     * a TV whose hardware decoder always runs at panel resolution. Reopen the hardware decoder
      * whenever that size changes so it matches what the server actually encodes. */
     uint16_t desktop_width = (uint16_t)atomic_load(&slot->desktop_width);
     uint16_t desktop_height = (uint16_t)atomic_load(&slot->desktop_height);
@@ -1403,12 +1635,8 @@ static void on_video_au(void *ctx, const uint8_t *data, size_t len, bool is_keyf
         return;
     }
     if (app->rgba) {
-#if defined(HELLOLG_WITH_SDL) && HELLOLG_WITH_SDL
-        native_defer_rgba_texture_destroy(app);
-#endif
-        native_rgba_surface_close(app->rgba);
-        app->rgba = NULL;
-        fprintf(stderr, "[native] switching graphics path from native RemoteFX RGBA to ss4s/H.264\n");
+        native_close_rgba_locked(app, true);
+        clog(cLogLevelNotice, "switching graphics path from native RemoteFX RGBA to NDL/H.264");
     }
     if (app->video && (app->video_owner_slot != slot->index ||
                        app->video_owner_epoch != atomic_load(&slot->connect_epoch))) {
@@ -1420,8 +1648,9 @@ static void on_video_au(void *ctx, const uint8_t *data, size_t len, bool is_keyf
             pthread_mutex_unlock(&app->video_lock);
             unsigned waited = atomic_fetch_add(&slot->keyframe_wait_drops, 1u) + 1u;
             if (waited % 60u == 1u) {
-                fprintf(stderr, "[native] waiting for a %s keyframe; %u delta AUs dropped since the switch\n",
-                        native_session_slot_name(slot->index), waited);
+                clog(cLogLevelDebug,
+                     "waiting for a %s keyframe; %u delta AUs dropped since the switch",
+                     native_session_slot_name(slot->index), waited);
             }
             return;
         }
@@ -1431,33 +1660,31 @@ static void on_video_au(void *ctx, const uint8_t *data, size_t len, bool is_keyf
             /* Same dimensions: hand the running decoder over in-band. gnome-remote-desktop
              * sends SPS+PPS with every IDR, which restarts H.264 decode cleanly — no
              * pipeline reload, no black gap, and the mixed audio track is never touched. */
-            fprintf(stderr, "[native] handing the video decoder to the %s session in-band (%ux%u)\n",
-                    native_session_slot_name(slot->index), (unsigned)desktop_width, (unsigned)desktop_height);
+            clog(cLogLevelNotice, "handing the video decoder to the %s session in-band (%ux%u)",
+                 native_session_slot_name(slot->index), (unsigned)desktop_width,
+                 (unsigned)desktop_height);
             app->video_owner_slot = slot->index;
             app->video_owner_epoch = atomic_load(&slot->connect_epoch);
             app->decoder_keyframe_pending = false;
         } else {
-            fprintf(stderr, "[native] swapping video to the %s session (keyframe in hand, %ux%u -> %ux%u)\n",
-                    native_session_slot_name(slot->index), (unsigned)native_video_width(app->video),
-                    (unsigned)native_video_height(app->video), (unsigned)desktop_width, (unsigned)desktop_height);
+            clog(cLogLevelNotice,
+                 "swapping video to the %s session (keyframe in hand, %ux%u -> %ux%u)",
+                 native_session_slot_name(slot->index), (unsigned)native_video_width(app->video),
+                 (unsigned)native_video_height(app->video), (unsigned)desktop_width,
+                 (unsigned)desktop_height);
             native_video_close(app->video);
             app->video = NULL;
             app->decoder_keyframe_pending = false;
-            /* Closing the video track unloaded the shared pipeline; bring audio back. */
-            native_reopen_audio_locked(app);
         }
     }
     if (app->video &&
         (desktop_width != native_video_width(app->video) || desktop_height != native_video_height(app->video))) {
-        fprintf(stderr, "[native] ss4s surface size changed %ux%u -> %ux%u; reopening decoder\n",
-                (unsigned)native_video_width(app->video), (unsigned)native_video_height(app->video),
-                (unsigned)desktop_width, (unsigned)desktop_height);
+        clog(cLogLevelNotice, "hardware surface size changed %ux%u -> %ux%u; reopening decoder",
+             (unsigned)native_video_width(app->video), (unsigned)native_video_height(app->video),
+             (unsigned)desktop_width, (unsigned)desktop_height);
         native_video_close(app->video);
         app->video = NULL;
         app->decoder_keyframe_pending = false;
-        /* Closing the video track unloaded the shared pipeline; bring audio back.
-         * The speculative open below won't (it no-ops while app->audio is set). */
-        native_reopen_audio_locked(app);
     }
     if (!app->video) {
         NativeMedia *media = native_ensure_media_locked(app);
@@ -1475,7 +1702,8 @@ static void on_video_au(void *ctx, const uint8_t *data, size_t len, bool is_keyf
         if (!app->video) {
             pthread_mutex_unlock(&app->video_lock);
             app->decoder_errors++;
-            fprintf(stderr, "[native] terminal native error: DecoderError; ss4s decoder unavailable\n");
+            clog(cLogLevelError,
+                 "terminal native error: DecoderError; hardware decoder unavailable");
             slot_stop_with_state(slot, RDP_STATE_DECODER_ERROR, rdp_state_exit_code(RDP_STATE_DECODER_ERROR));
             return;
         }
@@ -1492,8 +1720,8 @@ static void on_video_au(void *ctx, const uint8_t *data, size_t len, bool is_keyf
          * tick would send that refresh to the fresh target and arm its watchdog into a
          * needless reconnect on a static desktop. */
         if (slot->index == atomic_load(&app->active_index) && !app->decoder_keyframe_pending) {
-            fprintf(stderr,
-                    "[native] decoder requested keyframe/recovery; waiting for native RDP recovery, no web fallback\n");
+            clog(cLogLevelWarning,
+                 "decoder requested keyframe/recovery; waiting for native RDP recovery, no web fallback");
             app->decoder_keyframe_pending = true;
             /* Kick the SDL thread: refresh-capable servers deliver an IDR, refresh-
              * ineffective ones fall to the keyframe watchdog's reconnect. Without this a
@@ -1519,7 +1747,7 @@ static void on_video_au(void *ctx, const uint8_t *data, size_t len, bool is_keyf
     }
 
     app->decoder_errors++;
-    fprintf(stderr, "[native] terminal native error: DecoderError; decoder feed result=%d\n", (int)result);
+    clog(cLogLevelError, "terminal native error: DecoderError; decoder feed result=%d", (int)result);
     slot_stop_with_state(slot, RDP_STATE_DECODER_ERROR, rdp_state_exit_code(RDP_STATE_DECODER_ERROR));
 }
 
@@ -1532,14 +1760,17 @@ static void on_audio_format(void *ctx, uint32_t codec, uint32_t sample_rate, uin
         return;
     }
     App *app = slot->app;
+    slot->audio_routed = false;
+    atomic_store(&slot->audio_codec, 0u);
+    atomic_store(&slot->audio_sample_rate, 0u);
+    atomic_store(&slot->audio_channels, 0u);
     if (codec != RDP_AUDIO_CODEC_PCM_S16LE && codec != RDP_AUDIO_CODEC_OPUS) {
         if (!slot->audio_incompatible_logged) {
-            fprintf(stderr, "[native-audio] %s session negotiated unsupported codec %u; muting it in the mix\n",
-                    native_session_slot_name(slot->index), (unsigned)codec);
+            clog(cLogLevelWarning, "%s session negotiated unsupported codec %u; muting it in the mix",
+                 native_session_slot_name(slot->index), (unsigned)codec);
             slot->audio_incompatible_logged = true;
         }
         native_audio_pipeline_close_source(&app->audio_pipeline, slot->index);
-        slot->audio_routed = false;
         return;
     }
     if (codec == RDP_AUDIO_CODEC_OPUS) {
@@ -1549,12 +1780,11 @@ static void on_audio_format(void *ctx, uint32_t codec, uint32_t sample_rate, uin
         slot->opus_decoder = native_opus_decoder_open(sample_rate, channels);
         if (!slot->opus_decoder) {
             if (!slot->audio_incompatible_logged) {
-                fprintf(stderr, "[native-audio] %s session: no Opus decoder available; muting it in the mix\n",
-                        native_session_slot_name(slot->index));
+                clog(cLogLevelWarning, "%s session: no Opus decoder available; muting it in the mix",
+                     native_session_slot_name(slot->index));
                 slot->audio_incompatible_logged = true;
             }
             native_audio_pipeline_close_source(&app->audio_pipeline, slot->index);
-            slot->audio_routed = false;
             return;
         }
     } else if (slot->opus_decoder) {
@@ -1564,22 +1794,23 @@ static void on_audio_format(void *ctx, uint32_t codec, uint32_t sample_rate, uin
 
     if (!native_audio_pipeline_set_source_format(&app->audio_pipeline, slot->index, sample_rate, channels)) {
         if (!slot->audio_incompatible_logged) {
-            fprintf(stderr, "[native-audio] %s session has unsupported PCM format %uHz %uch; muting it\n",
-                    native_session_slot_name(slot->index), (unsigned)sample_rate, (unsigned)channels);
+            clog(cLogLevelWarning, "%s session has unsupported PCM format %uHz %uch; muting it",
+                 native_session_slot_name(slot->index), (unsigned)sample_rate, (unsigned)channels);
             slot->audio_incompatible_logged = true;
         }
         native_opus_decoder_close(slot->opus_decoder);
         slot->opus_decoder = NULL;
-        slot->audio_routed = false;
+        native_audio_pipeline_close_source(&app->audio_pipeline, slot->index);
         return;
     }
-    slot->audio_sample_rate = sample_rate;
-    slot->audio_channels = channels;
+    atomic_store(&slot->audio_codec, codec);
+    atomic_store(&slot->audio_sample_rate, sample_rate);
+    atomic_store(&slot->audio_channels, channels);
     slot->audio_routed = true;
     slot->audio_incompatible_logged = false;
-    fprintf(stderr, "[native-audio] %s session audio joined the mix (%s %uHz %uch)\n",
-            native_session_slot_name(slot->index), codec == RDP_AUDIO_CODEC_OPUS ? "Opus->PCM" : "PCM",
-            (unsigned)sample_rate, (unsigned)channels);
+    clog(cLogLevelInfo, "%s session audio joined the mix (%s %uHz %uch)",
+         native_session_slot_name(slot->index), codec == RDP_AUDIO_CODEC_OPUS ? "Opus->PCM" : "PCM",
+         (unsigned)sample_rate, (unsigned)channels);
 
     pthread_mutex_lock(&app->video_lock);
     if (!app->audio) {
@@ -1598,16 +1829,16 @@ static void on_audio_format(void *ctx, uint32_t codec, uint32_t sample_rate, uin
                  * SPS+PPS+IDR instead of feeding P-frames into a fresh decoder — and ask
                  * the SDL thread to force that keyframe (gnome-remote-desktop never
                  * resends an IDR spontaneously). */
-                fprintf(stderr,
-                        "[native] audio open reloaded the media pipeline; reopening video on next keyframe\n");
+                clog(cLogLevelNotice,
+                     "audio open reloaded the media pipeline; reopening video on next keyframe");
                 native_video_close(app->video);
                 app->video = NULL;
                 app->decoder_keyframe_pending = false;
-                native_reopen_audio_locked(app);
                 atomic_store(&app->video_refresh_needed, true);
             }
         } else {
-            fprintf(stderr, "[native-audio] audio sink unavailable (PCM 48000Hz 2ch); continuing with silent video\n");
+            clog(cLogLevelWarning,
+                 "audio sink unavailable (PCM 48000Hz 2ch); continuing with silent video");
         }
     }
     pthread_mutex_unlock(&app->video_lock);
@@ -1627,7 +1858,7 @@ static void on_audio_data(void *ctx, const uint8_t *data, size_t len, uint32_t t
         }
         return;
     }
-    size_t frame_bytes = (size_t)slot->audio_channels * sizeof(int16_t);
+    size_t frame_bytes = (size_t)atomic_load(&slot->audio_channels) * sizeof(int16_t);
     size_t frames = frame_bytes ? len / frame_bytes : 0;
     if (frames > 0) {
         (void)native_audio_pipeline_push(&app->audio_pipeline, slot->index,
@@ -1689,6 +1920,10 @@ static void native_stop_media(App *app) {
     pthread_mutex_lock(&app->video_lock);
     native_rgba_surface_close(app->rgba);
     app->rgba = NULL;
+    native_reset_rgba_owner(app);
+    /* native_stop_media() is SDL/main-thread only, so the frozen surface's texture can
+     * be destroyed directly along with the current canvas. */
+    native_close_hub_return_rgba_locked(app);
     /* Tracks first, then the shared player/library they attach to. */
     native_audio_close(app->audio);
     app->audio = NULL;
@@ -1706,6 +1941,16 @@ static void native_stop_media(App *app) {
     }
 #endif
     pthread_mutex_unlock(&app->video_lock);
+}
+
+static void native_publish_effective_solo_mask(App *app) {
+    uint8_t connected_mask = 0;
+    for (int i = 0; i < NATIVE_SETTINGS_MAX_SESSIONS; i++) {
+        if (app->sessions[i].rdp) {
+            connected_mask |= (uint8_t)(1u << i);
+        }
+    }
+    native_audio_pipeline_set_solo_mask(&app->audio_pipeline, app->mixer_solo_mask & connected_mask);
 }
 
 /* Stops one slot's RDP session (joins its worker) and detaches it from the shared
@@ -1726,12 +1971,14 @@ static void native_stop_slot(App *app, int index) {
     pthread_mutex_lock(&app->video_lock);
     native_audio_pipeline_close_source(&app->audio_pipeline, index);
     slot->audio_routed = false;
-    slot->audio_sample_rate = 0;
-    slot->audio_channels = 0;
+    atomic_store(&slot->audio_codec, 0u);
+    atomic_store(&slot->audio_sample_rate, 0u);
+    atomic_store(&slot->audio_channels, 0u);
     slot->audio_incompatible_logged = false;
     /* Whatever the cache held belongs to the connection that just died. */
     native_au_snapshot_reset(&slot->snapshot);
     pthread_mutex_unlock(&app->video_lock);
+    native_publish_effective_solo_mask(app);
     atomic_store(&slot->snapshot_idr_ready, false);
     slot->snapshot_pending = false;
     /* The worker is joined above; its decoder can be freed from this thread now. */
@@ -1740,6 +1987,10 @@ static void native_stop_slot(App *app, int index) {
     slot->suppressed = false;
     atomic_store(&slot->current_state, (int)RDP_STATE_IDLE);
     atomic_store(&slot->session_failed, false);
+#if defined(HELLOLG_WITH_SDL) && HELLOLG_WITH_SDL
+    app->session_started_ms[index] = 0;
+    app->session_runtime_active[index] = false;
+#endif
 }
 
 static void native_stop_all_sessions(App *app) {
@@ -1767,14 +2018,31 @@ static bool native_slot_connect(App *app, int index, bool arm_snapshot) {
         return false;
     }
     NativeSessionSlot *slot = &app->sessions[index];
+#if defined(HELLOLG_WITH_SDL) && HELLOLG_WITH_SDL
+    /* All calls that reach here with a running slot are internal recovery reconnects,
+     * except the explicit UI Connect path, which clears this clock before calling us. */
+    uint64_t logical_session_started_ms = app->session_started_ms[index];
+    bool logical_session_runtime_active = app->session_runtime_active[index];
+#endif
     native_stop_slot(app, index);
+#if defined(HELLOLG_WITH_SDL) && HELLOLG_WITH_SDL
+    pthread_mutex_lock(&app->video_lock);
+    if (app->hub_return_rgba && app->hub_return_replacement_slot == index) {
+        /* The old worker is joined, so this cumulative frame baseline is stable. Publish
+         * the next epoch before the replacement worker can race out its first bitmap/AU. */
+        native_arm_hub_return_replacement_locked(
+            app, index, atomic_load(&slot->connect_epoch) + 1u,
+            atomic_load(&slot->video_ok_frames));
+    }
+    pthread_mutex_unlock(&app->video_lock);
+#endif
     if (arm_snapshot) {
         /* "Not ready" must be public before the cache can accept AUs (see on_video_au:
          * the timestamp/readiness pair is published append-side in the safe order). */
         atomic_store(&slot->snapshot_idr_ready, false);
         pthread_mutex_lock(&app->video_lock);
         if (!native_au_snapshot_arm(&slot->snapshot)) {
-            fprintf(stderr, "[native] %s AU snapshot allocation failed\n", native_session_slot_name(index));
+            clog(cLogLevelWarning, "%s AU snapshot allocation failed", native_session_slot_name(index));
         }
         pthread_mutex_unlock(&app->video_lock);
     }
@@ -1811,6 +2079,7 @@ static bool native_slot_connect(App *app, int index, bool arm_snapshot) {
     RdpCallbacks callbacks = {
         .ctx = slot,
         .on_state = on_state,
+        .on_log_enabled = on_log_enabled,
         .on_log = on_log,
         .on_desktop_size = on_desktop_size,
         .on_bitmap_update = on_bitmap_update,
@@ -1822,14 +2091,20 @@ static bool native_slot_connect(App *app, int index, bool arm_snapshot) {
         .on_pointer_state = on_pointer_state,
     };
 
-    fprintf(stderr, "[native] starting %s session for %s:%u (%ux%u@%u AVC420/RemoteFX)\n",
-            native_session_slot_name(index), config.host, (unsigned)config.port, (unsigned)config.width,
-            (unsigned)config.height, (unsigned)config.fps);
+    clog(cLogLevelInfo, "starting %s session for %s:%u (%ux%u@%u AVC420/RemoteFX)",
+         native_session_slot_name(index), config.host, (unsigned)config.port, (unsigned)config.width,
+         (unsigned)config.height, (unsigned)config.fps);
     slot->rdp = rdp_session_start(&config, &callbacks);
     if (!slot->rdp) {
-        fprintf(stderr, "[native] rdp_session_start failed for the %s session\n", native_session_slot_name(index));
+        clog(cLogLevelError, "rdp_session_start failed for the %s session",
+             native_session_slot_name(index));
         return false;
     }
+#if defined(HELLOLG_WITH_SDL) && HELLOLG_WITH_SDL
+    app->session_started_ms[index] = logical_session_started_ms;
+    app->session_runtime_active[index] = logical_session_runtime_active;
+#endif
+    native_publish_effective_solo_mask(app);
     if (is_active) {
         native_input_set_session(&app->input, slot->rdp);
     }
@@ -1853,39 +2128,39 @@ static void native_set_virtual_mouse_position(App *app, int x, int y);
 static void native_log_sdl_display_modes(void) {
     int display_count = SDL_GetNumVideoDisplays();
     if (display_count <= 0) {
-        fprintf(stderr, "[native] SDL video displays unavailable: %s\n", SDL_GetError());
+        clog(cLogLevelWarning, "SDL video displays unavailable: %s", SDL_GetError());
         return;
     }
 
-    fprintf(stderr, "[native] SDL video displays=%d\n", display_count);
+    clog(cLogLevelDebug, "SDL video displays=%d", display_count);
     for (int display = 0; display < display_count; display++) {
         SDL_DisplayMode desktop_mode;
         if (SDL_GetDesktopDisplayMode(display, &desktop_mode) == 0) {
-            fprintf(stderr, "[native] SDL display %d desktop=%dx%d@%d format=0x%x\n", display, desktop_mode.w,
-                    desktop_mode.h, desktop_mode.refresh_rate, (unsigned)desktop_mode.format);
+            clog(cLogLevelDebug, "SDL display %d desktop=%dx%d@%d format=0x%x", display,
+                 desktop_mode.w, desktop_mode.h, desktop_mode.refresh_rate, (unsigned)desktop_mode.format);
         } else {
-            fprintf(stderr, "[native] SDL display %d desktop mode unavailable: %s\n", display, SDL_GetError());
+            clog(cLogLevelDebug, "SDL display %d desktop mode unavailable: %s", display, SDL_GetError());
         }
 
         SDL_DisplayMode current_mode;
         if (SDL_GetCurrentDisplayMode(display, &current_mode) == 0) {
-            fprintf(stderr, "[native] SDL display %d current=%dx%d@%d format=0x%x\n", display, current_mode.w,
-                    current_mode.h, current_mode.refresh_rate, (unsigned)current_mode.format);
+            clog(cLogLevelDebug, "SDL display %d current=%dx%d@%d format=0x%x", display,
+                 current_mode.w, current_mode.h, current_mode.refresh_rate, (unsigned)current_mode.format);
         } else {
-            fprintf(stderr, "[native] SDL display %d current mode unavailable: %s\n", display, SDL_GetError());
+            clog(cLogLevelDebug, "SDL display %d current mode unavailable: %s", display, SDL_GetError());
         }
 
         int mode_count = SDL_GetNumDisplayModes(display);
         if (mode_count < 0) {
-            fprintf(stderr, "[native] SDL display %d modes unavailable: %s\n", display, SDL_GetError());
+            clog(cLogLevelDebug, "SDL display %d modes unavailable: %s", display, SDL_GetError());
             continue;
         }
-        fprintf(stderr, "[native] SDL display %d modes=%d\n", display, mode_count);
+        clog(cLogLevelTrace, "SDL display %d modes=%d", display, mode_count);
         for (int mode_index = 0; mode_index < mode_count; mode_index++) {
             SDL_DisplayMode mode;
             if (SDL_GetDisplayMode(display, mode_index, &mode) == 0) {
-                fprintf(stderr, "[native] SDL display %d mode %d=%dx%d@%d format=0x%x\n", display, mode_index,
-                        mode.w, mode.h, mode.refresh_rate, (unsigned)mode.format);
+                clog(cLogLevelTrace, "SDL display %d mode %d=%dx%d@%d format=0x%x", display,
+                     mode_index, mode.w, mode.h, mode.refresh_rate, (unsigned)mode.format);
             }
         }
     }
@@ -1898,7 +2173,7 @@ static bool native_read_renderer_output_size(SDL_Renderer *renderer, int *width,
     int output_width = 0;
     int output_height = 0;
     if (SDL_GetRendererOutputSize(renderer, &output_width, &output_height) != 0 || output_width <= 0 || output_height <= 0) {
-        fprintf(stderr, "[native] SDL renderer output size unavailable: %s\n", SDL_GetError());
+        clog(cLogLevelError, "SDL renderer output size unavailable: %s", SDL_GetError());
         return false;
     }
     if (width) {
@@ -1921,7 +2196,7 @@ static bool native_update_render_size(App *app, SDL_Renderer *renderer) {
     if (app && (atomic_load(&app->render_width) != clamped_width || atomic_load(&app->render_height) != clamped_height)) {
         atomic_store(&app->render_width, clamped_width);
         atomic_store(&app->render_height, clamped_height);
-        fprintf(stderr, "[native] SDL renderer output=%dx%d\n", render_width, render_height);
+        clog(cLogLevelDebug, "SDL renderer output=%dx%d", render_width, render_height);
         pthread_mutex_lock(&app->video_lock);
         native_media_set_viewport(app->media, clamped_width, clamped_height);
         pthread_mutex_unlock(&app->video_lock);
@@ -2016,7 +2291,7 @@ static bool native_init_render_state(App *app, SDL_Window *window, SDL_Renderer 
     int current_width = 0;
     int current_height = 0;
     SDL_GetWindowSize(window, &current_width, &current_height);
-    fprintf(stderr, "[native] SDL window size=%dx%d\n", current_width, current_height);
+    clog(cLogLevelDebug, "SDL window size=%dx%d", current_width, current_height);
     if (!native_update_render_size(app, renderer)) {
         if (message && message_cap > 0) {
             (void)snprintf(message, message_cap, "Failed to read local SDL render target.");
@@ -2074,17 +2349,25 @@ static int native_sdl_webos_color_slot(const SDL_KeyboardEvent *event) {
     return -1;
 }
 
+static bool native_sdl_confirm_key(const SDL_KeyboardEvent *event) {
+    if (!event) {
+        return false;
+    }
+    return event->keysym.sym == SDLK_RETURN || event->keysym.sym == SDLK_KP_ENTER ||
+           event->keysym.sym == SDLK_RETURN2;
+}
+
 static void native_request_session_switch(App *app, int target);
 static void native_ring_switch(App *app, int direction);
+static void native_show_hub(App *app);
 /* Volume-mixer overlay key hooks for the evdev drain (definitions live with the overlay
  * code, after the presenters they use). */
 static bool native_mixer_overlay_consumes_evdev_key(uint16_t code);
-static void native_mixer_overlay_evdev_key(App *app, uint16_t code);
+static void native_mixer_overlay_evdev_key(App *app, uint16_t code, bool down);
 
-/* Pre-connect screen: swallow the color keys before the LVGL key queue eats them. They
- * carry the same navigation semantics as on the streaming screen — back to that slot's
- * live stream when it is connected, otherwise its configurator form (which is what the
- * next Connect targets). App exit is the system's business (webOS EXIT/home). */
+/* Pre-connect screen: swallow session-navigation keys before the LVGL key queue eats
+ * them. Onboarding temporarily owns the remote; after that, colours activate their
+ * fixed profiles and CH +/- moves the hub selection. */
 static int native_filter_webos_system_keys(void *userdata, SDL_Event *event) {
     App *app = (App *)userdata;
     if (!event || (event->type != SDL_KEYDOWN && event->type != SDL_KEYUP)) {
@@ -2093,8 +2376,24 @@ static int native_filter_webos_system_keys(void *userdata, SDL_Event *event) {
     int slot = native_sdl_webos_color_slot(&event->key);
     if (slot >= 0) {
         if (event->type == SDL_KEYDOWN && app) {
+#if defined(HELLOLG_WITH_PRECONNECT_UI) && HELLOLG_WITH_PRECONNECT_UI
+            if (!native_preconnect_ui_session_keys_enabled(app->preconnect_ui)) {
+                return 0;
+            }
+            native_preconnect_ui_cancel_pending_navigation(app->preconnect_ui);
+#endif
             native_request_session_switch(app, slot);
         }
+        return 0;
+    }
+    if (event->key.keysym.scancode == 480 /* SDL_WEBOS_SCANCODE_CH_UP */ ||
+        event->key.keysym.scancode == 481 /* SDL_WEBOS_SCANCODE_CH_DOWN */) {
+#if defined(HELLOLG_WITH_PRECONNECT_UI) && HELLOLG_WITH_PRECONNECT_UI
+        if (event->type == SDL_KEYDOWN && app && native_preconnect_ui_session_keys_enabled(app->preconnect_ui)) {
+            (void)native_preconnect_ui_cycle_slot(app->preconnect_ui,
+                                                  event->key.keysym.scancode == 480 ? 1 : -1);
+        }
+#endif
         return 0;
     }
     return 1;
@@ -2291,16 +2590,8 @@ static void native_drain_evdev_mouse(App *app, SDL_Window *window) {
 }
 
 static void native_log_unmapped_evdev_key(uint16_t code, bool down) {
-    static unsigned unmapped_log_count = 0;
-    if (unmapped_log_count >= 256) {
-        if (unmapped_log_count == 256) {
-            fprintf(stderr, "[native-input] further unmapped evdev key logs suppressed\n");
-            unmapped_log_count++;
-        }
-        return;
-    }
-    unmapped_log_count++;
-    fprintf(stderr, "[native-input] unmapped evdev key %s code=%u\n", down ? "down" : "up", (unsigned)code);
+    clog_limited(cLogLevelDebug, 16, 1000, "unmapped evdev key %s code=%u",
+                 down ? "down" : "up", (unsigned)code);
 }
 
 /* SDL thread: apply queued raw-evdev keyboard events. Each Linux keycode is translated to its
@@ -2329,6 +2620,12 @@ static int native_evdev_color_slot(uint16_t code) {
     }
 }
 
+#if defined(HELLOLG_WITH_PRECONNECT_UI) && HELLOLG_WITH_PRECONNECT_UI
+static bool native_evdev_confirm_key(uint16_t code) {
+    return code == 28 /* KEY_ENTER */ || code == 96 /* KEY_KPENTER */ || code == 352 /* KEY_OK */;
+}
+#endif
+
 static void native_drain_evdev_keyboard(App *app) {
     if (!native_evdev_input_keyboard_active(&app->evdev_input)) {
         return;
@@ -2341,6 +2638,12 @@ static void native_drain_evdev_keyboard(App *app) {
             break;
         }
         for (size_t i = 0; i < count; i++) {
+            if (events[i].from_remote) {
+                /* Remote presses are sparse; keep this diagnostic because key codes
+                 * vary between webOS firmware and remote models. */
+                clog(cLogLevelDebug, "remote key code=%u %s", (unsigned)events[i].code,
+                     events[i].down ? "down" : "up");
+            }
             int color_slot = native_evdev_color_slot(events[i].code);
             if (color_slot >= 0) {
                 if (events[i].down) {
@@ -2355,11 +2658,31 @@ static void native_drain_evdev_keyboard(App *app) {
                 continue;
             }
             if (app->mixer_overlay_visible && native_mixer_overlay_consumes_evdev_key(events[i].code)) {
+                /* Releases flow through too: the activation edge detector re-arms on
+                 * the up edge (both edges stay swallowed either way). */
+                native_mixer_overlay_evdev_key(app, events[i].code, events[i].down);
+                continue;
+            }
+#if defined(HELLOLG_WITH_PRECONNECT_UI) && HELLOLG_WITH_PRECONNECT_UI
+            if (events[i].from_remote && native_evdev_confirm_key(events[i].code)) {
+                /* The central remote button owns HUB, but Enter from a physical USB
+                 * keyboard (from_remote=false) remains an ordinary RDP key. Swallow
+                 * both edges. Open on release so native_show_hub can drop EVIOCGRAB
+                 * only after the compositor can no longer inherit the other half of
+                 * this press and reinterpret it as BACK. Autorepeat merely keeps the
+                 * held latch armed. */
                 if (events[i].down) {
-                    native_mixer_overlay_evdev_key(app, events[i].code);
+                    app->hub_open_key_held = true;
+                } else {
+                    bool opened_from_this_press = app->hub_open_key_held;
+                    app->hub_open_key_held = false;
+                    if (opened_from_this_press && app->streaming_visible) {
+                        native_show_hub(app);
+                    }
                 }
                 continue;
             }
+#endif
             if (events[i].code == 402 /* KEY_CHANNELUP */ || events[i].code == 403 /* KEY_CHANNELDOWN */) {
                 /* Channel-zapping between the connected slots; like the color keys these
                  * may ride either input path depending on the remote firmware. */
@@ -2452,21 +2775,23 @@ static NativeInputStartResult native_start_streaming_input(App *app) {
          * Probe /dev/input directly so an eventfd/thread failure with a keyboard attached is
          * reported as a resource failure, not "no keyboard detected". */
         if (native_evdev_input_probe_keyboard()) {
-            fprintf(stderr, "[native] WARNING: input capture failed to start even though a USB keyboard is "
-                            "attached; this session has no mouse or keyboard input\n");
+            clog(cLogLevelWarning,
+                 "input capture failed to start even though a USB keyboard is attached; this session has no "
+                 "mouse or keyboard input");
             return NATIVE_INPUT_START_UNAVAILABLE;
         }
-        fprintf(stderr,
-                "[native] WARNING: no USB mouse/keyboard grabbed; using SDL mouse fallback and no keyboard input\n");
+        clog(cLogLevelWarning,
+             "no USB mouse/keyboard grabbed; using SDL mouse fallback and no keyboard input");
         return NATIVE_INPUT_START_NO_KEYBOARD;
     }
     if (!native_evdev_input_mouse_active(&app->evdev_input)) {
-        fprintf(stderr, "[native] no USB mouse to grab; using the compositor pointer (Magic Remote) via SDL\n");
+        clog(cLogLevelInfo,
+             "no USB mouse to grab; using the compositor pointer (Magic Remote) via SDL");
     }
     if (!native_evdev_input_keyboard_active(&app->evdev_input)) {
-        fprintf(stderr,
-                "[native] WARNING: no USB keyboard grabbed and there is no SDL keyboard fallback; this "
-                "session has no keyboard input until a USB keyboard is attached (it is picked up live)\n");
+        clog(cLogLevelWarning,
+             "no USB keyboard grabbed and there is no SDL keyboard fallback; this session has no keyboard "
+             "input until a USB keyboard is attached (it is picked up live)");
         return NATIVE_INPUT_START_NO_KEYBOARD;
     }
     return NATIVE_INPUT_START_OK;
@@ -2485,6 +2810,7 @@ static void native_stop_streaming_input(App *app) {
     /* Flush releases for anything held BEFORE dropping the grab: once the grab is gone the
      * up-events go to the overlay, not RDP, and the server would keep the drag/key stuck. */
     native_flush_held_inputs(app);
+    app->hub_open_key_held = false;
 #if HELLOLG_WITH_EVDEV_INPUT
     native_evdev_input_stop(&app->evdev_input);
 #endif
@@ -2496,7 +2822,8 @@ static void native_stop_streaming_input(App *app) {
  * pointer hidden behind our back, so without this the RDP cursor stays invisible until a big
  * mouse sweep. */
 static void native_resume_streaming_input(App *app, SDL_Window *window) {
-    if (!app || atomic_load(&native_active_slot(app)->current_state) != (int)RDP_STATE_ACTIVE) {
+    if (!app || !app->streaming_visible ||
+        atomic_load(&native_active_slot(app)->current_state) != (int)RDP_STATE_ACTIVE) {
         return;
     }
 #if defined(HELLOLG_WITH_PRECONNECT_UI) && HELLOLG_WITH_PRECONNECT_UI
@@ -2521,7 +2848,7 @@ static void native_present_renderer_frame(App *app, SDL_Renderer *renderer, bool
         return;
     }
     /* Present the transparent hole-punch frame exactly once. Re-clearing and
-     * re-presenting every loop tick raced the ss4s hardware video plane's own buffer
+     * re-presenting every loop tick raced the NDL hardware video plane's own buffer
      * swaps on this webOS compositor and produced visible flicker between the (empty)
      * graphics layer and the video plane underneath. */
     SDL_SetRenderTarget(renderer, NULL);
@@ -2531,7 +2858,7 @@ static void native_present_renderer_frame(App *app, SDL_Renderer *renderer, bool
     SDL_RenderPresent(renderer);
     app->video_plane_punched = true;
     if (logged && !*logged) {
-        fprintf(stderr, "[native] presented initial SDL renderer frame\n");
+        clog(cLogLevelDebug, "presented initial SDL renderer frame");
         *logged = true;
     }
 }
@@ -2539,79 +2866,127 @@ static void native_present_renderer_frame(App *app, SDL_Renderer *renderer, bool
 static void native_present_surface_frame(SDL_Window *window, bool *logged) {
     SDL_Surface *surface = SDL_GetWindowSurface(window);
     if (!surface) {
-        fprintf(stderr, "[native] SDL_GetWindowSurface failed: %s\n", SDL_GetError());
+        clog(cLogLevelError, "SDL_GetWindowSurface failed: %s", SDL_GetError());
         return;
     }
     if (SDL_FillRect(surface, NULL, SDL_MapRGB(surface->format, 0, 0, 0)) != 0) {
-        fprintf(stderr, "[native] SDL_FillRect launch frame failed: %s\n", SDL_GetError());
+        clog(cLogLevelError, "SDL_FillRect launch frame failed: %s", SDL_GetError());
         return;
     }
     if (SDL_UpdateWindowSurface(window) != 0) {
-        fprintf(stderr, "[native] SDL_UpdateWindowSurface launch frame failed: %s\n", SDL_GetError());
+        clog(cLogLevelError, "SDL_UpdateWindowSurface launch frame failed: %s", SDL_GetError());
         return;
     }
     if (logged && !*logged) {
-        fprintf(stderr, "[native] presented initial SDL surface frame\n");
+        clog(cLogLevelDebug, "presented initial SDL surface frame");
         *logged = true;
     }
 }
 
-static int native_present_rgba_frame(App *app, SDL_Renderer *renderer, bool *logged) {
+/* Draws the cached RemoteFX/bitmap desktop into the current window backbuffer without
+ * presenting. Returns 1 for a completed draw, 2 for a recoverable skipped draw (the
+ * previous front buffer remains owned by RGBA), 0 when no frame exists, and -1 for a
+ * terminal failure. Streaming presents immediately below; HUB uses the same draw as its
+ * bottom layer, then LVGL adds translucent chrome and performs the single present. */
+static int native_draw_rgba_frame(App *app, SDL_Renderer *renderer, bool *logged) {
     if (!app || !renderer) {
         return 0;
     }
     int status = 0;
+    int failed_owner_slot = -1;
     NativeRgbaResult failed_result = NATIVE_RGBA_OK;
     pthread_mutex_lock(&app->video_lock);
     if (app->pending_texture_destroy) {
         SDL_DestroyTexture(app->pending_texture_destroy);
         app->pending_texture_destroy = NULL;
     }
-    if (app->rgba && native_rgba_surface_has_frame(app->rgba)) {
+    int active_index = atomic_load(&app->active_index);
+    NativeSessionSlot *active = &app->sessions[active_index];
+    unsigned active_epoch = atomic_load(&active->connect_epoch);
+    bool active_rgba_ready = native_rgba_owner_matches(app, active_index, active_epoch) &&
+                             native_rgba_surface_has_frame(app->rgba);
+    bool active_h264_ready = app->video && app->video_owner_slot == active_index &&
+                             app->video_owner_epoch == active_epoch;
+    bool replacement_ready =
+        app->hub_return_rgba && app->hub_return_replacement_slot == active_index &&
+        app->hub_return_replacement_epoch == active_epoch &&
+        atomic_load(&active->current_state) == (int)RDP_STATE_ACTIVE &&
+        atomic_load(&active->video_ok_frames) != app->hub_return_replacement_baseline_frames &&
+        (active_rgba_ready || active_h264_ready);
+    bool drawing_return = app->hub_return_rgba && !replacement_ready;
+    NativeRgbaSurface *surface = active_rgba_ready ? app->rgba : NULL;
+    if (drawing_return) {
+        surface = app->hub_return_rgba;
+    }
+    if (surface && native_rgba_surface_has_frame(surface)) {
         uint16_t viewport_width = (uint16_t)atomic_load(&app->render_width);
         uint16_t viewport_height = (uint16_t)atomic_load(&app->render_height);
-        NativeRgbaResult result = native_rgba_surface_present(app->rgba, renderer, viewport_width, viewport_height);
+        NativeRgbaResult result = native_rgba_surface_render(surface, renderer, viewport_width, viewport_height);
         if (result == NATIVE_RGBA_OK) {
             status = 1;
-            /* RGBA presents opaque content into the same renderer the ss4s hole-punch
+            /* RGBA presents opaque content into the same renderer the NDL hole-punch
              * uses. If the stream later switches back to H.264, the punch-through latch
              * must fire again so the SDL layer clears back to transparent instead of
              * leaving this opaque frame in front of the video plane. */
             app->video_plane_punched = false;
+        } else if (result == NATIVE_RGBA_RETRY) {
+            /* Do not fall through to the transparent NDL punch or present the cleared
+             * backbuffer. The next tick retries from the cached CPU frame. */
+            status = 2;
         } else {
             failed_result = result;
+            failed_owner_slot = drawing_return ? app->hub_return_rgba_owner_slot : active_index;
             status = -1;
+            if (drawing_return) {
+                /* This frozen texture exhausted its renderer-recovery budget. Drop it
+                 * after preserving the owner for one terminal report; otherwise every
+                 * HUB tick would retry and re-report the same unusable cache forever. */
+                native_close_hub_return_rgba_locked(app);
+                drawing_return = false;
+            }
         }
     }
+    /* A successful software draw, or a hardware owner with one accepted AU, is the
+     * replacement's first presentable frame. Retire the frozen desktop only now; a
+     * transient SDL retry deliberately keeps it for the next tick. */
+    if (app->hub_return_rgba && replacement_ready &&
+        (active_h264_ready || (status == 1 && !drawing_return))) {
+        native_close_hub_return_rgba_locked(app);
+    }
     pthread_mutex_unlock(&app->video_lock);
-    if (status > 0 && logged && !*logged) {
-        fprintf(stderr, "[native] presented initial native RemoteFX RGBA frame\n");
+    if (status == 1 && logged && !*logged) {
+        clog(cLogLevelDebug, "presented initial native RemoteFX RGBA frame");
         *logged = true;
     } else if (status < 0) {
         app->decoder_errors++;
-        fprintf(stderr, "[native] terminal native error: DecoderError; RemoteFX RGBA present failed result=%d\n",
-                (int)failed_result);
-        slot_stop_with_state(native_active_slot(app), RDP_STATE_DECODER_ERROR,
+        clog(cLogLevelError,
+             "terminal native error: DecoderError; RemoteFX RGBA present failed result=%d",
+             (int)failed_result);
+        NativeSessionSlot *failed_slot =
+            failed_owner_slot >= 0 && failed_owner_slot < NATIVE_SETTINGS_MAX_SESSIONS
+                ? &app->sessions[failed_owner_slot]
+                : native_active_slot(app);
+        slot_stop_with_state(failed_slot, RDP_STATE_DECODER_ERROR,
                              rdp_state_exit_code(RDP_STATE_DECODER_ERROR));
     }
     return status;
 }
 
-static void native_set_slot_badge_color(SDL_Renderer *renderer, int slot) {
-    switch (slot) {
-    case NATIVE_SESSION_SLOT_RED:
-        SDL_SetRenderDrawColor(renderer, 255, 65, 54, 230);
-        break;
-    case NATIVE_SESSION_SLOT_GREEN:
-        SDL_SetRenderDrawColor(renderer, 46, 204, 64, 230);
-        break;
-    case NATIVE_SESSION_SLOT_YELLOW:
-        SDL_SetRenderDrawColor(renderer, 255, 220, 0, 230);
-        break;
-    default:
-        SDL_SetRenderDrawColor(renderer, 0, 116, 217, 230); /* blue */
-        break;
+static int native_present_rgba_frame(App *app, SDL_Renderer *renderer, bool *logged) {
+    int status = native_draw_rgba_frame(app, renderer, logged);
+    if (status == 1) {
+        SDL_RenderPresent(renderer);
     }
+    return status;
+}
+
+static bool native_draw_preconnect_background(void *ctx, SDL_Renderer *renderer) {
+    return native_draw_rgba_frame((App *)ctx, renderer, NULL) > 0;
+}
+
+static void native_set_slot_badge_color(SDL_Renderer *renderer, int slot) {
+    uint32_t rgb = native_ui_slot_rgb(slot);
+    SDL_SetRenderDrawColor(renderer, (uint8_t)(rgb >> 16), (uint8_t)(rgb >> 8), (uint8_t)rgb, 230);
 }
 
 /* Colored square in the top-right corner naming the active session for a short moment
@@ -2686,21 +3061,26 @@ static void native_present_switch_splash(App *app, SDL_Renderer *renderer) {
 
 static void native_show_session_indicator(App *app, int slot);
 
-/* Any interaction: repaint and push the auto-hide deadline out. */
+/* Any interaction: push the auto-hide deadline out. */
 static void native_mixer_overlay_touch(App *app) {
     app->mixer_overlay_hide_ticks = SDL_GetTicks() + NATIVE_MIXER_OVERLAY_IDLE_HIDE_MS;
-    app->mixer_overlay_drawn = false;
 }
 
 static void native_mixer_overlay_hide(App *app) {
     if (!app->mixer_overlay_visible) {
         return;
     }
+    /* An outside click is closed on its release, not its press. Any simultaneous key,
+     * auto-switch or teardown request must wait for that edge too; otherwise this
+     * function would re-grab evdev while the physical pointer button is still down. */
+    if (app->mixer_overlay_dismiss_button != 0) {
+        return;
+    }
     app->mixer_overlay_visible = false;
-    app->mixer_overlay_drawn = false;
 #if defined(HELLOLG_WITH_PRECONNECT_UI) && HELLOLG_WITH_PRECONNECT_UI
     native_ui_mixer_hide(native_preconnect_ui_mixer(app->preconnect_ui));
     app->mixer_overlay_dragging = false;
+    app->mixer_overlay_dismiss_button = 0;
     /* Hand the pointer back to the stream: re-grab and restore the session's cursor —
      * but only while we are actually staying on a live FOCUSED stream. A hide on the way
      * to a configurator or a failure path must not re-grab (those screens own the SDL
@@ -2726,11 +3106,28 @@ static void native_mixer_overlay_hide(App *app) {
     app->video_plane_punched = false;
 }
 
+/* A streaming teardown cannot wait for the outside-click button-up: once the
+ * preconnect loop owns SDL events that edge no longer reaches the overlay handler.
+ * The caller must clear streaming_visible first so this path never re-grabs input. */
+static void native_mixer_overlay_force_hide(App *app) {
+    if (!app) {
+        return;
+    }
+    app->mixer_overlay_dismiss_button = 0;
+    native_mixer_overlay_hide(app);
+}
+
 static void native_mixer_overlay_show(App *app) {
     pthread_mutex_lock(&app->video_lock);
     bool rgba_active = app->rgba != NULL;
     pthread_mutex_unlock(&app->video_lock);
-    if (rgba_active) {
+    /* The panel renders through the LVGL preconnect display only. Without it the
+     * overlay would hijack keys while drawing nothing, so use the badge instead. */
+    bool mixer_available = false;
+#if defined(HELLOLG_WITH_PRECONNECT_UI) && HELLOLG_WITH_PRECONNECT_UI
+    mixer_available = native_preconnect_ui_mixer(app->preconnect_ui) != NULL;
+#endif
+    if (rgba_active || !mixer_available) {
         /* The RemoteFX RGBA path repaints the whole renderer every frame, so the panel
          * would be invisible while its keys still hijack input: keep the badge flash. */
         native_show_session_indicator(app, atomic_load(&app->active_index));
@@ -2738,6 +3135,9 @@ static void native_mixer_overlay_show(App *app) {
     }
     app->mixer_overlay_visible = true;
     app->mixer_overlay_selected = atomic_load(&app->active_index);
+    /* The close-by-OK release lands after hide, when the overlay no longer consumes it,
+     * so the held latch can be stale here: re-arm activation for this panel session. */
+    app->mixer_overlay_ok_held = false;
     /* A still-armed badge would hold its drawn latch through our hide and leave a stale
      * panel on screen until it expires; the overlay supersedes it. */
     app->indicator_slot = -1;
@@ -2748,6 +3148,7 @@ static void native_mixer_overlay_show(App *app) {
      * keeps it off while the overlay is visible) and show the plain arrow without
      * touching the session's cached cursor shape. Faders become click/drag targets. */
     app->mixer_overlay_dragging = false;
+    app->mixer_overlay_dismiss_button = 0;
     native_stop_streaming_input(app);
     native_input_set_active(&app->input, false);
     native_cursor_show_default();
@@ -2790,6 +3191,60 @@ static void native_mixer_overlay_set_db(App *app, int slot, int gain_db) {
     native_mixer_overlay_touch(app);
 }
 
+/* Duck-button press on a channel: flips whether that BACKGROUND session's audio ducks
+ * the currently displayed session (per-foreground trigger mask), persists the new mask,
+ * and retargets the pipeline's controller. The active channel's own button is inert. */
+static void native_mixer_overlay_toggle_duck(App *app, int slot) {
+    int fg = atomic_load(&app->active_index);
+    if (slot >= 0 && slot < NATIVE_SETTINGS_MAX_SESSIONS && slot != fg) {
+        app->duck_mask[fg] ^= (uint8_t)(1u << slot);
+        if (app->settings) {
+            app->settings->sessions[fg].duck_mask = app->duck_mask[fg];
+            (void)native_config_save_persisted(app->settings);
+        }
+        native_duck_retarget(app);
+        clog(cLogLevelInfo, "duck trigger %s: %s while %s is on screen",
+             (app->duck_mask[fg] >> slot) & 1u ? "enabled" : "disabled",
+             native_session_slot_name(slot), native_session_slot_name(fg));
+    }
+    native_mixer_overlay_touch(app);
+}
+
+/* M plate click: mutes/unmutes that channel in the mix (any session slot, the active
+ * one included). Runtime-only — nothing is persisted. */
+static void native_mixer_overlay_toggle_mute(App *app, int slot) {
+    if (slot >= 0 && slot < NATIVE_SETTINGS_MAX_SESSIONS) {
+        app->mixer_mute_mask ^= (uint8_t)(1u << slot);
+        bool muted = (app->mixer_mute_mask >> slot) & 1u;
+        native_audio_pipeline_set_source_muted(&app->audio_pipeline, slot, muted);
+        clog(cLogLevelInfo, "%s %s", native_session_slot_name(slot), muted ? "muted" : "unmuted");
+    }
+    native_mixer_overlay_touch(app);
+}
+
+/* S plate click: toggles that channel's solo. While any solo is lit, only soloed
+ * channels reach the mix (mute still wins on a muted+soloed channel). */
+static void native_mixer_overlay_toggle_solo(App *app, int slot) {
+    if (slot >= 0 && slot < NATIVE_SETTINGS_MAX_SESSIONS) {
+        app->mixer_solo_mask ^= (uint8_t)(1u << slot);
+        native_publish_effective_solo_mask(app);
+        clog(cLogLevelInfo, "solo %s: mask 0x%x", native_session_slot_name(slot),
+             (unsigned)app->mixer_solo_mask);
+    }
+    native_mixer_overlay_touch(app);
+}
+
+/* OK/ENTER while the overlay is up: pressing a background session's channel flips its
+ * duck button; on the active channel or the MASTER it keeps the old close behavior. */
+static void native_mixer_overlay_activate(App *app) {
+    int slot = app->mixer_overlay_selected;
+    if (slot >= 0 && slot < NATIVE_SETTINGS_MAX_SESSIONS && slot != atomic_load(&app->active_index)) {
+        native_mixer_overlay_toggle_duck(app, slot);
+        return;
+    }
+    native_mixer_overlay_hide(app);
+}
+
 static void native_mixer_overlay_adjust(App *app, int delta_steps) {
     int slot = app->mixer_overlay_selected;
     if (slot == NATIVE_UI_MIXER_MASTER) {
@@ -2829,7 +3284,13 @@ static bool native_mixer_overlay_consumes_evdev_key(uint16_t code) {
     }
 }
 
-static void native_mixer_overlay_evdev_key(App *app, uint16_t code) {
+static void native_mixer_overlay_evdev_key(App *app, uint16_t code, bool down) {
+    if (!down) {
+        if (code == 28 || code == 96 || code == 352) {
+            app->mixer_overlay_ok_held = false; /* release edge re-arms activation */
+        }
+        return;
+    }
     switch (code) {
     case 103: /* KEY_UP */
         native_mixer_overlay_adjust(app, NATIVE_MIXER_OVERLAY_GAIN_STEP_DB);
@@ -2843,7 +3304,17 @@ static void native_mixer_overlay_evdev_key(App *app, uint16_t code) {
     case 106: /* KEY_RIGHT */
         native_mixer_overlay_select(app, app->mixer_overlay_selected + 1);
         break;
-    default: /* enter/ok/esc/back */
+    case 28:  /* KEY_ENTER */
+    case 96:  /* KEY_KPENTER */
+    case 352: /* KEY_OK */
+        /* Edge-triggered, unlike the deliberately repeating fader arrows: evdev
+         * autorepeat (value 2) folds into more down events. */
+        if (!app->mixer_overlay_ok_held) {
+            app->mixer_overlay_ok_held = true;
+            native_mixer_overlay_activate(app);
+        }
+        break;
+    default: /* esc/back */
         native_mixer_overlay_hide(app);
         break;
     }
@@ -2879,6 +3350,12 @@ static void native_mixer_overlay_sdl_key(App *app, const SDL_KeyboardEvent *even
         break;
     case SDLK_RETURN:
     case SDLK_KP_ENTER:
+        /* Edge-triggered like the evdev path: a held Enter repeats key-downs, and a
+         * repeated activate would XOR the duck bit once per repeat. */
+        if (event->repeat == 0) {
+            native_mixer_overlay_activate(app);
+        }
+        break;
     case SDLK_ESCAPE:
         native_mixer_overlay_hide(app);
         break;
@@ -2929,8 +3406,8 @@ static void native_system_volume_tick(App *app) {
     if (pct == app->system_volume_seen) {
         return;
     }
-    fprintf(stderr, "[native] system volume %d -> %d (overlay %s)\n", app->system_volume_seen, pct,
-            app->mixer_overlay_visible ? "up" : "hidden");
+    clog(cLogLevelDebug, "system volume %d -> %d (overlay %s)", app->system_volume_seen, pct,
+         app->mixer_overlay_visible ? "up" : "hidden");
     app->system_volume_seen = pct;
     if (app->mixer_overlay_visible) {
         native_mixer_overlay_touch(app); /* still moving: hold the panel open */
@@ -2940,16 +3417,15 @@ static void native_system_volume_tick(App *app) {
     }
 }
 
-/* Presents the overlay (both renderers live in ui_mixer.c). The LVGL path renders LIVE —
- * per-tick, the meters animate with playback — while the raw-SDL fallback stays
- * latch-drawn like the indicator. Cleared back to the punch frame on hide/expiry.
- * Skipped while the RemoteFX RGBA path owns the renderer (native_mixer_overlay_show
- * refuses to open there). */
+/* Presents the live LVGL overlay; per-tick meter updates animate with playback. It is
+ * cleared back to the punch frame on hide/expiry and skipped while the RemoteFX RGBA
+ * path owns the renderer (native_mixer_overlay_show refuses to open there). */
 static void native_present_mixer_overlay_frame(App *app, SDL_Renderer *renderer) {
     if (!app->mixer_overlay_visible) {
         return;
     }
-    if (SDL_TICKS_PASSED(SDL_GetTicks(), app->mixer_overlay_hide_ticks)) {
+    if (!app->mixer_overlay_dragging && app->mixer_overlay_dismiss_button == 0 &&
+        SDL_TICKS_PASSED(SDL_GetTicks(), app->mixer_overlay_hide_ticks)) {
         native_mixer_overlay_hide(app);
         return;
     }
@@ -2991,19 +3467,16 @@ static void native_present_mixer_overlay_frame(App *app, SDL_Renderer *renderer)
         }
         native_audio_pipeline_get_output_peaks(&app->audio_pipeline, &peaks[NATIVE_UI_MIXER_MASTER][0],
                                                &peaks[NATIVE_UI_MIXER_MASTER][1]);
+        int duck_fg = atomic_load(&app->active_index);
         native_ui_mixer_render(mixer_ui, peaks, queue_ms, target_ms, app->mixer_gain_db, master_pct,
-                               app->mixer_overlay_selected, connected_mask, SDL_GetTicks());
+                               app->mixer_overlay_selected, connected_mask, duck_fg, app->duck_mask[duck_fg],
+                               app->mixer_mute_mask, app->mixer_solo_mask, SDL_GetTicks());
         app->video_plane_punched = true; /* screen content is ours, not the punch frame */
         return;
     }
 #endif
-    if (app->mixer_overlay_drawn) {
-        return;
-    }
-    native_ui_mixer_draw_fallback(renderer, app->mixer_gain_db, master_pct, app->mixer_overlay_selected,
-                                  connected_mask);
-    app->mixer_overlay_drawn = true;
-    app->video_plane_punched = true; /* screen content is ours, not the punch frame */
+    /* No LVGL mixer: show() refuses to open the overlay, so this is unreachable. */
+    (void)renderer;
 }
 
 static void native_present_streaming_frame(App *app, SDL_Renderer *renderer, bool *logged) {
@@ -3061,8 +3534,8 @@ static void native_background_slot(App *app, int index) {
                            atomic_load(&slot->current_state) == (int)RDP_STATE_ACTIVE &&
                            !NATIVE_SWITCH_TEST_NO_RECONNECT;
     if (snapshot_wanted) {
-        fprintf(stderr, "[native] reconnecting the %s session in the background to cache a fresh IDR\n",
-                native_session_slot_name(index));
+        clog(cLogLevelNotice, "reconnecting the %s session in the background to cache a fresh IDR",
+             native_session_slot_name(index));
         /* The snapshot is armed inside the connect, between the old worker's teardown
          * and the new worker's start, so the connect IDR cannot race an unarmed cache. */
         if (!native_slot_connect(app, index, true)) {
@@ -3080,8 +3553,8 @@ static void native_background_slot(App *app, int index) {
         } else {
             /* No memory for the cache: background it plainly; switching back takes the
              * usual refresh-or-reconnect path. */
-            fprintf(stderr, "[native] %s AU snapshot allocation failed; backgrounding without a cache\n",
-                    native_session_slot_name(index));
+            clog(cLogLevelWarning, "%s AU snapshot allocation failed; backgrounding without a cache",
+                 native_session_slot_name(index));
             rdp_set_suppress_output(slot->rdp, false);
             slot->suppressed = true;
         }
@@ -3126,13 +3599,13 @@ static bool native_snapshot_replay(App *app, int target) {
          * suppress tail dies out within tens of ms of backgrounding, and a background
          * period lasts far longer than the quiet window — this fires only for a
          * flip-back racing the tail or a server that ignores TS_SUPPRESS_OUTPUT_PDU. */
-        fprintf(stderr, "[native] %s streamed %ums ago, may still have AUs in flight; skipping replay\n",
-                native_session_slot_name(target), (unsigned)since_last_au);
+        clog(cLogLevelDebug, "%s streamed %ums ago, may still have AUs in flight; skipping replay",
+             native_session_slot_name(target), (unsigned)since_last_au);
         free(snap.buf);
         return false;
     }
-    fprintf(stderr, "[native] replaying %u cached %s AUs (%zu bytes) to re-enter the delta chain\n", snap.count,
-            native_session_slot_name(target), snap.used);
+    clog(cLogLevelDebug, "replaying %u cached %s AUs (%zu bytes) to re-enter the delta chain",
+         snap.count, native_session_slot_name(target), snap.used);
     unsigned baseline = atomic_load(&slot->video_ok_frames);
     for (unsigned i = 0; i < snap.count; i++) {
         const NativeAuSnapshotEntry *entry = &snap.entries[i];
@@ -3143,28 +3616,34 @@ static bool native_snapshot_replay(App *app, int target) {
     }
     free(snap.buf);
     if (atomic_load(&slot->video_ok_frames) == baseline) {
-        fprintf(stderr, "[native] %s snapshot replay fed no frames; falling back\n",
-                native_session_slot_name(target));
+        clog(cLogLevelWarning, "%s snapshot replay fed no frames; falling back",
+             native_session_slot_name(target));
         return false;
     }
     return true;
 }
 
-/* Finalizes a switch to `target`, which must already be connected. Retargets input and
- * cursor, drops the shared video path (the mixed audio track survives via
- * native_reopen_audio_locked), and asks the servers to pause/resume their graphics. */
+/* Finalizes a switch to `target`, which must already be connected. Retargets input,
+ * cursor, and the shared video path while the mixed audio track stays attached, then
+ * asks the servers to pause/resume their graphics. */
 static void native_complete_session_switch(App *app, int target) {
     int old_index = atomic_load(&app->active_index);
     NativeSessionSlot *target_slot = &app->sessions[target];
-    if (!target_slot->rdp) {
+    /* A cache-allocation fallback can intentionally reach here while a fresh worker is
+     * still CONNECTING and before snapshot_pending is set, so this boundary is looser
+     * than native_slot_is_live_stream_target; a terminal failure is never switchable. */
+    if (!target_slot->rdp || atomic_load(&target_slot->session_failed)) {
         return;
     }
     if (old_index == target) {
+#if defined(HELLOLG_WITH_PRECONNECT_UI) && HELLOLG_WITH_PRECONNECT_UI
+        native_preconnect_ui_select_slot(app->preconnect_ui, target);
+#endif
         native_show_session_indicator(app, target);
         return;
     }
-    fprintf(stderr, "[native] switching video %s -> %s\n", native_session_slot_name(old_index),
-            native_session_slot_name(target));
+    clog(cLogLevelNotice, "switching video %s -> %s", native_session_slot_name(old_index),
+         native_session_slot_name(target));
     /* Any switch that actually happens supersedes a deferred one still in flight. */
     app->pending_switch_target = -1;
     /* Reachable with the overlay up via the auto-switch on a died session. */
@@ -3196,15 +3675,31 @@ static void native_complete_session_switch(App *app, int target) {
      * reconnect on a static desktop. The old slot needs no recovery either way —
      * backgrounding reconnects it (snapshot) or suppresses it (resume asks for its own
      * keyframe on return). */
+    unsigned target_epoch = atomic_load(&target_slot->connect_epoch);
+    if (app->hub_return_rgba && app->hub_return_rgba_owner_slot == target) {
+        if (!native_promote_hub_return_rgba_locked(app, target, target_epoch)) {
+            /* The return slot reconnected while hidden. Its frozen pixels remain a
+             * read-only fallback; the new generation gets a fresh mutable canvas. */
+            native_close_rgba_locked(app, false);
+            native_arm_hub_return_replacement_locked(
+                app, target, target_epoch, atomic_load(&target_slot->video_ok_frames));
+        }
+    } else {
+        native_close_rgba_locked(app, false);
+        if (app->hub_return_rgba) {
+            /* Choosing any other live stream commits the HUB exit; its original BACK
+             * destination is no longer part of this handoff. */
+            native_close_hub_return_rgba_locked(app);
+        }
+    }
     atomic_store(&app->active_index, target);
     atomic_store(&app->video_refresh_needed, false);
-    if (app->rgba) {
-        native_defer_rgba_texture_destroy(app);
-        native_rgba_surface_close(app->rgba);
-        app->rgba = NULL;
-    }
     app->video_plane_punched = false;
     pthread_mutex_unlock(&app->video_lock);
+#if defined(HELLOLG_WITH_PRECONNECT_UI) && HELLOLG_WITH_PRECONNECT_UI
+    native_preconnect_ui_select_slot(app->preconnect_ui, target);
+#endif
+    native_duck_retarget(app);
 
     /* Input now drives the new session; the per-tick derive block re-arms the active
      * flag and re-syncs NumLock. */
@@ -3246,9 +3741,9 @@ static void native_complete_session_switch(App *app, int target) {
              * channel, Refresh Rect ignored — learned from an earlier watchdog timeout).
              * Skip the doomed wait and reconnect right away: a fresh connection always
              * starts with an IDR. */
-            fprintf(stderr,
-                    "[native] %s server yields no keyframe on request; reconnecting immediately for a fresh IDR\n",
-                    native_session_slot_name(target));
+            clog(cLogLevelWarning,
+                 "%s server yields no keyframe on request; reconnecting immediately for a fresh IDR",
+                 native_session_slot_name(target));
             if (!native_slot_connect(app, target, false)) {
                 /* Startup failure (e.g. worker spawn): route it through the standard
                  * failure drain — configurator with a status / auto-switch to a survivor
@@ -3285,8 +3780,9 @@ static void native_prepare_pending_switch(App *app, int target) {
     bool reconnect = (slot->refresh_ineffective || app->snapshot_force) && !NATIVE_SWITCH_TEST_NO_RECONNECT;
     bool armed;
     if (reconnect) {
-        fprintf(stderr, "[native] reconnecting the %s session in the background for the deferred switch\n",
-                native_session_slot_name(target));
+        clog(cLogLevelNotice,
+             "reconnecting the %s session in the background for the deferred switch",
+             native_session_slot_name(target));
         /* One reconnect per deferred switch: a stream that produces no AU even on a
          * fresh connection (bitmap path) must not loop reconnects forever. */
         slot->snapshot_retry_used = true;
@@ -3311,8 +3807,8 @@ static void native_prepare_pending_switch(App *app, int target) {
     if (!armed) {
         /* No memory for the cache: fall back to the immediate old-style switch (its
          * splash covers the reload) rather than leaving the press unanswered. */
-        fprintf(stderr, "[native] %s AU snapshot allocation failed; switching immediately\n",
-                native_session_slot_name(target));
+        clog(cLogLevelWarning, "%s AU snapshot allocation failed; switching immediately",
+             native_session_slot_name(target));
         app->pending_switch_target = -1;
         native_complete_session_switch(app, target);
         return;
@@ -3330,6 +3826,49 @@ static void native_prepare_pending_switch(App *app, int target) {
     }
 }
 
+/* Reveal the four-card HUB without stopping the active RDP session. Translucent LVGL
+ * chrome is composited over the still-running video plane, while input is released so
+ * the remote can navigate locally. A subsequent card action resumes/switches through
+ * the normal session path. */
+static void native_show_hub(App *app) {
+#if defined(HELLOLG_WITH_PRECONNECT_UI) && HELLOLG_WITH_PRECONNECT_UI
+    if (!app || !app->streaming_visible || app->mixer_overlay_visible || !app->preconnect_ui) {
+        return;
+    }
+    int active = atomic_load(&app->active_index);
+    clog(cLogLevelInfo, "central remote button opens HUB on the %s profile",
+         native_session_slot_name(active));
+
+    /* A HUB request supersedes a deferred colour-key switch. Its target can finish
+     * snapshot backgrounding normally; it no longer owns navigation. */
+    app->pending_switch_target = -1;
+    native_stop_streaming_input(app);
+    native_input_set_active(&app->input, false);
+#if HELLOLG_WITH_EVDEV_INPUT
+    native_preconnect_ui_set_keyboard_available(app->preconnect_ui, native_evdev_input_probe_keyboard());
+    native_preconnect_ui_set_mouse_available(app->preconnect_ui, native_evdev_input_probe_mouse());
+#endif
+    native_cursor_show_default();
+    app->indicator_slot = -1;
+    app->indicator_drawn = false;
+    app->switch_splash_drawn = false;
+    pthread_mutex_lock(&app->video_lock);
+    /* Re-arm the one-shot punch for the eventual return so the final HUB chrome frame
+     * is cleared before raw streaming input resumes. */
+    app->video_plane_punched = false;
+    pthread_mutex_unlock(&app->video_lock);
+    app->streaming_visible = false;
+    app->hub_visible = true;
+    app->hub_return_slot = active;
+    app->hub_connect_target = -1;
+    app->ui_last_state = -1;
+    native_preconnect_ui_show_hub(app->preconnect_ui, active);
+    native_preconnect_ui_set_visible(app->preconnect_ui, true);
+#else
+    (void)app;
+#endif
+}
+
 /* Navigates the screen to `target`'s configurator (pre-connect form) while any current
  * session keeps running in the background: its graphics are suppressed server-side and
  * its audio keeps feeding the mix. */
@@ -3337,30 +3876,36 @@ static void native_show_slot_configurator(App *app, int target) {
     /* Navigating to a form invalidates a deferred switch; the prepared slot finishes
      * backgrounding on its own. */
     app->pending_switch_target = -1;
+    app->hub_connect_target = -1;
 #if defined(HELLOLG_WITH_PRECONNECT_UI) && HELLOLG_WITH_PRECONNECT_UI
     int old_index = atomic_load(&app->active_index);
     if (old_index != target) {
-        fprintf(stderr, "[native] showing the %s session configurator\n", native_session_slot_name(target));
+        clog(cLogLevelInfo, "showing the %s session configurator", native_session_slot_name(target));
         /* Releases owed to the old server must go out while input is still wired to it;
          * the evdev grab is dropped because the configurator needs the SDL mouse. */
         native_stop_streaming_input(app);
+#if HELLOLG_WITH_EVDEV_INPUT
+        native_preconnect_ui_set_keyboard_available(app->preconnect_ui, native_evdev_input_probe_keyboard());
+        native_preconnect_ui_set_mouse_available(app->preconnect_ui, native_evdev_input_probe_mouse());
+#endif
         native_input_set_active(&app->input, false);
-        /* Demote the old slot BEFORE backgrounding it: snapshot backgrounding reconnects
-         * the slot, and native_slot_connect must see it as inactive so the shared
-         * decoder/input state stays with the incoming screen. */
-        atomic_store(&app->active_index, target);
-        native_background_slot(app, old_index);
         pthread_mutex_lock(&app->video_lock);
-        if (app->rgba) {
-            native_defer_rgba_texture_destroy(app);
-            native_rgba_surface_close(app->rgba);
-            app->rgba = NULL;
-        }
+        /* Capture before the ownership flip: an in-flight old bitmap callback either
+         * finishes under this lock and is frozen with the frame, or observes the new
+         * active slot on its under-lock recheck and drops the update. */
+        native_capture_hub_return_rgba_locked(app);
+        native_close_rgba_locked(app, false);
+        atomic_store(&app->active_index, target);
         /* The video track stays open behind the (opaque) configurator: closing it would
          * reload the shared pipeline and cut the mixed audio for nothing. Returning to a
          * stream swaps the decoder on that stream's next keyframe (on_video_au). */
         app->video_plane_punched = false;
         pthread_mutex_unlock(&app->video_lock);
+        native_duck_retarget(app);
+        /* Demote the old slot BEFORE backgrounding it: snapshot backgrounding reconnects
+         * the slot, and native_slot_connect must see it as inactive so the shared
+         * decoder/input state stays with the incoming screen. */
+        native_background_slot(app, old_index);
         native_input_set_session(&app->input, app->sessions[target].rdp);
         /* The configurator needs the plain SDL arrow, but the old session keeps running
          * backgrounded: leave its cached cursor shape/hidden state alone so switching
@@ -3373,19 +3918,19 @@ static void native_show_slot_configurator(App *app, int target) {
     if (app->preconnect_ui) {
         /* Any in-flight connect banner belongs to the slot we are leaving; its session
          * continues in the background and reports through per-slot status lines. */
-        native_preconnect_ui_set_connecting(app->preconnect_ui, false, "");
-        native_preconnect_ui_select_slot(app->preconnect_ui, target);
+        native_preconnect_ui_set_connecting(app->preconnect_ui, old_index, false, "");
+        native_preconnect_ui_open_setup(app->preconnect_ui, target);
         native_preconnect_ui_set_visible(app->preconnect_ui, true);
     }
 #else
     (void)app;
     (void)target;
-    fprintf(stderr, "[native] no pre-connect UI in this build; cannot open a session configurator\n");
+    clog(cLogLevelWarning, "no pre-connect UI in this build; cannot open a session configurator");
 #endif
 }
 
-/* Color-button press: every button is "go to that session's screen" — the live stream
- * when the slot is connected, its configurator otherwise. */
+/* Color-button press: every button is "go to that computer" — resume a live stream,
+ * connect a configured offline profile, or open setup for an empty slot. */
 static void native_request_session_switch(App *app, int target) {
     if (!app || target < 0 || target >= NATIVE_SETTINGS_MAX_SESSIONS) {
         return;
@@ -3406,8 +3951,8 @@ static void native_request_session_switch(App *app, int target) {
         /* The active slot's key while a deferred switch is in flight = change of mind:
          * stay here. The prepared slot finishes backgrounding on its own (the tick
          * suppresses it once its IDR lands), ready for a later switch. */
-        fprintf(stderr, "[native] deferred switch to %s canceled\n",
-                native_session_slot_name(app->pending_switch_target));
+        clog(cLogLevelInfo, "deferred switch to %s canceled",
+             native_session_slot_name(app->pending_switch_target));
         app->pending_switch_target = -1;
         native_show_session_indicator(app, target);
         return;
@@ -3415,8 +3960,12 @@ static void native_request_session_switch(App *app, int target) {
     /* A slot mid-hidden-reconnect (snapshot_pending) is still a live stream target: the
      * user watched it moments ago; treat the press as a switch rather than dropping to
      * its configurator. */
-    if (slot->rdp &&
-        (atomic_load(&slot->current_state) == (int)RDP_STATE_ACTIVE || slot->snapshot_pending)) {
+    if (native_slot_is_live_stream_target(slot)) {
+        /* A live resume/switch answers the HUB visit. Do this only after identifying a
+         * stream-capable target: choosing a still-CONNECTING background card must leave
+         * HUB open until that connection can actually be entered. */
+        app->hub_visible = false;
+        app->hub_connect_target = -1;
         if (target == atomic_load(&app->active_index) && app->streaming_visible) {
             /* Re-pressing the active slot's button is no switch — open the live volume
              * mixer instead of just re-flashing the badge. */
@@ -3449,8 +3998,8 @@ static void native_request_session_switch(App *app, int target) {
             native_complete_session_switch(app, target);
             return;
         }
-        fprintf(stderr, "[native] deferring the switch to %s until its stream is ready\n",
-                native_session_slot_name(target));
+        clog(cLogLevelInfo, "deferring the switch to %s until its stream is ready",
+             native_session_slot_name(target));
         app->pending_switch_target = target;
         app->pending_switch_deadline_ticks = SDL_GetTicks() + NATIVE_PENDING_SWITCH_TIMEOUT_MS;
         slot->snapshot_retry_used = false;
@@ -3466,10 +4015,15 @@ static void native_request_session_switch(App *app, int target) {
         native_prepare_pending_switch(app, target);
         return;
     }
-    if (target == atomic_load(&app->active_index)) {
-        return; /* already on this slot's configurator (or it is mid-connect on screen) */
+    if (slot->rdp) {
+        /* A worker that has not reached ACTIVE is already connecting. Do not queue a
+         * duplicate attempt; its live card state will catch up on the next loop tick. */
+        return;
     }
     native_show_slot_configurator(app, target);
+#if defined(HELLOLG_WITH_PRECONNECT_UI) && HELLOLG_WITH_PRECONNECT_UI
+    (void)native_preconnect_ui_request_connect(app->preconnect_ui, target);
+#endif
 }
 
 /* Remote D-pad ring switching: left/right cycles to the neighbouring stream-capable slot
@@ -3484,8 +4038,7 @@ static void native_ring_switch(App *app, int direction) {
             candidate += NATIVE_SETTINGS_MAX_SESSIONS;
         }
         NativeSessionSlot *slot = &app->sessions[candidate];
-        if (slot->rdp &&
-            (atomic_load(&slot->current_state) == (int)RDP_STATE_ACTIVE || slot->snapshot_pending)) {
+        if (native_slot_is_live_stream_target(slot)) {
             native_request_session_switch(app, candidate);
             return;
         }
@@ -3523,11 +4076,12 @@ static void native_switch_tick(App *app) {
             slot->suppressed = true;
             slot->snapshot_pending = false;
             if (idr_ready) {
-                fprintf(stderr, "[native] %s connect IDR cached; suppressing the backgrounded session\n",
-                        native_session_slot_name(i));
+                clog(cLogLevelDebug, "%s connect IDR cached; suppressing the backgrounded session",
+                     native_session_slot_name(i));
             } else {
-                fprintf(stderr, "[native] %s snapshot voided; suppressing the backgrounded session without a cache\n",
-                        native_session_slot_name(i));
+                clog(cLogLevelWarning,
+                     "%s snapshot voided; suppressing the backgrounded session without a cache",
+                     native_session_slot_name(i));
                 if (i == app->pending_switch_target) {
                     /* The deferred switch lost its cache (oversize IDR): answer the
                      * press with the immediate old-style switch rather than never. */
@@ -3546,9 +4100,9 @@ static void native_switch_tick(App *app) {
                 /* A deferred switch asked this server for a keyframe and none came:
                  * learn it and fall to the hidden reconnect — the user is still watching
                  * the live current stream, so the lesson costs no black screen. */
-                fprintf(stderr,
-                        "[native] %s yielded no keyframe within %ums; reconnecting in the background (deferred switch)\n",
-                        native_session_slot_name(i), (unsigned)NATIVE_SWITCH_KEYFRAME_TIMEOUT_MS);
+                clog(cLogLevelWarning,
+                     "%s yielded no keyframe within %ums; reconnecting in the background (deferred switch)",
+                     native_session_slot_name(i), (unsigned)NATIVE_SWITCH_KEYFRAME_TIMEOUT_MS);
                 slot->refresh_ineffective = true;
                 slot->snapshot_pending = false;
                 native_prepare_pending_switch(app, i);
@@ -3563,9 +4117,9 @@ static void native_switch_tick(App *app) {
             rdp_set_suppress_output(slot->rdp, false);
             slot->suppressed = true;
             slot->snapshot_pending = false;
-            fprintf(stderr,
-                    "[native] %s snapshot got no AUs within %ums; suppressing the backgrounded session without a cache\n",
-                    native_session_slot_name(i), (unsigned)NATIVE_SWITCH_KEYFRAME_TIMEOUT_MS);
+            clog(cLogLevelWarning,
+                 "%s snapshot got no AUs within %ums; suppressing the backgrounded session without a cache",
+                 native_session_slot_name(i), (unsigned)NATIVE_SWITCH_KEYFRAME_TIMEOUT_MS);
             if (i == app->pending_switch_target) {
                 /* Reached with the one retry spent (a stream that never feeds
                  * on_video_au, e.g. the bitmap path) or in no-reconnect test builds:
@@ -3584,13 +4138,13 @@ static void native_switch_tick(App *app) {
         NativeSessionSlot *slot = &app->sessions[target];
         if (!slot->rdp || atomic_load(&slot->session_failed)) {
             /* The prepared session died; the failure drain reports it. Stay put. */
-            fprintf(stderr, "[native] deferred switch to %s abandoned (session gone)\n",
-                    native_session_slot_name(target));
+            clog(cLogLevelWarning, "deferred switch to %s abandoned (session gone)",
+                 native_session_slot_name(target));
             app->pending_switch_target = -1;
         } else if (!slot->snapshot_pending && slot->suppressed && atomic_load(&slot->snapshot_idr_ready) &&
                    native_monotonic_ms() - atomic_load(&slot->snapshot_last_au_ms) >= NATIVE_SNAPSHOT_QUIET_MS) {
-            fprintf(stderr, "[native] %s stream is ready; completing the deferred switch\n",
-                    native_session_slot_name(target));
+            clog(cLogLevelDebug, "%s stream is ready; completing the deferred switch",
+                 native_session_slot_name(target));
             app->pending_switch_target = -1;
             native_complete_session_switch(app, target);
         } else if (SDL_TICKS_PASSED(SDL_GetTicks(), app->pending_switch_deadline_ticks)) {
@@ -3598,8 +4152,8 @@ static void native_switch_tick(App *app) {
              * suppress (quiet window never opens) or its cache keeps dying. Answer the
              * press with the immediate old-style switch instead of staying pending
              * forever with further presses ignored. */
-            fprintf(stderr, "[native] deferred switch to %s timed out after %ums; switching the old way\n",
-                    native_session_slot_name(target), (unsigned)NATIVE_PENDING_SWITCH_TIMEOUT_MS);
+            clog(cLogLevelWarning, "deferred switch to %s timed out after %ums; switching the old way",
+                 native_session_slot_name(target), (unsigned)NATIVE_PENDING_SWITCH_TIMEOUT_MS);
             app->pending_switch_target = -1;
             native_complete_session_switch(app, target);
         }
@@ -3629,15 +4183,16 @@ static void native_switch_tick(App *app) {
         } else if (SDL_TICKS_PASSED(SDL_GetTicks(), app->switch_deadline_ticks)) {
             NativeSessionSlot *active = native_active_slot(app);
             if (NATIVE_SWITCH_TEST_NO_RECONNECT) {
-                fprintf(stderr,
-                        "[native] TEST: watchdog expired; would reconnect the %s session, keeping the connection\n",
-                        native_session_slot_name(active->index));
+                clog(cLogLevelDebug,
+                     "TEST: watchdog expired; would reconnect the %s session, keeping the connection",
+                     native_session_slot_name(active->index));
                 app->switch_deadline_ticks = SDL_GetTicks() + 10000u; /* re-check, keep logging */
             } else if (!app->switch_reconnect_used && active->rdp &&
                 atomic_load(&active->current_state) == (int)RDP_STATE_ACTIVE) {
-                fprintf(stderr,
-                        "[native] no keyframe %ums after the switch; reconnecting the %s session for a fresh IDR\n",
-                        (unsigned)NATIVE_SWITCH_KEYFRAME_TIMEOUT_MS, native_session_slot_name(active->index));
+                clog(cLogLevelWarning,
+                     "no keyframe %ums after the switch; reconnecting the %s session for a fresh IDR",
+                     (unsigned)NATIVE_SWITCH_KEYFRAME_TIMEOUT_MS,
+                     native_session_slot_name(active->index));
                 /* Remember: switches to this slot should reconnect immediately from now on. */
                 active->refresh_ineffective = true;
                 app->switch_reconnect_used = true;
@@ -3649,7 +4204,7 @@ static void native_switch_tick(App *app) {
                                          rdp_state_exit_code(RDP_STATE_NETWORK_ERROR));
                 }
             } else {
-                fprintf(stderr, "[native] switch watchdog gave up waiting for video frames\n");
+                clog(cLogLevelError, "switch watchdog gave up waiting for video frames");
                 app->switch_deadline_ticks = 0;
             }
         }
@@ -3660,36 +4215,36 @@ static void native_switch_tick(App *app) {
 static void handle_sdl_event(App *app, SDL_Window *window, SDL_Renderer *renderer, const SDL_Event *event) {
     switch (event->type) {
     case SDL_QUIT:
-        fprintf(stderr, "[native] SDL_QUIT requests shutdown\n");
+        clog(cLogLevelNotice, "SDL_QUIT requests shutdown");
         atomic_store(&app->running, false);
         break;
     case SDL_APP_TERMINATING:
-        fprintf(stderr, "[native] SDL_APP_TERMINATING requests shutdown\n");
+        clog(cLogLevelNotice, "SDL_APP_TERMINATING requests shutdown");
         atomic_store(&app->running, false);
         break;
     case SDL_APP_WILLENTERBACKGROUND:
-        fprintf(stderr, "[native] SDL_APP_WILLENTERBACKGROUND; keeping native session running\n");
+        clog(cLogLevelInfo, "SDL_APP_WILLENTERBACKGROUND; keeping native session running");
         native_stop_streaming_input(app);
         break;
     case SDL_APP_DIDENTERBACKGROUND:
-        fprintf(stderr, "[native] SDL_APP_DIDENTERBACKGROUND; keeping native session running\n");
+        clog(cLogLevelInfo, "SDL_APP_DIDENTERBACKGROUND; keeping native session running");
         native_stop_streaming_input(app); /* belt and suspenders */
         break;
     case SDL_APP_WILLENTERFOREGROUND:
-        fprintf(stderr, "[native] SDL_APP_WILLENTERFOREGROUND\n");
+        clog(cLogLevelDebug, "SDL_APP_WILLENTERFOREGROUND");
         break;
     case SDL_APP_DIDENTERFOREGROUND:
-        fprintf(stderr, "[native] SDL_APP_DIDENTERFOREGROUND\n");
+        clog(cLogLevelInfo, "SDL_APP_DIDENTERFOREGROUND");
         app->window_unfocused = false;
         native_resume_streaming_input(app, window);
         break;
     case SDL_WINDOWEVENT:
         if (event->window.event == SDL_WINDOWEVENT_CLOSE) {
-            fprintf(stderr, "[native] SDL window close requests shutdown\n");
+            clog(cLogLevelNotice, "SDL window close requests shutdown");
             atomic_store(&app->running, false);
         } else if (event->window.event == SDL_WINDOWEVENT_SIZE_CHANGED || event->window.event == SDL_WINDOWEVENT_RESIZED) {
-            fprintf(stderr, "[native] SDL window size event %u: %dx%d\n", (unsigned)event->window.event, event->window.data1,
-                    event->window.data2);
+            clog(cLogLevelDebug, "SDL window size event %u: %dx%d", (unsigned)event->window.event,
+                 event->window.data1, event->window.data2);
             (void)native_update_render_size(app, renderer);
             native_update_pointer_window_size(app);
         } else if (event->window.event == SDL_WINDOWEVENT_FOCUS_LOST || event->window.event == SDL_WINDOWEVENT_HIDDEN ||
@@ -3698,18 +4253,25 @@ static void handle_sdl_event(App *app, SDL_Window *window, SDL_Renderer *rendere
              * fully backgrounding the app, so SDL_APP_WILLENTERBACKGROUND never fires. Release
              * the global evdev grab here too, otherwise the mouse/keyboard stay locked to us and
              * are unusable in the overlay. Re-grab happens on FOCUS_GAINED below. */
-            fprintf(stderr, "[native] window lost focus (event %u); releasing input grab\n",
-                    (unsigned)event->window.event);
+            clog(cLogLevelInfo, "window lost focus (event %u); releasing input grab",
+                 (unsigned)event->window.event);
             app->window_unfocused = true;
+            if (app->mixer_overlay_visible && app->mixer_overlay_dismiss_button != 0) {
+                /* Focus loss can swallow the matching SDL button-up. It is safe to
+                 * finish the deferred close now because input remains ungrabbed until
+                 * focus returns. */
+                app->mixer_overlay_dismiss_button = 0;
+                native_mixer_overlay_hide(app);
+            }
             native_stop_streaming_input(app);
         } else if (event->window.event == SDL_WINDOWEVENT_FOCUS_GAINED || event->window.event == SDL_WINDOWEVENT_RESTORED ||
                    event->window.event == SDL_WINDOWEVENT_SHOWN) {
-            fprintf(stderr, "[native] window gained focus (event %u); re-grabbing input\n",
-                    (unsigned)event->window.event);
+            clog(cLogLevelInfo, "window gained focus (event %u); re-grabbing input",
+                 (unsigned)event->window.event);
             app->window_unfocused = false;
             native_resume_streaming_input(app, window);
         } else if (event->window.event == SDL_WINDOWEVENT_EXPOSED) {
-            fprintf(stderr, "[native] SDL window lifecycle event %u\n", (unsigned)event->window.event);
+            clog(cLogLevelTrace, "SDL window lifecycle event %u", (unsigned)event->window.event);
         }
         break;
     case SDL_MOUSEMOTION:
@@ -3754,10 +4316,11 @@ static void handle_sdl_event(App *app, SDL_Window *window, SDL_Renderer *rendere
         if (app->mixer_overlay_visible) {
             if (event->type == SDL_MOUSEBUTTONUP) {
                 app->mixer_overlay_dragging = false;
-                native_mixer_overlay_touch(app);
-                break;
-            }
-            if (event->button.button != SDL_BUTTON_LEFT) {
+                if (app->mixer_overlay_dismiss_button == event->button.button) {
+                    app->mixer_overlay_dismiss_button = 0;
+                    native_mixer_overlay_hide(app);
+                    break;
+                }
                 native_mixer_overlay_touch(app);
                 break;
             }
@@ -3765,14 +4328,33 @@ static void handle_sdl_event(App *app, SDL_Window *window, SDL_Renderer *rendere
             int win_h = 0;
             SDL_GetWindowSize(window, &win_w, &win_h);
             int hit_slot = -1;
-            bool on_fader = false;
-            if (!native_ui_mixer_hit_test(win_w, win_h, event->button.x, event->button.y, &hit_slot, &on_fader)) {
-                native_mixer_overlay_hide(app); /* click outside the panel closes it */
+            NativeUiMixerHit zone = NATIVE_UI_MIXER_HIT_BODY;
+            if (!native_ui_mixer_hit_test(win_w, win_h, event->button.x, event->button.y, &hit_slot, &zone)) {
+                /* Keep the overlay alive until this same button is released. Closing
+                 * on DOWN would immediately restore the grab and could leak the UP edge
+                 * into the RDP session as a stray pointer release. */
+                if (app->mixer_overlay_dismiss_button == 0) {
+                    app->mixer_overlay_dismiss_button = event->button.button;
+                }
+                app->mixer_overlay_dragging = false;
+                native_mixer_overlay_touch(app);
+                break;
+            }
+            if (event->button.button != SDL_BUTTON_LEFT) {
+                native_mixer_overlay_touch(app);
                 break;
             }
             if (hit_slot >= 0) {
                 native_mixer_overlay_select(app, hit_slot);
-                if (on_fader) {
+                if (zone == NATIVE_UI_MIXER_HIT_MUTE && hit_slot < NATIVE_SETTINGS_MAX_SESSIONS) {
+                    native_mixer_overlay_toggle_mute(app, hit_slot);
+                } else if (zone == NATIVE_UI_MIXER_HIT_SOLO && hit_slot < NATIVE_SETTINGS_MAX_SESSIONS) {
+                    native_mixer_overlay_toggle_solo(app, hit_slot);
+                } else if (zone == NATIVE_UI_MIXER_HIT_DUCK && hit_slot < NATIVE_SETTINGS_MAX_SESSIONS) {
+                    /* A click on the switch toggles it (inert for the active channel);
+                     * no drag state — the switch has no fader travel. */
+                    native_mixer_overlay_toggle_duck(app, hit_slot);
+                } else if (zone == NATIVE_UI_MIXER_HIT_FADER) {
                     if (hit_slot == NATIVE_UI_MIXER_MASTER) {
                         native_mixer_overlay_set_master_pct(app,
                                                             native_ui_mixer_fader_pct_at(win_h, event->button.y));
@@ -3841,23 +4423,44 @@ static void handle_sdl_event(App *app, SDL_Window *window, SDL_Renderer *rendere
     case SDL_KEYDOWN:
     case SDL_KEYUP:
         /* The USB keyboard is read from grabbed /dev/input (input_evdev); there is no SDL
-         * keyboard path. The only keys taken from SDL are the webOS remote's four color
-         * keys (session-slot navigation): they come from the ungrabbed TV remote, not the
-         * grabbed keyboard. App exit is system-driven (webOS EXIT/home -> SDL_QUIT /
+         * keyboard path. SDL keys here belong to the ungrabbed webOS remote: its colour
+         * keys navigate sessions, central OK opens HUB, and the channel rocker rings
+         * connected slots. App exit is system-driven (webOS EXIT/home -> SDL_QUIT /
          * SDL_APP_TERMINATING above).
          *
          * The mouse, by contrast, keeps an SDL fallback above: a grabbed USB mouse is read via
          * evdev, but with no USB mouse SDL still delivers the compositor pointer (Magic Remote). */
+#if !defined(HELLOLG_WITH_PRECONNECT_UI) || !HELLOLG_WITH_PRECONNECT_UI
+        if (app->streaming_visible && !app->mixer_overlay_visible &&
+            native_sdl_confirm_key(&event->key)) {
+            /* Without HUB support the fallback remote's OK button remains an ordinary
+             * RDP Enter. Forward both edges; dropping the release can leave Enter held
+             * on the server. SDL repeat does not represent a new physical edge. */
+            if (event->type == SDL_KEYDOWN && event->key.repeat != 0) {
+                break;
+            }
+            bool down = event->type == SDL_KEYDOWN;
+            if (native_input_key(&app->input, 0x1c, down, false)) {
+                native_track_key(app, 0x1c, false, down);
+            }
+            break;
+        }
+#endif
         if (event->type == SDL_KEYDOWN) {
             /* Only the ungrabbed remote (and system) reaches SDL here — the USB keyboard
              * is evdev-grabbed — so these are sparse; logging them maps what a given
              * remote firmware actually sends. */
-            fprintf(stderr, "[native-input] remote sdl key scancode=%d\n", (int)event->key.keysym.scancode);
+            clog(cLogLevelTrace, "remote sdl key scancode=%d", (int)event->key.keysym.scancode);
             int slot = native_sdl_webos_color_slot(&event->key);
             if (slot >= 0) {
                 native_request_session_switch(app, slot);
             } else if (app->mixer_overlay_visible) {
                 native_mixer_overlay_sdl_key(app, &event->key);
+            } else if (app->streaming_visible && event->key.repeat == 0 &&
+                       native_sdl_confirm_key(&event->key)) {
+                /* SDL is the fallback for remote nodes the evdev grab does not own.
+                 * A single central-button down opens HUB; its release is ignored. */
+                native_show_hub(app);
             } else if (event->key.keysym.scancode == 480 /* SDL_WEBOS_SCANCODE_CH_UP */ ||
                        event->key.keysym.scancode == 481 /* SDL_WEBOS_SCANCODE_CH_DOWN */) {
                 /* The channel rocker rings through the connected slots — channel-zapping
@@ -3906,18 +4509,18 @@ static void native_pump_preconnect_system_events(App *app, SDL_Window *window, S
 
 static int native_run_app_loop(App *app, NativeSettings *settings) {
     if (SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) {
-        fprintf(stderr, "[native] SDL_InitSubSystem(VIDEO|EVENTS) failed: %s\n", SDL_GetError());
+        clog(cLogLevelError, "SDL_InitSubSystem(VIDEO|EVENTS) failed: %s", SDL_GetError());
         return 4;
     }
     native_log_sdl_display_modes();
 
-    fprintf(stderr, "[native] creating borderless SDL window %dx%d\n", NATIVE_LOCAL_SURFACE_WIDTH,
-            NATIVE_LOCAL_SURFACE_HEIGHT);
+    clog(cLogLevelInfo, "creating borderless SDL window %dx%d", NATIVE_LOCAL_SURFACE_WIDTH,
+         NATIVE_LOCAL_SURFACE_HEIGHT);
     uint32_t window_flags = SDL_WINDOW_SHOWN | SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_BORDERLESS;
     SDL_Window *window = SDL_CreateWindow("gnomecast", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
                                           NATIVE_LOCAL_SURFACE_WIDTH, NATIVE_LOCAL_SURFACE_HEIGHT, window_flags);
     if (!window) {
-        fprintf(stderr, "[native] SDL_CreateWindow failed: %s\n", SDL_GetError());
+        clog(cLogLevelError, "SDL_CreateWindow failed: %s", SDL_GetError());
         SDL_QuitSubSystem(SDL_INIT_VIDEO | SDL_INIT_EVENTS);
         return 4;
     }
@@ -3928,7 +4531,7 @@ static int native_run_app_loop(App *app, NativeSettings *settings) {
 #if defined(HELLOLG_WITH_PRECONNECT_UI) && HELLOLG_WITH_PRECONNECT_UI
     SDL_Renderer *renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_TARGETTEXTURE);
     if (!renderer) {
-        fprintf(stderr, "[native] SDL_CreateRenderer failed: %s\n", SDL_GetError());
+        clog(cLogLevelError, "SDL_CreateRenderer failed: %s", SDL_GetError());
         SDL_DestroyWindow(window);
         SDL_QuitSubSystem(SDL_INIT_VIDEO | SDL_INIT_EVENTS);
         return 4;
@@ -3936,7 +4539,7 @@ static int native_run_app_loop(App *app, NativeSettings *settings) {
 #else
     SDL_Renderer *renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
     if (!renderer) {
-        fprintf(stderr, "[native] SDL_CreateRenderer failed: %s\n", SDL_GetError());
+        clog(cLogLevelError, "SDL_CreateRenderer failed: %s", SDL_GetError());
         SDL_DestroyWindow(window);
         SDL_QuitSubSystem(SDL_INIT_VIDEO | SDL_INIT_EVENTS);
         return 4;
@@ -3948,7 +4551,7 @@ static int native_run_app_loop(App *app, NativeSettings *settings) {
     char surface_message[128];
     if (!native_init_render_state(app, window, renderer, &window_width, &window_height, surface_message,
                                   sizeof(surface_message))) {
-        fprintf(stderr, "[native] %s\n", surface_message);
+        clog(cLogLevelError, "%s", surface_message);
         SDL_DestroyRenderer(renderer);
         SDL_DestroyWindow(window);
         SDL_QuitSubSystem(SDL_INIT_VIDEO | SDL_INIT_EVENTS);
@@ -3958,39 +4561,43 @@ static int native_run_app_loop(App *app, NativeSettings *settings) {
     SDL_StartTextInput();
 
     uint16_t loop_fps = settings->sessions[NATIVE_SESSION_SLOT_GREEN].fps;
-    fprintf(stderr, "[native] SDL loop running at target %u fps\n", (unsigned)loop_fps);
+    clog(cLogLevelInfo, "SDL loop running at target %u fps", (unsigned)loop_fps);
 
 #if defined(HELLOLG_WITH_PRECONNECT_UI) && HELLOLG_WITH_PRECONNECT_UI
     NativePreconnectUi *ui = native_preconnect_ui_create(window, renderer, settings->sessions,
                                                          settings->audio_codec);
     if (!ui) {
-        fprintf(stderr, "[native-ui] failed to create pre-connect UI\n");
+        clog(cLogLevelError, "failed to create pre-connect UI");
         SDL_StopTextInput();
         SDL_DestroyRenderer(renderer);
         SDL_DestroyWindow(window);
         SDL_QuitSubSystem(SDL_INIT_VIDEO | SDL_INIT_EVENTS);
         return 4;
     }
+    native_preconnect_ui_set_background_drawer(ui, native_draw_preconnect_background, app);
     app->preconnect_ui = ui;
+    int initial_hub_slot = native_preconnect_ui_selected_slot(ui);
+    if (initial_hub_slot >= 0 && initial_hub_slot < NATIVE_SETTINGS_MAX_SESSIONS) {
+        atomic_store(&app->active_index, initial_hub_slot);
+        native_duck_retarget(app);
+    }
 
     app->interactive_ui = true;
     app->ui_last_state = -1;
     app->streaming_visible = false;
+    app->hub_visible = false;
     bool present_logged = false;
 
 #if HELLOLG_WITH_EVDEV_INPUT
-    /* The keyboard is read from grabbed /dev/input with no SDL fallback; warn on the visible
-     * preconnect screen if none is attached so it isn't discovered only after connecting. */
-    if (!native_evdev_input_probe_keyboard()) {
-        native_preconnect_ui_set_status(ui, "No USB keyboard detected — you can connect, but keyboard input needs one.",
-                                        true);
-    }
+    /* The hub mirrors the current USB input probes in its compact icon indicators. */
+    native_preconnect_ui_set_keyboard_available(ui, native_evdev_input_probe_keyboard());
+    native_preconnect_ui_set_mouse_available(ui, native_evdev_input_probe_mouse());
 #endif
 
     while (atomic_load(&app->running)) {
         NativeSessionSlot *active = native_active_slot(app);
         int event_state = atomic_load(&active->current_state);
-        if (active->rdp && event_state == (int)RDP_STATE_ACTIVE) {
+        if (app->streaming_visible && active->rdp && event_state == (int)RDP_STATE_ACTIVE) {
             native_drain_pointer_clamp(app);
             native_drain_pointer_warp(app, window);
             native_cursor_tick(app);
@@ -4025,19 +4632,25 @@ static int native_run_app_loop(App *app, NativeSettings *settings) {
                 (void)snprintf(status, sizeof(status), "%s session failed: %s", native_session_slot_name(i),
                                rdp_state_name(terminal_state));
             }
+            native_preconnect_ui_set_slot_state(ui, i, NATIVE_PRECONNECT_SESSION_ERROR, status);
+            if (i == app->hub_connect_target) {
+                /* A HUB-originated connect failed before it could own the screen. Keep
+                 * HUB open and returnable, but stop waiting for this slot to auto-enter. */
+                app->hub_connect_target = -1;
+            }
 
             if (i == atomic_load(&app->active_index)) {
                 int survivor = -1;
                 for (int j = 0; j < NATIVE_SETTINGS_MAX_SESSIONS; j++) {
-                    if (j != i && app->sessions[j].rdp && !atomic_load(&app->sessions[j].session_failed) &&
+                    if (j != i && native_slot_is_live_stream_target(&app->sessions[j]) &&
                         atomic_load(&app->sessions[j].current_state) == (int)RDP_STATE_ACTIVE) {
                         survivor = j;
                     }
                 }
                 if (survivor >= 0 && app->streaming_visible) {
                     /* The session the user was WATCHING died: fall back to the survivor. */
-                    fprintf(stderr, "[native] %s; auto-switching video to the %s session\n", status,
-                            native_session_slot_name(survivor));
+                    clog(cLogLevelWarning, "%s; auto-switching video to the %s session", status,
+                         native_session_slot_name(survivor));
                     native_complete_session_switch(app, survivor);
                     native_stop_slot(app, i);
                     native_preconnect_ui_set_status(ui, status, true);
@@ -4048,27 +4661,44 @@ static int native_run_app_loop(App *app, NativeSettings *settings) {
                      * survivor's stream on every retry. */
                     native_stop_slot(app, i);
                     app->ui_last_state = -1;
-                    native_preconnect_ui_set_connecting(ui, false, status);
+                    native_preconnect_ui_set_connecting(ui, i, false, status);
                     native_preconnect_ui_set_status(ui, status, true);
                 } else {
                     /* Flush + release input while the failed session pointer is still
                      * wired, then tear the slot down (media follows after the pass once
                      * no slot needs it). */
                     native_stop_streaming_input(app);
+#if HELLOLG_WITH_EVDEV_INPUT
+                    native_preconnect_ui_set_keyboard_available(ui, native_evdev_input_probe_keyboard());
+                    native_preconnect_ui_set_mouse_available(ui, native_evdev_input_probe_mouse());
+#endif
                     native_stop_slot(app, i);
                     native_cursor_reset(&slot->cursor);
                     app->switch_deadline_ticks = 0;
-                    native_mixer_overlay_hide(app); /* streaming screen is going away */
                     app->streaming_visible = false;
+                    native_mixer_overlay_force_hide(app);
                     app->ui_last_state = -1;
                     native_preconnect_ui_set_visible(ui, true);
-                    native_preconnect_ui_set_connecting(ui, false, status);
+                    native_preconnect_ui_set_connecting(ui, i, false, status);
                     native_preconnect_ui_set_status(ui, status, true);
                 }
             } else {
-                fprintf(stderr, "[native] background %s\n", status);
+                clog(cLogLevelWarning, "background %s", status);
                 native_stop_slot(app, i);
-                native_preconnect_ui_set_status(ui, status, true);
+            }
+            if (!app->streaming_visible && !app->hub_visible) {
+                int pending_return = app->pending_switch_target;
+                bool pending_return_live = false;
+                if (pending_return >= 0 && pending_return < NATIVE_SETTINGS_MAX_SESSIONS) {
+                    NativeSessionSlot *pending_slot = &app->sessions[pending_return];
+                    pending_return_live = native_slot_is_live_stream_target(pending_slot);
+                }
+                if (!pending_return_live) {
+                    /* A HUB return can be accepted just before its target dies. The UI
+                     * is still on screen in that race, so make it interactive again
+                     * instead of waiting for a hide transition that will never happen. */
+                    native_preconnect_ui_cancel_hub_close(ui);
+                }
             }
             /* After each drained failure: when NO slot holds a session anymore, the
              * shared media pipeline must go too. Checked per drained slot (not inside
@@ -4080,13 +4710,67 @@ static int native_run_app_loop(App *app, NativeSettings *settings) {
             }
         }
 
+        /* Keep every card live, including sessions that are connected in the background.
+         * Terminal failures above own the ERROR state after their worker is drained. */
+        uint64_t runtime_now = native_monotonic_ms64();
+        for (int i = 0; i < NATIVE_SETTINGS_MAX_SESSIONS; i++) {
+            NativeSessionSlot *slot = &app->sessions[i];
+            bool failed = atomic_load(&slot->session_failed);
+            int slot_state = atomic_load(&slot->current_state);
+            bool session_exists = slot->rdp && !failed;
+            if (!session_exists) {
+                app->session_started_ms[i] = 0;
+                app->session_runtime_active[i] = false;
+                native_preconnect_ui_set_slot_runtime(ui, i, 0, 0, 0, false, 0, 0, 0, 0, 0);
+            } else if (slot_state == (int)RDP_STATE_ACTIVE || app->session_runtime_active[i]) {
+                /* Start only once the user's connection reaches ACTIVE. Hidden snapshot
+                 * and watchdog reconnects retain the latch and original start stamp. */
+                if (!app->session_runtime_active[i]) {
+                    app->session_started_ms[i] = runtime_now;
+                    app->session_runtime_active[i] = true;
+                }
+                uint64_t session_minutes64 = (runtime_now - app->session_started_ms[i]) / 60000u;
+                uint32_t session_minutes =
+                    session_minutes64 > UINT32_MAX ? UINT32_MAX : (uint32_t)session_minutes64;
+                NativeAudioSourceStats audio_stats;
+                bool audio_stream_open =
+                    native_audio_pipeline_get_source_stats(&app->audio_pipeline, i, &audio_stats) && audio_stats.open;
+                uint32_t audio_codec = audio_stream_open ? atomic_load(&slot->audio_codec) : 0u;
+                uint32_t audio_sample_rate = audio_stream_open ? atomic_load(&slot->audio_sample_rate) : 0u;
+                uint16_t audio_channels =
+                    audio_stream_open ? (uint16_t)atomic_load(&slot->audio_channels) : 0u;
+                int32_t audio_peak_left = 0;
+                int32_t audio_peak_right = 0;
+                native_audio_pipeline_get_source_peaks(&app->audio_pipeline, i, &audio_peak_left,
+                                                       &audio_peak_right);
+                native_preconnect_ui_set_slot_runtime(
+                    ui, i, (uint16_t)atomic_load(&slot->desktop_width),
+                    (uint16_t)atomic_load(&slot->desktop_height),
+                    session_minutes, audio_stream_open, audio_codec, audio_sample_rate, audio_channels,
+                    audio_peak_left, audio_peak_right);
+            } else {
+                /* A fresh connection is still negotiating, so no session clock exists
+                 * yet. Its card state below remains CONNECTING. */
+                native_preconnect_ui_set_slot_runtime(ui, i, 0, 0, 0, false, 0, 0, 0, 0, 0);
+            }
+            if (!slot->rdp || failed) {
+                continue;
+            }
+            native_preconnect_ui_set_slot_state(
+                ui, i,
+                slot_state == (int)RDP_STATE_ACTIVE ? NATIVE_PRECONNECT_SESSION_CONNECTED
+                                                    : NATIVE_PRECONNECT_SESSION_CONNECTING,
+                slot_state == (int)RDP_STATE_ACTIVE ? NULL : rdp_state_name((RdpState)slot_state));
+        }
+
         active = native_active_slot(app);
         int state = atomic_load(&active->current_state);
         /* Input arming is derived here, on the SDL thread, from the active slot's state:
          * worker callbacks must not write shared input state (see on_state). */
         /* The mixer overlay owns the pointer while visible (evdev grab released, system
          * cursor shown): keep RDP input disarmed so nothing leaks to the session. */
-        bool input_streaming = active->rdp && state == (int)RDP_STATE_ACTIVE && !app->mixer_overlay_visible;
+        bool input_streaming = app->streaming_visible && active->rdp && state == (int)RDP_STATE_ACTIVE &&
+                               !app->mixer_overlay_visible;
         native_input_set_active(&app->input, input_streaming);
         /* Input coordinate mapping follows the ACTIVE slot's desktop size, derived here
          * like the arming flag: workers only publish their own slot's atomics (a worker
@@ -4116,7 +4800,16 @@ static int native_run_app_loop(App *app, NativeSettings *settings) {
             native_preconnect_ui_set_status(ui, status, false);
             app->ui_last_state = state;
         }
-        if (active->rdp && state == (int)RDP_STATE_ACTIVE && !app->streaming_visible) {
+        bool hub_connect_ready = app->hub_connect_target == atomic_load(&app->active_index);
+        if (active->rdp && state == (int)RDP_STATE_ACTIVE && !app->streaming_visible &&
+            app->pending_switch_target < 0 &&
+            (!app->hub_visible || hub_connect_ready)) {
+            if (hub_connect_ready) {
+                /* Only a successful ACTIVE transition commits the HUB exit. Until this
+                 * point BACK must still be able to resume the stream below the HUB. */
+                app->hub_connect_target = -1;
+                app->hub_visible = false;
+            }
             if (active->suppressed) {
                 /* The user left this slot mid-connect (queueing a suppress in its worker)
                  * and returned before it went active, so no switch path ran to resume it:
@@ -4133,30 +4826,211 @@ static int native_run_app_loop(App *app, NativeSettings *settings) {
                 app->switch_reconnect_used = false;
             }
             (void)native_config_save_persisted(settings);
+            native_preconnect_ui_set_connecting(ui, atomic_load(&app->active_index), false, "");
             native_preconnect_ui_set_visible(ui, false);
             app->window_unfocused = false; /* enter streaming focused, whatever fired during preconnect */
             /* Grab input now that streaming has started; the preconnect UI needs the SDL mouse,
              * so we don't grab earlier. Note any degradation on the (now hidden) preconnect
              * status so it shows if the session returns here; the loud log covers diagnosis. */
-            switch (native_start_streaming_input(app)) {
+            NativeInputStartResult input_result = native_start_streaming_input(app);
+#if HELLOLG_WITH_EVDEV_INPUT
+            native_preconnect_ui_set_mouse_available(ui, native_evdev_input_mouse_active(&app->evdev_input));
+#endif
+            switch (input_result) {
             case NATIVE_INPUT_START_OK:
+                native_preconnect_ui_set_keyboard_available(ui, true);
                 break;
             case NATIVE_INPUT_START_NO_KEYBOARD:
-                native_preconnect_ui_set_status(ui, "No USB keyboard detected — this session has no keyboard input.",
-                                                true);
+                native_preconnect_ui_set_keyboard_available(ui, false);
                 break;
             case NATIVE_INPUT_START_UNAVAILABLE:
-                native_preconnect_ui_set_status(
-                    ui, "Input capture failed to start — this session has no mouse or keyboard input.", true);
+                native_preconnect_ui_set_input_unavailable(ui);
                 break;
             }
+            /* HUB and setup use the system arrow and can leave it at an unrelated UI
+             * coordinate. Restore the server cursor and home the compositor pointer to
+             * the last RDP position before input starts flowing again. */
+            native_cursor_reassert(&active->cursor);
+            app->cursor_reassert_pending = true;
+            SDL_WarpMouseInWindow(window, atomic_load(&app->virtual_mouse_x),
+                                  atomic_load(&app->virtual_mouse_y));
             app->streaming_visible = true;
+            app->hub_visible = false;
             native_system_volume_rebaseline(app);
             native_show_session_indicator(app, atomic_load(&app->active_index));
         }
 
         if (app->streaming_visible) {
             native_present_streaming_frame(app, renderer, &present_logged);
+        }
+
+        int activate_slot = -1;
+        bool hub_close_requested = native_preconnect_ui_take_hub_close(ui);
+        if (hub_close_requested) {
+            /* BACK wins over every navigation action queued in the same LVGL input
+             * batch, including Connect/Retry on an offline card. */
+            native_preconnect_ui_cancel_pending_navigation(ui);
+            if (!app->hub_visible) {
+                /* On the initial pre-connect screen BACK has no desktop to return to;
+                 * keep the HUB usable instead of leaving its close guard armed. */
+                native_preconnect_ui_cancel_hub_close(ui);
+            }
+        }
+        if (hub_close_requested && app->hub_visible) {
+            int return_slot = app->hub_return_slot;
+            bool return_slot_live = false;
+            if (return_slot >= 0 && return_slot < NATIVE_SETTINGS_MAX_SESSIONS) {
+                NativeSessionSlot *return_session = &app->sessions[return_slot];
+                return_slot_live = native_slot_is_live_stream_target(return_session);
+            }
+            if (!return_slot_live) {
+                return_slot = -1;
+                for (int candidate = 0; candidate < NATIVE_SETTINGS_MAX_SESSIONS; candidate++) {
+                    NativeSessionSlot *candidate_slot = &app->sessions[candidate];
+                    if (native_slot_is_live_stream_target(candidate_slot) &&
+                        atomic_load(&candidate_slot->current_state) == (int)RDP_STATE_ACTIVE) {
+                        return_slot = candidate;
+                        break;
+                    }
+                }
+                for (int candidate = 0;
+                     return_slot < 0 && candidate < NATIVE_SETTINGS_MAX_SESSIONS; candidate++) {
+                    NativeSessionSlot *candidate_slot = &app->sessions[candidate];
+                    if (native_slot_is_live_stream_target(candidate_slot) &&
+                        candidate_slot->snapshot_pending) {
+                        return_slot = candidate;
+                    }
+                }
+            }
+            if (return_slot >= 0) {
+                clog(cLogLevelInfo, "remote BACK closes HUB and returns to the %s profile",
+                     native_session_slot_name(return_slot));
+                native_request_session_switch(app, return_slot);
+                if (app->hub_visible) {
+                    /* The worker can leave ACTIVE between validation and the switch;
+                     * release the guard when no stream accepted the return request. */
+                    native_preconnect_ui_cancel_hub_close(ui);
+                }
+            } else {
+                clog(cLogLevelWarning, "remote BACK cannot close HUB: no live session remains");
+                native_preconnect_ui_cancel_hub_close(ui);
+            }
+        }
+        if (!hub_close_requested && native_preconnect_ui_take_activate(ui, &activate_slot)) {
+            native_request_session_switch(app, activate_slot);
+        }
+
+        int saved_slot = -1;
+        uint16_t saved_audio_codec = settings->audio_codec;
+        if (native_preconnect_ui_take_save(ui, &saved_slot, &saved_audio_codec) && saved_slot >= 0 &&
+            saved_slot < NATIVE_SETTINGS_MAX_SESSIONS) {
+            NativeSessionConfig edited;
+            bool saved = false;
+            char save_status[128] = "";
+            if (native_preconnect_ui_get_slot_values(ui, saved_slot, &edited)) {
+                edited.duck_mask = settings->sessions[saved_slot].duck_mask;
+                NativeSettings candidate = *settings;
+                candidate.sessions[saved_slot] = edited;
+                candidate.audio_codec = saved_audio_codec;
+                NativeSessionSlot *runtime = &app->sessions[saved_slot];
+                bool connection_changed =
+                    native_session_connection_config_changed(&runtime->config, &edited);
+                if (connection_changed && native_session_is_still_connecting(runtime)) {
+                    (void)snprintf(save_status, sizeof(save_status),
+                                   "The %s session is still connecting.",
+                                   native_session_slot_name(saved_slot));
+                } else if (native_config_save_persisted(&candidate)) {
+                    bool endpoint_changed = native_session_endpoint_changed(&runtime->config, &edited);
+                    *settings = candidate;
+                    if (app->audio_codec != saved_audio_codec) {
+                        clog(cLogLevelInfo, "audio codec preference now %s (new connections only)",
+                             saved_audio_codec == NATIVE_AUDIO_CODEC_PCM ? "pcm" : "auto");
+                        app->audio_codec = saved_audio_codec;
+                    }
+                    if (runtime->rdp && connection_changed) {
+                        /* Never leave the live old endpoint behind a newly saved
+                         * identity. Save stops it; Save and connect replaces it. */
+                        native_stop_slot(app, saved_slot);
+                        native_preconnect_ui_set_slot_state(ui, saved_slot, NATIVE_PRECONNECT_SESSION_OFFLINE,
+                                                            NULL);
+                        if (!native_any_slot_connected(app)) {
+                            native_stop_media(app);
+                        }
+                    }
+                    if (!runtime->rdp) {
+                        if (endpoint_changed) {
+                            runtime->refresh_ineffective = false;
+                        }
+                        pthread_mutex_lock(&app->redaction_lock);
+                        runtime->config = edited;
+                        pthread_mutex_unlock(&app->redaction_lock);
+                    } else {
+                        /* A display-name-only edit is safe on the existing endpoint. */
+                        pthread_mutex_lock(&app->redaction_lock);
+                        (void)snprintf(runtime->config.name, sizeof(runtime->config.name), "%s", edited.name);
+                        pthread_mutex_unlock(&app->redaction_lock);
+                    }
+                    saved = true;
+                } else {
+                    clog(cLogLevelError, "failed to persist the %s profile",
+                         native_session_slot_name(saved_slot));
+                    (void)snprintf(save_status, sizeof(save_status),
+                                   "Could not save settings on this TV. Check storage and retry.");
+                }
+            }
+            native_preconnect_ui_finish_save(ui, saved_slot, saved,
+                                             saved ? "Saved on this TV."
+                                                   : (save_status[0] ? save_status
+                                                                     : "Could not save this profile."));
+        }
+
+        int deleted_slot = -1;
+        if (native_preconnect_ui_take_delete(ui, &deleted_slot) && deleted_slot >= 0 &&
+            deleted_slot < NATIVE_SETTINGS_MAX_SESSIONS) {
+            NativeSessionConfig empty = {0};
+            empty.port = 3389;
+            empty.fps = 60;
+            NativeSettings candidate = *settings;
+            candidate.sessions[deleted_slot] = empty;
+            NativeSessionSlot *runtime = &app->sessions[deleted_slot];
+            bool deleted = false;
+            char delete_status[128] = "";
+            if (native_session_is_still_connecting(runtime)) {
+                (void)snprintf(delete_status, sizeof(delete_status),
+                               "The %s session is still connecting.",
+                               native_session_slot_name(deleted_slot));
+            } else if (native_config_save_persisted(&candidate)) {
+                deleted = true;
+                native_stop_slot(app, deleted_slot);
+                *settings = candidate;
+                runtime->refresh_ineffective = false;
+                pthread_mutex_lock(&app->redaction_lock);
+                runtime->config = empty;
+                pthread_mutex_unlock(&app->redaction_lock);
+                app->duck_mask[deleted_slot] = 0;
+                app->mixer_mute_mask &= (uint8_t)~(uint8_t)(1u << deleted_slot);
+                app->mixer_solo_mask &= (uint8_t)~(uint8_t)(1u << deleted_slot);
+                native_publish_effective_solo_mask(app);
+                app->mixer_gain_db[deleted_slot] = 0;
+                native_audio_pipeline_set_source_muted(&app->audio_pipeline, deleted_slot, false);
+                native_audio_pipeline_set_source_gain(&app->audio_pipeline, deleted_slot,
+                                                      native_ui_mixer_gain_db_to_q15(0));
+                native_duck_retarget(app);
+                native_preconnect_ui_set_slot_state(ui, deleted_slot,
+                                                    NATIVE_PRECONNECT_SESSION_NOT_SET_UP, NULL);
+                if (!native_any_slot_connected(app)) {
+                    native_stop_media(app);
+                }
+            } else {
+                clog(cLogLevelError, "failed to delete the %s profile",
+                     native_session_slot_name(deleted_slot));
+                (void)snprintf(delete_status, sizeof(delete_status),
+                               "Could not delete this profile. Check storage and retry.");
+            }
+            native_preconnect_ui_finish_delete(ui, deleted_slot, deleted,
+                                               deleted ? "Profile deleted."
+                                                       : (delete_status[0] ? delete_status
+                                                                           : "Could not delete this profile."));
         }
 
         int requested_slot = NATIVE_SESSION_SLOT_GREEN;
@@ -4167,92 +5041,160 @@ static int native_run_app_loop(App *app, NativeSettings *settings) {
         uint16_t requested_port = 0;
         uint16_t requested_fps = 0;
         uint16_t requested_audio_codec = NATIVE_AUDIO_CODEC_AUTO;
+        bool requested_requires_save = false;
         /* ALWAYS consume the one-shot request: gating the take on slot state would leave
          * a Connect clicked on a still-connecting slot's configurator latched in the UI,
          * to be replayed as a surprise reconnect whenever that session later fails. */
         if (native_preconnect_ui_take_connect(ui, &requested_slot, requested_host, sizeof(requested_host),
                                               &requested_port, requested_username, sizeof(requested_username),
                                               requested_password, sizeof(requested_password), requested_domain,
-                                              sizeof(requested_domain), &requested_fps, &requested_audio_codec)) {
+                                              sizeof(requested_domain), &requested_fps, &requested_audio_codec,
+                                              &requested_requires_save)) {
             if (requested_slot < 0 || requested_slot >= NATIVE_SETTINGS_MAX_SESSIONS) {
                 requested_slot = NATIVE_SESSION_SLOT_GREEN;
             }
-            NativeSessionConfig *session = &settings->sessions[requested_slot];
             NativeSessionSlot *requested_live = &app->sessions[requested_slot];
-            if (requested_live->rdp &&
-                atomic_load(&requested_live->current_state) != (int)RDP_STATE_ACTIVE) {
+            NativeSettings candidate = *settings;
+            NativeSessionConfig *session = &candidate.sessions[requested_slot];
+            char validation_message[128] = "";
+            bool ready_to_connect = true;
+            if (native_session_is_still_connecting(requested_live)) {
                 /* Mid-handshake: joining the worker here could block the SDL thread for
-                 * the whole connect timeout, so reject instead (an ACTIVE background
-                 * session stays reconnectable through the branch below). */
-                char busy_status[96];
-                (void)snprintf(busy_status, sizeof(busy_status), "The %s session is still connecting.",
-                               native_session_slot_name(requested_slot));
-                native_preconnect_ui_set_status(ui, busy_status, true);
+                 * the whole connect timeout, so reject instead. */
+                (void)snprintf(validation_message, sizeof(validation_message),
+                               "The %s session is still connecting.", native_session_slot_name(requested_slot));
+                ready_to_connect = false;
             } else if (!copy_config_string(session->host, sizeof(session->host), requested_host, "host")) {
-                native_preconnect_ui_set_status(ui, "Host value is too long.", true);
+                (void)snprintf(validation_message, sizeof(validation_message), "Host value is too long.");
+                ready_to_connect = false;
             } else if (!copy_config_string(session->username, sizeof(session->username), requested_username,
                                            "username")) {
-                native_preconnect_ui_set_status(ui, "Username value is too long.", true);
+                (void)snprintf(validation_message, sizeof(validation_message), "Username value is too long.");
+                ready_to_connect = false;
             } else if (!copy_config_string(session->password, sizeof(session->password), requested_password,
                                            "password")) {
-                native_preconnect_ui_set_status(ui, "Password value is too long.", true);
+                (void)snprintf(validation_message, sizeof(validation_message), "Password value is too long.");
+                ready_to_connect = false;
             } else if (!copy_config_string(session->domain, sizeof(session->domain), requested_domain, "domain")) {
-                native_preconnect_ui_set_status(ui, "Domain value is too long.", true);
+                (void)snprintf(validation_message, sizeof(validation_message), "Domain value is too long.");
+                ready_to_connect = false;
             } else {
+                NativeSessionConfig edited;
+                if (native_preconnect_ui_get_slot_values(ui, requested_slot, &edited)) {
+                    (void)snprintf(session->name, sizeof(session->name), "%s", edited.name);
+                }
                 session->port = requested_port;
                 session->fps = requested_fps;
-                settings->audio_codec = requested_audio_codec;
-                /* Applies to sessions started from now on; live sessions keep their
-                 * negotiated stream until they reconnect. Per-source conversion allows
-                 * those streams to use different sample rates in the same mix. */
-                if (app->audio_codec != requested_audio_codec) {
-                    fprintf(stderr, "[native-audio] audio codec preference now %s (new connections only)\n",
-                            requested_audio_codec == NATIVE_AUDIO_CODEC_PCM ? "pcm" : "auto");
-                    app->audio_codec = requested_audio_codec;
-                }
-                native_config_apply_initial_desktop_hint(settings);
-                char validation_message[128];
+                candidate.audio_codec = requested_audio_codec;
+                native_config_apply_initial_desktop_hint(&candidate);
                 if (!native_session_config_validate_connect(session, requested_slot, validation_message,
                                                             sizeof(validation_message))) {
-                    native_preconnect_ui_set_status(ui, validation_message, true);
+                    ready_to_connect = false;
+                }
+            }
+
+            if (ready_to_connect && requested_requires_save && !native_config_save_persisted(&candidate)) {
+                clog(cLogLevelError, "failed to persist the %s profile before connect",
+                     native_session_slot_name(requested_slot));
+                (void)snprintf(validation_message, sizeof(validation_message),
+                               "Could not save settings on this TV. Check storage and retry.");
+                ready_to_connect = false;
+            }
+            native_preconnect_ui_finish_connect_save(ui, requested_slot, ready_to_connect,
+                                                      ready_to_connect && requested_requires_save,
+                                                      ready_to_connect ? NULL : validation_message);
+            if (ready_to_connect) {
+                /* A HUB-originated connect exits only after the asynchronous worker is
+                 * ACTIVE. Until then the old stream remains the BACK destination. */
+                bool connect_from_hub = app->hub_visible;
+                app->hub_connect_target = connect_from_hub ? requested_slot : -1;
+                if (requested_requires_save) {
+                    *settings = candidate;
+                }
+                session = &settings->sessions[requested_slot];
+                if (app->audio_codec != requested_audio_codec) {
+                    clog(cLogLevelInfo, "audio codec preference now %s (new connections only)",
+                         requested_audio_codec == NATIVE_AUDIO_CODEC_PCM ? "pcm" : "auto");
+                    app->audio_codec = requested_audio_codec;
+                }
+                native_config_log_effective(settings);
+                native_preconnect_ui_set_connecting(ui, requested_slot, true, "Connecting...");
+                int old_index = atomic_load(&app->active_index);
+                /* Join before replacing config: workers may still consult their old
+                 * redaction strings while winding down. This is an explicit user
+                 * connection, not an internal recovery reconnect, so it starts a new
+                 * logical-session clock once the replacement reaches ACTIVE. */
+                app->session_started_ms[requested_slot] = 0;
+                app->session_runtime_active[requested_slot] = false;
+                native_stop_slot(app, requested_slot);
+                if (native_session_endpoint_changed(&app->sessions[requested_slot].config, session)) {
+                    app->sessions[requested_slot].refresh_ineffective = false;
+                }
+                pthread_mutex_lock(&app->redaction_lock);
+                app->sessions[requested_slot].config = *session;
+                pthread_mutex_unlock(&app->redaction_lock);
+
+                /* Ask the outgoing server to stop graphics before ownership moves, so
+                 * no full-rate AUs/bitmap deltas can land in the demotion window. Do
+                 * not mark it suppressed yet: after the flip native_background_slot()
+                 * still needs to choose plain suppress vs hidden snapshot reconnect. */
+                if (old_index != requested_slot && app->sessions[old_index].rdp &&
+                    !app->sessions[old_index].suppressed) {
+                    rdp_set_suppress_output(app->sessions[old_index].rdp, false);
+                }
+                app->pending_switch_target = -1;
+                app->switch_deadline_ticks = 0;
+                pthread_mutex_lock(&app->video_lock);
+                if (connect_from_hub) {
+                    native_capture_hub_return_rgba_locked(app);
+                }
+                if (app->hub_return_rgba) {
+                    /* native_slot_connect increments this epoch before the worker starts.
+                     * Arm the readiness gate now so an immediate callback cannot make us
+                     * drop the frozen background before ACTIVE. */
+                    native_arm_hub_return_replacement_locked(
+                        app, requested_slot,
+                        atomic_load(&app->sessions[requested_slot].connect_epoch) + 1u,
+                        atomic_load(&app->sessions[requested_slot].video_ok_frames));
+                }
+                /* Any non-frozen canvas belongs to the outgoing/failed owner. The new
+                 * RemoteFX stream must receive a zeroed surface for its dirty rectangles. */
+                native_close_rgba_locked(app, false);
+                atomic_store(&app->active_index, requested_slot);
+                atomic_store(&app->video_refresh_needed, false);
+                app->video_plane_punched = false;
+                pthread_mutex_unlock(&app->video_lock);
+                native_preconnect_ui_select_slot(ui, requested_slot);
+                native_duck_retarget(app);
+                if (old_index != requested_slot) {
+                    /* Demotion must precede this helper: snapshot backgrounding may
+                     * reconnect old_index, which must not reset the shared decoder. */
+                    native_background_slot(app, old_index);
+                }
+                app->ui_last_state = -1;
+                if (!native_slot_connect(app, requested_slot, false)) {
+                    const char *start_error = "Connection failed: start failed";
+                    if (app->hub_connect_target == requested_slot) {
+                        app->hub_connect_target = -1;
+                    }
+                    native_preconnect_ui_set_connecting(ui, requested_slot, false, start_error);
+                    native_preconnect_ui_set_slot_state(ui, requested_slot, NATIVE_PRECONNECT_SESSION_ERROR,
+                                                        start_error);
+                    native_preconnect_ui_open_setup(ui, requested_slot);
+                    native_preconnect_ui_set_status(ui, start_error, true);
+                    if (!native_any_slot_connected(app)) {
+                        native_stop_media(app);
+                    }
                 } else {
-                    /* The user may have edited OTHER slots' forms without connecting
-                     * them; pull those values into the settings too, or the save on
-                     * ACTIVE would persist stale data and drop the edits on restart.
-                     * Live sessions keep their own slot->config until they reconnect. */
-                    for (int other = 0; other < NATIVE_SETTINGS_MAX_SESSIONS; other++) {
-                        if (other != requested_slot) {
-                            (void)native_preconnect_ui_get_slot_values(ui, other, &settings->sessions[other]);
-                        }
-                    }
-                    native_config_log_effective(settings);
-                    native_preconnect_ui_set_connecting(ui, true, "Connecting...");
-                    /* Connect can target a slot whose session still runs in the
-                     * background (form selected without navigating). Join that worker
-                     * BEFORE overwriting slot->config — workers read it lock-free for
-                     * log redaction — and reconnect it with the new values. */
-                    native_stop_slot(app, requested_slot);
-                    if (strcmp(app->sessions[requested_slot].config.host, session->host) != 0 ||
-                        app->sessions[requested_slot].config.port != session->port) {
-                        /* A different server now occupies this color slot: the learned
-                         * no-keyframe-on-request workaround belonged to the old one. */
-                        app->sessions[requested_slot].refresh_ineffective = false;
-                    }
-                    pthread_mutex_lock(&app->redaction_lock);
-                    app->sessions[requested_slot].config = *session;
-                    pthread_mutex_unlock(&app->redaction_lock);
-                    atomic_store(&app->active_index, requested_slot);
-                    app->ui_last_state = -1;
-                    if (!native_slot_connect(app, requested_slot, false)) {
-                        native_preconnect_ui_set_connecting(ui, false, "Connection failed: start failed");
-                        native_preconnect_ui_set_status(ui, "Connection failed: start failed", true);
-                    } else {
-                        native_update_pointer_window_size(app);
-                    }
+                    native_update_pointer_window_size(app);
                 }
             }
         }
 
+        pthread_mutex_lock(&app->video_lock);
+        bool hardware_video_plane = app->video != NULL;
+        pthread_mutex_unlock(&app->video_lock);
+        native_preconnect_ui_set_hardware_video_plane(ui, hardware_video_plane);
         native_preconnect_ui_tick(ui);
         uint16_t active_fps = native_active_slot(app)->config.fps;
         if (active_fps == 0) {
@@ -4280,8 +5222,7 @@ static int native_run_app_loop(App *app, NativeSettings *settings) {
     native_update_pointer_window_size(app);
     (void)native_start_streaming_input(app);
     /* No pre-connect screen in this build: the stream IS the screen from the first tick.
-     * The flag gates the active-color mixer-overlay toggle in
-     * native_request_session_switch; without it the raw fallback panel is unreachable. */
+     * The flag still gates active-session input and presentation. */
     app->streaming_visible = true;
     native_system_volume_rebaseline(app);
 
@@ -4301,8 +5242,8 @@ static int native_run_app_loop(App *app, NativeSettings *settings) {
         native_system_volume_tick(app);
 
         NativeSessionSlot *arm_slot = native_active_slot(app);
-        /* Same overlay gate as the preconnect loop: while the raw fallback panel is up,
-         * input not consumed for its navigation must not leak to the session behind it. */
+        /* Same overlay gate as the preconnect loop: overlay navigation must not leak
+         * input to the session behind it. */
         bool input_streaming = arm_slot->rdp &&
                                atomic_load(&arm_slot->current_state) == (int)RDP_STATE_ACTIVE &&
                                !app->mixer_overlay_visible;
@@ -4339,6 +5280,7 @@ static int native_run_app_loop(App *app, NativeSettings *settings) {
 
     SDL_StopTextInput();
     if (renderer) {
+        native_destroy_rgba_renderer_textures(app);
         SDL_DestroyRenderer(renderer);
     }
     SDL_DestroyWindow(window);
@@ -4348,15 +5290,17 @@ static int native_run_app_loop(App *app, NativeSettings *settings) {
 #else
 static int native_run_app_loop(App *app, NativeSettings *settings) {
     (void)settings;
-    fprintf(stderr,
-            "[native] SDL event loop is not compiled in; deterministic smoke loop exits after start "
-            "(enable HELLOLG_WITH_SDL for webOS lifecycle/input)\n");
+    clog(cLogLevelInfo,
+         "SDL event loop is not compiled in; deterministic smoke loop exits after start "
+         "(enable HELLOLG_WITH_SDL for webOS lifecycle/input)");
     return atomic_load(&app->exit_code);
 }
 #endif
 
 int main(int argc, char **argv) {
     native_prepare_webos_logging();
+    (void)clog_configure_env();
+    clog(cLogLevelNotice, "--- launch ---");
     native_prepare_webos_environment();
 
     NativeSettings native_settings;
@@ -4411,6 +5355,9 @@ int main(int argc, char **argv) {
         return 2;
     }
     atomic_init(&app.active_index, NATIVE_SESSION_SLOT_GREEN);
+    app.rgba_owner_slot = -1;
+    app.hub_return_rgba_owner_slot = -1;
+    app.hub_return_replacement_slot = -1;
     for (int i = 0; i < NATIVE_SETTINGS_MAX_SESSIONS; i++) {
         NativeSessionSlot *slot = &app.sessions[i];
         slot->app = &app;
@@ -4423,36 +5370,46 @@ int main(int argc, char **argv) {
         atomic_init(&slot->desktop_width, native_settings.width);
         atomic_init(&slot->desktop_height, native_settings.height);
         atomic_init(&slot->video_ok_frames, 0);
+        atomic_init(&slot->audio_codec, 0u);
+        atomic_init(&slot->audio_sample_rate, 0u);
+        atomic_init(&slot->audio_channels, 0u);
         atomic_init(&slot->connect_epoch, 0u);
         atomic_init(&slot->keyframe_wait_drops, 0u);
         atomic_init(&slot->snapshot_idr_ready, false);
         atomic_init(&slot->snapshot_last_au_ms, 0u);
         atomic_init(&slot->video_via_bitmap, false);
         app.mixer_gain_db[i] = 0; /* unity */
+        app.duck_mask[i] = (uint8_t)native_settings.sessions[i].duck_mask;
     }
     atomic_init(&app.video_refresh_needed, false);
     app.audio_codec = native_settings.audio_codec;
     if (!native_audio_pipeline_init(&app.audio_pipeline) ||
         !native_audio_pipeline_pump_start(&app.audio_pipeline, native_audio_pipeline_feed_cb, &app)) {
-        fprintf(stderr, "[native-audio] miniaudio pipeline unavailable; continuing with silent video\n");
+        clog(cLogLevelWarning, "miniaudio pipeline unavailable; continuing with silent video");
         native_audio_pipeline_destroy(&app.audio_pipeline);
     } else {
         for (int i = 0; i < NATIVE_SETTINGS_MAX_SESSIONS; i++) {
             native_audio_pipeline_set_source_gain(&app.audio_pipeline, i,
                                                   native_ui_mixer_gain_db_to_q15(app.mixer_gain_db[i]));
         }
-        fprintf(stderr, "[native-audio] miniaudio graph running at 48000Hz stereo, 480-frame blocks\n");
+        clog(cLogLevelInfo, "miniaudio engine running at 48000Hz stereo, 480-frame blocks");
     }
+    app.settings = &native_settings;
+    app.mixer_mute_mask = 0;
+    app.mixer_solo_mask = 0;
+    native_duck_retarget(&app);
     const char *snapshot_force = getenv("HELLOLG_SNAPSHOT_FORCE");
     app.snapshot_force = snapshot_force && snapshot_force[0] != '\0' && strcmp(snapshot_force, "0") != 0;
     if (app.snapshot_force) {
-        fprintf(stderr, "[native] HELLOLG_SNAPSHOT_FORCE: IDR-snapshot backgrounding for every slot\n");
+        clog(cLogLevelInfo, "HELLOLG_SNAPSHOT_FORCE: IDR-snapshot backgrounding for every slot");
     }
 #if defined(HELLOLG_WITH_SDL) && HELLOLG_WITH_SDL
     app.indicator_slot = -1;
     app.system_volume_seen = -1;
     app.system_volume_baseline_seq = 0;
     app.pending_switch_target = -1;
+    app.hub_return_slot = -1;
+    app.hub_connect_target = -1;
     app.wheel_step = native_settings.wheel_step;
     app.wheel_scroll_divisor = native_settings.wheel_scroll_divisor;
     atomic_init(&app.render_width, 0);
@@ -4464,7 +5421,7 @@ int main(int argc, char **argv) {
     /* System-volume bridge for the MASTER fader; harmless where luna-send-pub does not
      * exist (every call fails, the fader just stays dimmed). */
     if (!native_luna_volume_start(&app.luna_volume)) {
-        fprintf(stderr, "[native-luna] volume worker failed to start; the MASTER fader stays unavailable\n");
+        clog(cLogLevelWarning, "volume worker failed to start; the MASTER fader stays unavailable");
     }
     native_luna_volume_refresh(&app.luna_volume);
 

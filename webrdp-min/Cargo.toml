@@ -46,7 +46,7 @@ ironrdp-displaycontrol = { path = "../third_party/IronRDP/crates/ironrdp-display
 
 # Diagnostics for the native direct TCP/TLS worker.
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }
 
 # X.509 parsing to extract the server public key from the TLS certificate
 # for CredSSP pubKeyAuth.

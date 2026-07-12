@@ -11,6 +11,10 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include "clog.h"
+
+clog_define(g_native_log_config, cLogLevelInfo, cLogFlags_Default, "config.paths", NULL);
+
 bool native_config_join_path(char *path, size_t cap, const char *dir, const char *name) {
     if (!path || cap == 0 || !dir || !dir[0] || !name || !name[0]) {
         return false;
@@ -149,7 +153,7 @@ bool native_config_dir_secure_or_heal(const char *dir) {
     if (chmod(dir, 0700) != 0) {
         return false;
     }
-    fprintf(stderr, "[native] tightened persisted-config dir to 0700: %s\n", dir);
+    clog(cLogLevelNotice, "tightened persisted-config dir to 0700: %s", dir);
     return native_config_dir_is_secure(dir);
 }
 
@@ -197,7 +201,7 @@ bool native_config_add_candidate_path(NativeConfigPathCandidates *candidates, co
     }
     if (!native_config_copy_path(candidates->paths[candidates->count], sizeof(candidates->paths[candidates->count]),
                                  path)) {
-        fprintf(stderr, "[native] persisted config path is too long\n");
+        clog(cLogLevelError, "persisted config path is too long");
         return false;
     }
     candidates->from_env[candidates->count] = from_env;
@@ -211,7 +215,7 @@ bool native_config_add_candidate_dir(NativeConfigPathCandidates *candidates, con
     }
     char path[NATIVE_PERSISTED_CONFIG_PATH_MAX];
     if (!native_config_join_path(path, sizeof(path), dir, NATIVE_PERSISTED_CONFIG_FILENAME)) {
-        fprintf(stderr, "[native] persisted config path is too long\n");
+        clog(cLogLevelError, "persisted config path is too long");
         return false;
     }
     return native_config_add_candidate_path(candidates, path, from_env);
@@ -240,8 +244,8 @@ bool native_config_find_persisted_save_candidate(const NativeConfigPathCandidate
             /* One line per candidate, once per process (the resolved path is cached):
              * without this the tmpfs fallback won silently and settings quietly stopped
              * surviving TV power cycles. */
-            fprintf(stderr, "[native] persisted-config candidate rejected: %s (%s)\n", candidates->paths[i],
-                    strerror(errno));
+            clog(cLogLevelWarning, "persisted-config candidate rejected: %s (%s)",
+                 candidates->paths[i], strerror(errno));
             continue;
         }
         *index = i;

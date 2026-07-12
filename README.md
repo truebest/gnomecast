@@ -1,20 +1,25 @@
 # gnomecast
 
-`gnomecast` is a native webOS RDP client for LG TVs, built to cast a GNOME desktop
-(gnome-remote-desktop) to the TV with hardware decoding for both video and audio.
+`gnomecast` is a native webOS RDP client for LG TVs, built to put GNOME desktops
+(`gnome-remote-desktop`) on the TV with hardware-decoded video and native mixed audio.
 
 ## Features
 
 - **Video**: AVC420/H.264 over RDPEGFX, decoded by the TV hardware video plane through
-  ss4s (NDL/SMP). Servers that cannot provide H.264 fall back to native RemoteFX
-  Progressive/bitmap decoding in Rust, presented as RGBA through SDL.
+  the in-house NDL DirectMedia backend (`backend_ndl`, dlopen of
+  `libNDL_directmedia.so.1`). Servers that cannot provide H.264 fall back to native
+  RemoteFX Progressive/bitmap decoding in Rust, presented as RGBA through SDL.
+- **Multi-session switching**: four RDP sessions map to the remote's red, green, yellow,
+  and blue buttons. One session owns the video and KVM-style input at a time while the
+  other connected sessions remain backgrounded and keep feeding the audio mix.
 - **Audio**: MS-RDPEA over the `AUDIO_PLAYBACK_DVC` dynamic channel (the transport
   gnome-remote-desktop uses). Opus 48 kHz stereo is negotiated preferentially and
   decoded in-process through libopus; 16-bit PCM is the fallback. A headless miniaudio
-  graph mixes all sessions at 48 kHz stereo and independently resamples 44.1/48 kHz
-  sources. Its always-on adaptive jitter controller tracks burst/HOL delay and clock
-  drift; there is no manual buffer setting. NDL/ss4s remains the PCM sink. Audio is
-  strictly best-effort: failures degrade to silent video, never to a dropped session.
+  engine mixes `ma_sound` voices from all sessions at 48 kHz stereo and independently
+  resamples 44.1/48 kHz sources. Its always-on adaptive jitter controller tracks
+  burst/HOL delay and clock drift; there is no manual buffer setting. NDL remains the
+  PCM sink. Audio is strictly best-effort: failures degrade to silent video, never
+  to a dropped session.
 - **Input**: the USB mouse and keyboard are read straight from the kernel evdev layer
   (`/dev/input`, `EVIOCGRAB`), below the webOS compositor, so physical input reaches the RDP
   server untouched by the TV's SDL/Wayland munging — no synthesized Back on right-click, no
@@ -86,26 +91,28 @@ not a missing feature:
   the pixel domain. webOS media pipelines (NDL/SMP) feed the elementary
   stream straight to the hardware video plane and never expose decoded frames
   to the application, so the recombination step has nowhere to run.
-- Native 4:4:4 profiles are absent from TV decoder silicon in *every* codec:
-  webOS 23/24 decoders implement H.264 BP/MP/HP, HEVC Main/Main10 and
-  AV1 Main only — no Hi444PP, no HEVC RExt, no AV1 High.
+- On the validated webOS 23/24 targets, the available hardware profiles are H.264
+  BP/MP/HP, HEVC Main/Main10, and AV1 Main — no Hi444PP, HEVC RExt, or AV1 High.
 - Decoding the AVC444 stream pair in software would forfeit the hardware
   video plane and cannot sustain 4K on TV SoCs.
 
-The same ceiling applies to any ss4s-based client.
+The same composition ceiling applies to any hardware-plane client that cannot access
+decoded frames.
 
 ## Layout
 
 - `native/` — C11/CMake shell: webOS lifecycle, raw evdev mouse+keyboard reader
-  (`input_evdev.c`, with an SDL pointer fallback) and SDL presentation, the
-  shared ss4s media player (`media_ss4s.c`) with its video (`video_ss4s.c`) and audio
-  (`audio_ss4s.c`) tracks, RemoteFX RGBA presentation, pre-connect UI, package targets.
+  (`input_evdev.c`, with an SDL pointer fallback), SDL presentation, gnomecast-specific
+  DirectMedia adapters under `native/src/ndl_adapter/`, RemoteFX RGBA presentation,
+  pre-connect UI, and package targets.
+- `backend_ndl/` — standalone MIT C11 DirectMedia library with a public SDK-independent
+  header, CMake package, runtime `dlopen`, callbacks, and host tests.
 - `webrdp-min/` — Rust static library implementing the RDP client (direct TCP + TLS +
   CredSSP/NTLM, EGFX, rdpsnd-over-DVC), exposed through the C ABI in
   `native/include/rdp_ffi.h`.
 - `third_party/` — pinned native dependencies (git submodules): our IronRDP fork
   ([truebest/IronRDP](https://github.com/truebest/IronRDP), branch `gnome-rdp-support`,
-  mirror patch record in `patches/ironrdp/`), ss4s, commons, LVGL, miniaudio.
+  mirror patch record in `patches/ironrdp/`), LVGL, miniaudio.
 - `Dockerfile` + `bitbucket-pipelines.yml` — reproducible build environment and CI that
   produces the webOS `.ipk`. CI runs inside a prebuilt public image
   (`cubicattache/gnomecast-webos-build`); rebuild and push it with
@@ -117,20 +124,21 @@ browser runtime fallback paths.
 
 ## Documentation
 
-- `docs/native-runbook.md` — build/package/deploy/triage commands;
-- `docs/build-environment.md` — host and webOS toolchain setup;
-- `docs/audio-rdpsnd-design-notes.md` — audio design record: protocol findings
-  (gnome-remote-desktop specifics), codec strategy, and live bring-up gotchas;
-- `docs/future-work.md` — deferred design ideas and their acceptance criteria;
-- `third_party/PROVENANCE.md` and `third_party/IronRDP/PROVENANCE.md` — pinned dependency
-  provenance and the IronRDP fork delta.
+- [Documentation index](docs/README.md) — ownership and purpose of each document;
+- [native webOS runbook](docs/native-runbook.md) — runtime controls, build, package,
+  deploy, acceptance, logging, and triage;
+- [build environment](docs/build-environment.md) — reproducible host/container setup;
+- [third-party provenance](third_party/PROVENANCE.md) and
+  [IronRDP fork provenance](third_party/IronRDP/PROVENANCE.md) — pinned dependencies and
+  fork delta.
 
 ## License
 
 gnomecast's own code is released under the [MIT License](LICENSE).
 
-Bundled dependencies under `third_party/` (git submodules) keep their own licenses: IronRDP
-(MIT OR Apache-2.0), LVGL (MIT), commons (MIT), miniaudio (MIT-0), and **ss4s
-(LGPL-3.0)**. The ss4s core is statically linked into the application binary; the LGPL-3.0
-relinking requirement is satisfied by this repository being fully open source. Packaged
-builds ship all dependency license texts under `licenses/` inside the `.ipk`.
+Bundled dependencies under `third_party/` keep their own licenses: IronRDP
+(MIT OR Apache-2.0), LVGL (MIT), miniaudio (MIT-0), and the IBM Plex and JetBrains Mono
+fonts (SIL Open Font License 1.1). The `backend_ndl/`
+subproject, including its host-test ABI double, is MIT (see `backend_ndl/THIRD_PARTY.md`).
+Packaged builds ship dependency provenance and applicable notices under `licenses/`
+inside the `.ipk`.

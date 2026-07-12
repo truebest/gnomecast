@@ -20,6 +20,10 @@
 #include <libevdev/libevdev.h>
 #include <SDL.h>
 
+#include "clog.h"
+
+clog_define(g_native_log_input, cLogLevelInfo, cLogFlags_Default, "input.evdev", NULL);
+
 #define NATIVE_EVDEV_MAX_DEVICES 16
 /* Consecutive poll() failures tolerated before the reader gives up (see evdev_thread). */
 #define NATIVE_EVDEV_MAX_POLL_FAILURES 100
@@ -32,6 +36,9 @@ typedef struct NativeEvdevDevice {
      * than one exclusive kind; events are routed per event type in evdev_dispatch. */
     bool is_mouse;
     bool is_keyboard;
+    /* A TV-remote virtual node, recognized by its stable webOS device name.
+     * Its confirm key has app-level meaning while physical keyboard Enter does not. */
+    bool is_remote;
     char path[64]; /* /dev/input node path, used to de-duplicate hotplug re-scans */
 } NativeEvdevDevice;
 
@@ -68,8 +75,8 @@ static bool evdev_is_keyboard(const struct libevdev *dev) {
 }
 
 /* Visit each /dev/input/event* node, calling `visit(path, user)`; stops as soon as a visit
- * returns true and reports whether that happened. Shared by keyboard probing and grab setup so
- * the two never disagree about which nodes exist or how they are enumerated. */
+ * returns true and reports whether that happened. Shared by device probing and grab setup so
+ * they never disagree about which nodes exist or how they are enumerated. */
 typedef bool (*NativeEvdevNodeVisitor)(const char *path, void *user);
 
 static bool evdev_for_each_input_node(NativeEvdevNodeVisitor visit, void *user) {
@@ -109,6 +116,26 @@ static bool evdev_probe_keyboard_node(const char *path, void *user) {
 
 bool native_evdev_input_probe_keyboard(void) {
     return evdev_for_each_input_node(evdev_probe_keyboard_node, NULL);
+}
+
+static bool evdev_probe_mouse_node(const char *path, void *user) {
+    (void)user;
+    int fd = open(path, O_RDONLY | O_NONBLOCK);
+    if (fd < 0) {
+        return false;
+    }
+    struct libevdev *dev = NULL;
+    bool is_mouse = false;
+    if (libevdev_new_from_fd(fd, &dev) == 0) {
+        is_mouse = evdev_is_mouse(dev);
+        libevdev_free(dev);
+    }
+    close(fd);
+    return is_mouse; /* stop at the first relative mouse found */
+}
+
+bool native_evdev_input_probe_mouse(void) {
+    return evdev_for_each_input_node(evdev_probe_mouse_node, NULL);
 }
 
 static uint8_t evdev_mouse_button(uint16_t code) {
@@ -155,7 +182,7 @@ static bool evdev_push_mouse(NativeEvdevInput *input, const NativeMouseEv *ev) {
     return true;
 }
 
-static bool evdev_push_keyboard(NativeEvdevInput *input, uint16_t code, bool down) {
+static bool evdev_push_keyboard(NativeEvdevInput *input, uint16_t code, bool down, bool from_remote) {
     pthread_mutex_lock(&input->lock);
     unsigned next = (input->keyboard_tail + 1u) % NATIVE_EVDEV_KEYBOARD_RING;
     if (next == input->keyboard_head) {
@@ -163,6 +190,7 @@ static bool evdev_push_keyboard(NativeEvdevInput *input, uint16_t code, bool dow
     }
     input->keyboard_ring[input->keyboard_tail].code = code;
     input->keyboard_ring[input->keyboard_tail].down = down;
+    input->keyboard_ring[input->keyboard_tail].from_remote = from_remote;
     input->keyboard_tail = next;
     pthread_mutex_unlock(&input->lock);
     return true;
@@ -212,12 +240,13 @@ static bool evdev_dispatch_mouse(NativeEvdevInput *input, const struct input_eve
     return evdev_push_mouse(input, &ev);
 }
 
-static bool evdev_dispatch_keyboard(NativeEvdevInput *input, const struct input_event *raw) {
+static bool evdev_dispatch_keyboard(NativeEvdevInput *input, const NativeEvdevDevice *device,
+                                    const struct input_event *raw) {
     if (raw->type != EV_KEY) {
         return false;
     }
     atomic_fetch_add(&input->event_count, 1u);
-    return evdev_push_keyboard(input, (uint16_t)raw->code, raw->value != 0);
+    return evdev_push_keyboard(input, (uint16_t)raw->code, raw->value != 0, device->is_remote);
 }
 
 static bool evdev_dispatch(NativeEvdevInput *input, const NativeEvdevDevice *device, const struct input_event *raw) {
@@ -237,10 +266,12 @@ static bool evdev_dispatch(NativeEvdevInput *input, const NativeEvdevDevice *dev
          * on that node also typing like a keyboard. The keyboard drain runs whenever the
          * ring holds events, so these get through even with no keyboard-classified
          * device present. (KEY_RED..KEY_BLUE and KEY_CHANNELUP/DOWN are contiguous.) */
-        if (raw->code >= KEY_RED && raw->code <= KEY_CHANNELDOWN) {
-            return evdev_dispatch_keyboard(input, raw);
+        bool remote_confirm = device->is_remote &&
+                              (raw->code == KEY_ENTER || raw->code == KEY_KPENTER || raw->code == KEY_OK);
+        if ((raw->code >= KEY_RED && raw->code <= KEY_CHANNELDOWN) || remote_confirm) {
+            return evdev_dispatch_keyboard(input, device, raw);
         }
-        return device->is_keyboard ? evdev_dispatch_keyboard(input, raw) : false;
+        return device->is_keyboard ? evdev_dispatch_keyboard(input, device, raw) : false;
     default:
         return false;
     }
@@ -252,7 +283,7 @@ static void evdev_notify_main(NativeEvdevInput *input) {
     }
     uint64_t one = 1;
     if (write(input->wake_fd, &one, sizeof(one)) < 0 && errno != EAGAIN) {
-        fprintf(stderr, "[native-input] failed to signal input eventfd: %s\n", strerror(errno));
+        clog(cLogLevelWarning, "failed to signal input eventfd: %s", strerror(errno));
     }
 }
 
@@ -266,7 +297,7 @@ static NativeEvdevDrainResult evdev_drain_sync(NativeEvdevInput *input, NativeEv
         } else if (ret == -EAGAIN) {
             break;
         } else {
-            fprintf(stderr, "[native-input] libevdev sync failed on fd %d: %s\n", device->fd, strerror(-ret));
+            clog(cLogLevelWarning, "libevdev sync failed on fd %d: %s", device->fd, strerror(-ret));
             result.remove = true;
             break;
         }
@@ -291,7 +322,7 @@ static NativeEvdevDrainResult evdev_drain_device(NativeEvdevInput *input, Native
         } else if (ret == -EAGAIN) {
             break;
         } else {
-            fprintf(stderr, "[native-input] libevdev read failed on fd %d: %s\n", device->fd, strerror(-ret));
+            clog(cLogLevelWarning, "libevdev read failed on fd %d: %s", device->fd, strerror(-ret));
             result.remove = true;
             break;
         }
@@ -306,7 +337,7 @@ static void evdev_close_device(NativeEvdevDevice *device) {
     if (device->dev) {
         int ret = libevdev_grab(device->dev, LIBEVDEV_UNGRAB);
         if (ret < 0 && ret != -ENODEV) {
-            fprintf(stderr, "[native-input] failed to ungrab fd %d: %s\n", device->fd, strerror(-ret));
+            clog(cLogLevelWarning, "failed to ungrab fd %d: %s", device->fd, strerror(-ret));
         }
         libevdev_free(device->dev);
         device->dev = NULL;
@@ -352,8 +383,8 @@ static void evdev_remove_device(NativeEvdevInput *input, NativeEvdevBackend *bac
         return;
     }
     NativeEvdevDevice removed = backend->devices[index];
-    fprintf(stderr, "[native-input] removing %s fd %d after disconnect/error\n", evdev_device_kind_name(&removed),
-            removed.fd);
+    clog(cLogLevelNotice, "removing %s fd %d after disconnect/error", evdev_device_kind_name(&removed),
+         removed.fd);
     evdev_close_device(&removed);
     for (int i = index; i + 1 < backend->ndevices; i++) {
         backend->devices[i] = backend->devices[i + 1];
@@ -413,7 +444,7 @@ static bool evdev_add_device(NativeEvdevInput *input, NativeEvdevBackend *backen
     int fd = open(path, O_RDONLY | O_NONBLOCK);
     if (fd < 0) {
         if (errno != ENXIO && errno != EACCES) {
-            fprintf(stderr, "[native-input] failed to open %s: %s\n", path, strerror(errno));
+            clog(cLogLevelWarning, "failed to open %s: %s", path, strerror(errno));
         }
         return false;
     }
@@ -438,14 +469,19 @@ static bool evdev_add_device(NativeEvdevInput *input, NativeEvdevBackend *backen
     device->dev = dev;
     device->is_mouse = is_mouse;
     device->is_keyboard = is_keyboard;
+    /* webOS exposes the Magic Remote through virtual nodes named "Smart Remote RCU
+     * Input" / "LGE Network Input" (network-remote app buttons ride the latter). */
+    const char *dev_name = libevdev_get_name(dev);
+    device->is_remote = dev_name && (strstr(dev_name, "RCU") || strstr(dev_name, "LGE Network"));
     (void)snprintf(device->path, sizeof(device->path), "%s", path);
     const char *kind_name = evdev_device_kind_name(device);
 
     ret = libevdev_grab(dev, LIBEVDEV_GRAB);
     if (ret < 0) {
-        fprintf(stderr, "[native-input] failed to grab %s %s: %s (kept ungrabbed)\n", kind_name, path, strerror(-ret));
+        clog(cLogLevelWarning, "failed to grab %s %s: %s (kept ungrabbed)", kind_name, path,
+             strerror(-ret));
     } else {
-        fprintf(stderr, "[native-input] grabbed %s %s (%s)\n", kind_name, path, libevdev_get_name(dev));
+        clog(cLogLevelInfo, "grabbed %s %s (%s)", kind_name, path, libevdev_get_name(dev));
     }
 
     backend->ndevices++;
@@ -483,8 +519,8 @@ static NativeEvdevBackend *evdev_open_backend(NativeEvdevInput *input) {
      * unavailable we simply fall back to a one-shot scan. */
     backend->inotify_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
     if (backend->inotify_fd >= 0 && inotify_add_watch(backend->inotify_fd, "/dev/input", IN_CREATE | IN_ATTRIB) < 0) {
-        fprintf(stderr, "[native-input] inotify watch on /dev/input failed (%s); hotplug add disabled\n",
-                strerror(errno));
+        clog(cLogLevelWarning, "inotify watch on /dev/input failed (%s); hotplug add disabled",
+             strerror(errno));
         close(backend->inotify_fd);
         backend->inotify_fd = -1;
     }
@@ -546,12 +582,12 @@ static void *evdev_thread(void *arg) {
             if (errno == EINTR) {
                 continue;
             }
-            fprintf(stderr, "[native-input] poll failed: %s\n", strerror(errno));
+            clog(cLogLevelWarning, "poll failed: %s", strerror(errno));
             /* A persistent poll error (not EINTR) would otherwise spin the reader at 100% CPU,
              * starving video decode and flooding the log. Back off briefly, and after a bounded
              * run of consecutive failures give up so the app drops back to SDL input. */
             if (++poll_failures >= NATIVE_EVDEV_MAX_POLL_FAILURES) {
-                fprintf(stderr, "[native-input] too many consecutive poll failures; stopping evdev reader\n");
+                clog(cLogLevelWarning, "too many consecutive poll failures; stopping evdev reader");
                 /* Hand the devices back to the compositor before quitting, otherwise they stay
                  * EVIOCGRAB-captured and the SDL fallback would have nothing to read. */
                 evdev_release_devices(input, backend);
@@ -614,14 +650,14 @@ bool native_evdev_input_start(NativeEvdevInput *input) {
     input->wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     input->stop_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (input->wake_fd < 0 || input->stop_fd < 0) {
-        fprintf(stderr, "[native-input] eventfd() failed; evdev input is unavailable: %s\n", strerror(errno));
+        clog(cLogLevelWarning, "eventfd() failed; evdev input is unavailable: %s", strerror(errno));
         native_evdev_input_stop(input);
         return false;
     }
 
     NativeEvdevBackend *backend = evdev_open_backend(input);
     if (!backend) {
-        fprintf(stderr, "[native-input] no USB mouse/keyboard devices found for evdev grab\n");
+        clog(cLogLevelInfo, "no USB mouse/keyboard devices found for evdev grab");
         native_evdev_input_stop(input);
         return false;
     }
@@ -629,14 +665,15 @@ bool native_evdev_input_start(NativeEvdevInput *input) {
 
     atomic_store(&input->running, true);
     if (pthread_create(&input->thread, NULL, evdev_thread, input) != 0) {
-        fprintf(stderr, "[native-input] failed to start evdev reader thread\n");
+        clog(cLogLevelWarning, "failed to start evdev reader thread");
         atomic_store(&input->running, false);
         native_evdev_input_stop(input);
         return false;
     }
     input->started = true;
-    fprintf(stderr, "[native-input] libevdev reader started (%d device(s), mouse=%d keyboard=%d)\n", backend->ndevices,
-            atomic_load(&input->mouse_active) ? 1 : 0, atomic_load(&input->keyboard_active) ? 1 : 0);
+    clog(cLogLevelInfo, "libevdev reader started (%d device(s), mouse=%d keyboard=%d)",
+         backend->ndevices, atomic_load(&input->mouse_active) ? 1 : 0,
+         atomic_load(&input->keyboard_active) ? 1 : 0);
     return true;
 }
 
