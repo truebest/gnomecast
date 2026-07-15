@@ -93,6 +93,11 @@ clog_define(g_native_log_config, cLogLevelInfo, cLogFlags_Default, "native", NUL
  * on expiry the press is answered with the immediate old-style switch — covers targets
  * that never quiet down (suppress ignored) or never produce an AU at all. */
 #define NATIVE_PENDING_SWITCH_TIMEOUT_MS 8000u
+/* Raw-evdev bypasses compositor pointer activity, so webOS cannot reliably restore a
+ * cursor plane it hid on standby. Reassert on the first movement after a short pause and
+ * occasionally during continuous movement; this is far below pointer-event frequency. */
+#define NATIVE_CURSOR_ACTIVITY_IDLE_MS 750u
+#define NATIVE_CURSOR_ACTIVITY_HEARTBEAT_MS 5000u
 /* Volume-mixer overlay: the fader model constants (range, step, auto-hide) and both
  * renderers live in ui_mixer.h/.c; this file keeps the state machine and key routing. */
 /* System-volume poll cadence while streaming: the LS2 getVolume round-trip is an
@@ -234,8 +239,9 @@ typedef struct App {
     int hub_return_replacement_slot;
     unsigned hub_return_replacement_epoch;
     unsigned hub_return_replacement_baseline_frames;
-    /* Shared SS4S library/player owner; video and audio attach tracks to it. Guarded by
-     * video_lock like the tracks themselves. */
+    /* Shared SS4S library/player owner; video and audio attach tracks to it. Its lifetime
+     * and the video track use video_lock; the audio pointer/feed use audio_lock, while the
+     * backend serializes actual NDL calls internally. */
     NativeMedia *media;
     NativeVideo *video;
     /* Which slot/connection generation the open video track decodes (video_lock). A
@@ -246,7 +252,8 @@ typedef struct App {
     int video_owner_slot;
     unsigned video_owner_epoch;
     /* The single mixed-PCM audio track; all sessions flow through the fixed 48 kHz stereo
-     * engine into it (video_lock). */
+     * engine into it. Its pointer/lifetime and feed calls use audio_lock so RemoteFX RGBA
+     * copies and SDL texture uploads under video_lock cannot stall the 10 ms PCM pump. */
     NativeAudio *audio;
     /* Headless miniaudio engine plus lock-free per-session adaptive sources. Its pump
      * thread feeds app->audio; the engine format never follows a source format. */
@@ -270,6 +277,7 @@ typedef struct App {
      * fader mirrors and drives the webOS volume, never the app's own mix. */
     NativeLunaVolume luna_volume;
     pthread_mutex_t video_lock;
+    pthread_mutex_t audio_lock;
     /* Guards slot config strings between the SDL thread overwriting a slot's config on
      * (re)Connect and OTHER slots' rdp-workers scanning every config in
      * redact_if_sensitive. A slot's own worker is joined before its config is written,
@@ -390,13 +398,13 @@ typedef struct App {
      * released and the SDL pointer fallback is ignored so input drives the overlay, not RDP.
      * Zero-initialised, i.e. focused. */
     bool window_unfocused;
-    /* SDL thread only. Set on focus regain: a webOS overlay leaves the platform cursor hidden,
-     * and because we grab the mouse the compositor never sees the pointer activity that would
-     * auto-re-show it — and a bare visibility call at focus-gain (no pointer movement, e.g. the
-     * menu was closed with Esc) does not always take. So we also re-assert the cursor on the
-     * first real mouse movement after regaining focus, when the visibility call coincides with
-     * genuine activity. One-shot. */
+    /* SDL thread only. Armed by focus regain and webOS cursor-hide pseudo-events; consumed
+     * by real mouse movement so the visibility request coincides with pointer activity. */
     bool cursor_reassert_pending;
+    /* SDL ticks for the low-rate activity recovery. A first move after idle catches LSM
+     * standby hides; the heartbeat catches cursor-plane loss during continuous movement. */
+    uint32_t cursor_last_activity_ticks;
+    uint32_t cursor_last_reassert_ticks;
     /* SDL thread only. Which inputs we have forwarded a down for but not yet an up, so their
      * releases can be flushed to the server before the evdev grab is dropped on focus loss —
      * otherwise the up goes to the overlay, not RDP, leaving a stuck drag or auto-repeating
@@ -1540,11 +1548,11 @@ static NativeMedia *native_ensure_media_locked(App *app) {
 }
 
 /* NDL sink: the headless miniaudio engine renders one 10 ms S16 block and this
- * callback feeds NDL. The engine render itself is lock-free; only the shared NDL track
- * needs the existing media lock. */
+ * callback feeds NDL. The engine render itself is lock-free; audio_lock only protects
+ * the track pointer/lifetime, independently of RemoteFX presentation under video_lock. */
 static void native_audio_pipeline_feed_cb(void *ctx, const int16_t *samples, size_t frames) {
     App *app = (App *)ctx;
-    pthread_mutex_lock(&app->video_lock);
+    pthread_mutex_lock(&app->audio_lock);
     if (app->audio) {
         size_t bytes = frames * NATIVE_AUDIO_PIPELINE_CHANNELS * sizeof(int16_t);
         if (native_audio_feed(app->audio, (const uint8_t *)samples, bytes) == NATIVE_AUDIO_ERROR) {
@@ -1554,7 +1562,7 @@ static void native_audio_pipeline_feed_cb(void *ctx, const int16_t *samples, siz
             native_audio_disable(app->audio);
         }
     }
-    pthread_mutex_unlock(&app->video_lock);
+    pthread_mutex_unlock(&app->audio_lock);
 }
 
 /* Opens the shared mixed-audio track speculatively as PCM 48kHz stereo before the
@@ -1566,7 +1574,14 @@ static void native_audio_pipeline_feed_cb(void *ctx, const int16_t *samples, siz
  * resends. If negotiation ends up choosing something else (or the server has no audio),
  * the normal on_audio_format path corrects or mutes it. Caller must hold app->video_lock. */
 static void native_open_speculative_audio_locked(App *app) {
-    if (!app || app->audio || !app->media || !native_audio_pipeline_is_initialized(&app->audio_pipeline)) {
+    if (!app || !app->media || !native_audio_pipeline_is_initialized(&app->audio_pipeline)) {
+        return;
+    }
+    /* Lock order is video_lock -> audio_lock everywhere both are needed. The backend's
+     * own lock serializes this track configuration against any in-flight feed call. */
+    pthread_mutex_lock(&app->audio_lock);
+    if (app->audio) {
+        pthread_mutex_unlock(&app->audio_lock);
         return;
     }
     app->audio = native_audio_open(app->media, RDP_AUDIO_CODEC_PCM_S16LE, NATIVE_AUDIO_PIPELINE_SAMPLE_RATE,
@@ -1575,6 +1590,7 @@ static void native_open_speculative_audio_locked(App *app) {
         clog(cLogLevelInfo, "opened speculative mixed PCM %uHz %uch track ahead of negotiation",
              NATIVE_AUDIO_PIPELINE_SAMPLE_RATE, NATIVE_AUDIO_PIPELINE_CHANNELS);
     }
+    pthread_mutex_unlock(&app->audio_lock);
 }
 
 static void on_video_au(void *ctx, const uint8_t *data, size_t len, bool is_keyframe, uint64_t pts90k) {
@@ -1813,6 +1829,7 @@ static void on_audio_format(void *ctx, uint32_t codec, uint32_t sample_rate, uin
          (unsigned)sample_rate, (unsigned)channels);
 
     pthread_mutex_lock(&app->video_lock);
+    pthread_mutex_lock(&app->audio_lock);
     if (!app->audio) {
         /* First working audio format and the speculative open didn't happen (or failed):
          * bring the shared track up now. */
@@ -1841,6 +1858,7 @@ static void on_audio_format(void *ctx, uint32_t codec, uint32_t sample_rate, uin
                  "audio sink unavailable (PCM 48000Hz 2ch); continuing with silent video");
         }
     }
+    pthread_mutex_unlock(&app->audio_lock);
     pthread_mutex_unlock(&app->video_lock);
 }
 
@@ -1925,8 +1943,10 @@ static void native_stop_media(App *app) {
      * be destroyed directly along with the current canvas. */
     native_close_hub_return_rgba_locked(app);
     /* Tracks first, then the shared player/library they attach to. */
+    pthread_mutex_lock(&app->audio_lock);
     native_audio_close(app->audio);
     app->audio = NULL;
+    pthread_mutex_unlock(&app->audio_lock);
     native_video_close(app->video);
     app->video = NULL;
     native_media_close(app->media);
@@ -2349,6 +2369,31 @@ static int native_sdl_webos_color_slot(const SDL_KeyboardEvent *event) {
     return -1;
 }
 
+/* webOS reports Magic Remote/LSM pointer visibility as synthetic key scancodes. They are
+ * not RDP keyboard input: use them to keep the cursor-plane diagnostic state honest and
+ * to arm recovery when the platform hides a cursor the server still considers visible. */
+static int native_sdl_webos_cursor_visibility(const SDL_KeyboardEvent *event) {
+    if (!event) {
+        return -1;
+    }
+#if HELLOLG_HAVE_SDL_WEBOS_CURSOR
+    if (event->keysym.scancode == SDL_WEBOS_SCANCODE_CURSOR_SHOW) {
+        return 1;
+    }
+    if (event->keysym.scancode == SDL_WEBOS_SCANCODE_CURSOR_HIDE) {
+        return 0;
+    }
+#else
+    if (event->keysym.scancode == 484) {
+        return 1;
+    }
+    if (event->keysym.scancode == 485) {
+        return 0;
+    }
+#endif
+    return -1;
+}
+
 static bool native_sdl_confirm_key(const SDL_KeyboardEvent *event) {
     if (!event) {
         return false;
@@ -2528,6 +2573,30 @@ static void native_flush_pending_evdev_motion(App *app, int *pending_dx, int *pe
     }
 }
 
+static void native_cursor_reassert_for_activity(App *app) {
+    if (!app) {
+        return;
+    }
+    uint32_t now = SDL_GetTicks();
+    bool after_idle = app->cursor_last_activity_ticks == 0 ||
+                      now - app->cursor_last_activity_ticks >= NATIVE_CURSOR_ACTIVITY_IDLE_MS;
+    bool heartbeat_due =
+        app->cursor_last_reassert_ticks == 0 ||
+        now - app->cursor_last_reassert_ticks >= NATIVE_CURSOR_ACTIVITY_HEARTBEAT_MS;
+    app->cursor_last_activity_ticks = now;
+    if (!app->cursor_reassert_pending && !after_idle && !heartbeat_due) {
+        return;
+    }
+
+    bool explicitly_pending = app->cursor_reassert_pending;
+    native_cursor_reassert(&native_active_slot(app)->cursor);
+    app->cursor_reassert_pending = false;
+    app->cursor_last_reassert_ticks = now;
+    if (explicitly_pending) {
+        clog(cLogLevelDebug, "reasserted server cursor on pointer activity after platform/focus hide");
+    }
+}
+
 /* SDL thread: apply queued raw-evdev mouse events. Relative motion is integrated into the
  * logical pointer and sent as an absolute server position; buttons/wheel are sent at the
  * current position. Because the mouse is grabbed, the compositor no longer moves the OS
@@ -2574,13 +2643,7 @@ static void native_drain_evdev_mouse(App *app, SDL_Window *window) {
     }
     native_flush_pending_evdev_motion(app, &pending_dx, &pending_dy, &moved);
     if (moved) {
-        if (app->cursor_reassert_pending) {
-            /* First real movement after regaining focus: re-show the cursor now that the
-             * visibility call coincides with genuine pointer activity (webOS ignored it at
-             * bare focus-gain, e.g. when the overlay was dismissed with Esc). */
-            native_cursor_reassert(&native_active_slot(app)->cursor);
-            app->cursor_reassert_pending = false;
-        }
+        native_cursor_reassert_for_activity(app);
         if (window) {
             int wx = atomic_load(&app->virtual_mouse_x);
             int wy = atomic_load(&app->virtual_mouse_y);
@@ -2836,6 +2899,7 @@ static void native_resume_streaming_input(App *app, SDL_Window *window) {
 #endif
     (void)native_start_streaming_input(app);
     native_cursor_reassert(&native_active_slot(app)->cursor);
+    app->cursor_last_reassert_ticks = SDL_GetTicks();
     /* Also re-assert on the next real mouse movement — see cursor_reassert_pending. */
     app->cursor_reassert_pending = true;
     if (window) {
@@ -4303,10 +4367,7 @@ static void handle_sdl_event(App *app, SDL_Window *window, SDL_Renderer *rendere
 #endif
         /* Fallback when no USB mouse was grabbed: SDL delivers the compositor's own pointer
          * (Magic Remote, trackpad remote) in absolute window coordinates. */
-        if (app->cursor_reassert_pending) {
-            native_cursor_reassert(&native_active_slot(app)->cursor);
-            app->cursor_reassert_pending = false;
-        }
+        native_cursor_reassert_for_activity(app);
         native_set_virtual_mouse_position(app, event->motion.x, event->motion.y);
         native_input_pointer_move(&app->input, event->motion.x, event->motion.y);
         break;
@@ -4450,6 +4511,24 @@ static void handle_sdl_event(App *app, SDL_Window *window, SDL_Renderer *rendere
             /* Only the ungrabbed remote (and system) reaches SDL here — the USB keyboard
              * is evdev-grabbed — so these are sparse; logging them maps what a given
              * remote firmware actually sends. */
+            int platform_cursor_visible = native_sdl_webos_cursor_visibility(&event->key);
+            if (platform_cursor_visible >= 0) {
+                NativeCursor *cursor = &native_active_slot(app)->cursor;
+                native_cursor_note_platform_visibility(cursor, platform_cursor_visible != 0);
+                bool stream_owns_cursor = app->streaming_visible && !app->window_unfocused &&
+                                          !app->mixer_overlay_visible;
+                if (stream_owns_cursor) {
+                    if (platform_cursor_visible == 0) {
+                        app->cursor_reassert_pending = true;
+                    } else {
+                        /* If the server wants HIDDEN, undo an out-of-band platform show;
+                         * otherwise restore the cached shape, not merely a generic arrow. */
+                        native_cursor_reassert(cursor);
+                        app->cursor_last_reassert_ticks = SDL_GetTicks();
+                    }
+                }
+                break;
+            }
             clog(cLogLevelTrace, "remote sdl key scancode=%d", (int)event->key.keysym.scancode);
             int slot = native_sdl_webos_color_slot(&event->key);
             if (slot >= 0) {
@@ -5349,7 +5428,13 @@ int main(int argc, char **argv) {
         native_shutdown_sdl_runtime();
         return 2;
     }
+    if (pthread_mutex_init(&app.audio_lock, NULL) != 0) {
+        pthread_mutex_destroy(&app.video_lock);
+        native_shutdown_sdl_runtime();
+        return 2;
+    }
     if (pthread_mutex_init(&app.redaction_lock, NULL) != 0) {
+        pthread_mutex_destroy(&app.audio_lock);
         pthread_mutex_destroy(&app.video_lock);
         native_shutdown_sdl_runtime();
         return 2;
@@ -5434,6 +5519,7 @@ int main(int argc, char **argv) {
         }
         native_audio_pipeline_destroy(&app.audio_pipeline);
         pthread_mutex_destroy(&app.redaction_lock);
+        pthread_mutex_destroy(&app.audio_lock);
         pthread_mutex_destroy(&app.video_lock);
         native_shutdown_sdl_runtime();
         return exit_code ? exit_code : 2;
@@ -5447,12 +5533,13 @@ int main(int argc, char **argv) {
 
     native_stop_all_sessions(&app);
     native_luna_volume_stop(&app.luna_volume);
-    /* The pump feeds through video_lock; stop it before destroying that lock. */
+    /* The pump feeds through audio_lock; stop it before destroying that lock. */
     native_audio_pipeline_destroy(&app.audio_pipeline);
     for (int i = 0; i < NATIVE_SETTINGS_MAX_SESSIONS; i++) {
         native_cursor_destroy(&app.sessions[i].cursor);
     }
     pthread_mutex_destroy(&app.redaction_lock);
+    pthread_mutex_destroy(&app.audio_lock);
     pthread_mutex_destroy(&app.video_lock);
     native_shutdown_sdl_runtime();
 

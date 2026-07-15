@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <time.h>
 
 /* Keep this translation unit and the separately compiled upstream miniaudio.c on the
@@ -69,6 +70,10 @@ _Static_assert((NATIVE_AUDIO_PIPELINE_CAPACITY_FRAMES & (NATIVE_AUDIO_PIPELINE_C
 #define NATIVE_AUDIO_JITTER_BUCKETS 31u
 #define NATIVE_AUDIO_JITTER_SAMPLES 2048u
 #define NATIVE_AUDIO_STATS_LOG_MS 3000u
+/* Best-effort CFS preference for the 10 ms PCM pump. webOS does not grant realtime
+ * scheduling to dev-mode apps; a modest negative nice keeps audio responsive under
+ * RemoteFX software decode without starving the RDP workers or SDL thread. */
+#define NATIVE_AUDIO_PUMP_NICE (-5)
 
 typedef struct NativeJitterSample {
     uint64_t arrival_ms;
@@ -1364,6 +1369,11 @@ static bool timespec_after(const struct timespec *left, const struct timespec *r
 
 static void *pipeline_pump_main(void *ctx) {
     NativeAudioPipelineImpl *pipeline = (NativeAudioPipelineImpl *)ctx;
+    if (setpriority(PRIO_PROCESS, 0, NATIVE_AUDIO_PUMP_NICE) != 0) {
+        clog(cLogLevelDebug, "audio pump remains at default priority: %s", strerror(errno));
+    } else {
+        clog(cLogLevelInfo, "audio pump priority set to nice %d", NATIVE_AUDIO_PUMP_NICE);
+    }
     struct timespec next;
     clock_gettime(CLOCK_MONOTONIC, &next);
     while (!atomic_load_explicit(&pipeline->pump_stop, memory_order_acquire)) {

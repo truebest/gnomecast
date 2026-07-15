@@ -107,7 +107,9 @@ NativeAudioResult native_audio_feed(NativeAudio *audio, const uint8_t *data, siz
         return NATIVE_AUDIO_OK;
     }
 
-    switch (backend_ndl_feed_audio(audio->backend, data, len, backend_ndl_media_time_ms(audio->backend))) {
+    /* AUTO is resolved under backend_ndl's feed lock, so a concurrent video-track
+     * reload cannot pair the new pipeline with a timestamp from the old generation. */
+    switch (backend_ndl_feed_audio(audio->backend, data, len, BACKEND_NDL_PTS_AUTO)) {
         case BACKEND_NDL_OK:
             audio->not_ready_logged = false;
             audio->overflow_logged = false;

@@ -20,6 +20,11 @@ extern "C" {
 
 typedef struct BackendNdl BackendNdl;
 
+/* Ask a feed call to derive milliseconds since the current successful load while
+ * holding the same backend lock as DirectVideoPlay/DirectAudioPlay. This keeps the
+ * timestamp in the same reload generation as the data it accompanies. */
+#define BACKEND_NDL_PTS_AUTO INT64_MIN
+
 typedef enum BackendNdlResult {
     BACKEND_NDL_OK = 0,
     BACKEND_NDL_ERROR = 1,
@@ -120,7 +125,8 @@ BackendNdlResult backend_ndl_unload(BackendNdl *ctx);
 /* Explicit unload+load with the currently configured tracks. */
 BackendNdlResult backend_ndl_reload(BackendNdl *ctx);
 
-/* Feed one elementary-stream access unit. PTS is passed verbatim to NDL.
+/* Feed one elementary-stream access unit. PTS is passed verbatim to NDL, except
+ * BACKEND_NDL_PTS_AUTO which is resolved under the feed/reload lock.
  * NOT_READY means the pipeline is not loaded; NEED_KEYFRAME means a load
  * re-armed the optional keyframe gate. */
 BackendNdlResult backend_ndl_feed_video(BackendNdl *ctx,
@@ -129,7 +135,8 @@ BackendNdlResult backend_ndl_feed_video(BackendNdl *ctx,
                                         long long ndl_pts,
                                         bool is_keyframe);
 
-/* Feed one interleaved S16LE PCM chunk. NOT_READY/OVERFLOW means it was dropped. */
+/* Feed one interleaved S16LE PCM chunk. BACKEND_NDL_PTS_AUTO is resolved under the
+ * feed/reload lock; NOT_READY/OVERFLOW means the chunk was dropped. */
 BackendNdlResult backend_ndl_feed_audio(BackendNdl *ctx,
                                         const void *data,
                                         size_t len,

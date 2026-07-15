@@ -38,6 +38,7 @@ typedef struct FakeNdl {
     int available_bytes;
     char app_id[128];
     NDL_DIRECTMEDIA_DATA_INFO_T last_load;
+    long long last_video_play_pts;
     unsigned int audio_play_sizes[FAKE_MAX_PLAYS];
     long long audio_play_pts[FAKE_MAX_PLAYS];
     ResourceReleased resource_released_callback;
@@ -86,7 +87,7 @@ static int fake_media_unload(void) {
 static int fake_video_play(void *buffer, unsigned int size, long long pts) {
     (void)buffer;
     (void)size;
-    (void)pts;
+    g_fake.last_video_play_pts = pts;
     g_fake.video_play_calls++;
     return g_fake.fail_video_play ? -1 : 0;
 }
@@ -423,6 +424,17 @@ static int test_feed_errors_and_overflow(void) {
     BackendNdl *ctx = open_test_backend(&api);
 
     backend_ndl_set_media(ctx, &k_video_1080p, &k_pcm_stereo_48k);
+
+    failures += expect_true(
+        backend_ndl_feed_video(ctx, k_au, sizeof(k_au), BACKEND_NDL_PTS_AUTO, true) == BACKEND_NDL_OK &&
+            g_fake.last_video_play_pts >= 0 && g_fake.last_video_play_pts < 1000,
+        "AUTO video PTS uses the current load generation");
+
+    int auto_audio_play = g_fake.audio_play_calls;
+    failures += expect_true(
+        backend_ndl_feed_audio(ctx, k_pcm_block, sizeof(k_pcm_block), BACKEND_NDL_PTS_AUTO) == BACKEND_NDL_OK &&
+            g_fake.audio_play_pts[auto_audio_play] >= 0 && g_fake.audio_play_pts[auto_audio_play] < 1000,
+        "AUTO audio PTS uses the current load generation");
 
     g_fake.fail_video_play = true;
     failures += expect_true(backend_ndl_feed_video(ctx, k_au, sizeof(k_au), 0, true) == BACKEND_NDL_ERROR,

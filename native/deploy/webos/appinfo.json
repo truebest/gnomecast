@@ -1,6 +1,6 @@
 {
   "id": "com.truebest.gnomecast.native",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "vendor": "truebest",
   "type": "native",
   "main": "bin/gnomecast-native",

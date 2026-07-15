@@ -10,6 +10,11 @@ set -euo pipefail
 # Usage:            tools/release-github.sh <version>        e.g. tools/release-github.sh 0.1.2
 # Remote override:  RELEASE_REMOTE=<name> (default: github)
 # Branch override:  RELEASE_BRANCH=<name> (default: main)
+#
+# This script only pushes the tag/commit. It does NOT create the GitHub Releases entry
+# (Releases page, release notes, .ipk asset) — that's a separate manual step:
+#   gh release create vX.Y.Z --repo truebest/gnomecast --title "gnomecast X.Y.Z" \
+#     --notes "..." dist/native-webos/com.truebest.gnomecast.native_X.Y.Z_arm.ipk
 
 version="${1:?usage: tools/release-github.sh <version>   e.g. 0.1.2}"
 remote="${RELEASE_REMOTE:-github}"
@@ -40,3 +45,5 @@ commit="$(git commit-tree "$tree" "${parent_args[@]}" -m "gnomecast ${version}")
 git tag "$tag" "$commit" >/dev/null
 git push "$remote" "$commit:refs/heads/$branch" "refs/tags/$tag"
 echo "release-github: published release commit $commit as $remote/$branch ($tag)"
+echo "release-github: tag pushed, but the GitHub Releases entry is NOT created yet — run:" >&2
+echo "  gh release create $tag --repo truebest/gnomecast --title \"gnomecast $version\" --notes \"...\" dist/native-webos/com.truebest.gnomecast.native_${version}_arm.ipk" >&2

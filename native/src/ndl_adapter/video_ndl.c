@@ -216,8 +216,7 @@ NativeVideoResult native_video_feed(NativeVideo *video, const uint8_t *data, siz
     }
 
     BackendNdlResult feed_result = backend_ndl_feed_video(video->backend, video->annexb, annexb_len,
-                                                          backend_ndl_media_time_ms(video->backend),
-                                                          backend_keyframe);
+                                                          BACKEND_NDL_PTS_AUTO, backend_keyframe);
 
     switch (feed_result) {
         case BACKEND_NDL_OK:

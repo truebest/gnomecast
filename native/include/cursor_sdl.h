@@ -97,6 +97,10 @@ void native_cursor_reset(NativeCursor *cursor);
  * backgrounded (a later switch-back reasserts its cached cursor; the server does not
  * resend shapes while suppressed). */
 void native_cursor_show_default(void);
+/* SDL thread: record a cursor show/hide pseudo-event emitted by webOS itself. This keeps
+ * the diagnostic/tracked platform state separate from the server's desired state; the
+ * caller may then reassert the server state on real pointer activity. */
+void native_cursor_note_platform_visibility(NativeCursor *cursor, bool visible);
 /* SDL thread: force the current server pointer state back onto the platform after a webOS
  * overlay (TV menu) hid the pointer behind our back — e.g. on window focus regain. Honours a
  * server-requested hide; otherwise re-shows and re-sets the last cursor shape. */

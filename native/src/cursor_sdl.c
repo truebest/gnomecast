@@ -63,16 +63,27 @@ void native_cursor_destroy(NativeCursor *cursor) {
 void native_cursor_submit_bitmap(NativeCursor *cursor, uint16_t width, uint16_t height,
                                  uint16_t hotspot_x, uint16_t hotspot_y, const uint8_t *rgba,
                                  size_t len) {
-    if (!cursor || !rgba || width == 0 || height == 0 || width > NATIVE_CURSOR_MAX_DIM ||
-        height > NATIVE_CURSOR_MAX_DIM || len != (size_t)width * (size_t)height * 4u) {
+    if (!cursor) {
+        return;
+    }
+    size_t expected_len = (size_t)width * (size_t)height * 4u;
+    if (!rgba || width == 0 || height == 0 || width > NATIVE_CURSOR_MAX_DIM ||
+        height > NATIVE_CURSOR_MAX_DIM || len != expected_len) {
+        clog_limited(cLogLevelWarning, 4, 5000,
+                     "rejected server cursor bitmap %ux%u len=%zu expected=%zu",
+                     (unsigned)width, (unsigned)height, len, expected_len);
         return;
     }
     uint8_t *copy = (uint8_t *)malloc(len);
     if (!copy) {
+        clog_limited(cLogLevelWarning, 4, 5000,
+                     "failed to copy server cursor bitmap %ux%u (%zu bytes)",
+                     (unsigned)width, (unsigned)height, len);
         return;
     }
     memcpy(copy, rgba, len);
     pthread_mutex_lock(&cursor->lock);
+    uint32_t previous = cursor->desired;
     free(cursor->shape_rgba);
     cursor->shape_rgba = copy;
     cursor->shape_width = width;
@@ -83,6 +94,10 @@ void native_cursor_submit_bitmap(NativeCursor *cursor, uint16_t width, uint16_t 
     cursor->shape_serial++;
     pthread_mutex_unlock(&cursor->lock);
     atomic_fetch_add(&cursor->generation, 1u);
+    if (previous != NATIVE_CURSOR_SHAPE) {
+        clog(cLogLevelDebug, "server pointer shape queued after state=%u (%ux%u)",
+             (unsigned)previous, (unsigned)width, (unsigned)height);
+    }
 }
 
 void native_cursor_submit_state(NativeCursor *cursor, uint32_t state) {
@@ -90,9 +105,14 @@ void native_cursor_submit_state(NativeCursor *cursor, uint32_t state) {
         return;
     }
     pthread_mutex_lock(&cursor->lock);
+    uint32_t previous = cursor->desired;
     cursor->desired = state;
     pthread_mutex_unlock(&cursor->lock);
     atomic_fetch_add(&cursor->generation, 1u);
+    if (state != previous) {
+        clog(cLogLevelDebug, "server pointer state queued: %s (previous=%u)",
+             state == NATIVE_CURSOR_HIDDEN ? "hidden" : "default", (unsigned)previous);
+    }
 }
 
 /* Area-average resample with alpha-weighted (premultiplied) accumulation. Every source
@@ -235,34 +255,58 @@ void native_cursor_scaled_geometry(uint16_t shape_w, uint16_t shape_h, uint16_t 
 #if defined(HELLOLG_WITH_SDL) && HELLOLG_WITH_SDL
 
 static void native_cursor_log_state(uint32_t state) {
-    static unsigned log_count = 0;
-    if (log_count < 8) {
-        clog(cLogLevelDebug, "server pointer %s",
-             state == NATIVE_CURSOR_HIDDEN ? "hidden" : "default");
-    } else if (log_count == 8) {
-        clog(cLogLevelDebug, "further pointer state logs suppressed");
-    }
-    log_count++;
+    /* State transitions are sparse (unlike motion), and a late unexpected HIDDEN is the
+     * key discriminator between an RDP-side hide and a lost webOS cursor plane. Do not
+     * permanently suppress these after the first few minutes of a session. */
+    clog(cLogLevelDebug, "applying server pointer %s",
+         state == NATIVE_CURSOR_HIDDEN ? "hidden" : "default");
 }
 
-static void native_cursor_platform_show(bool visible) {
+static bool native_cursor_platform_show(bool visible) {
 #if HELLOLG_CURSOR_HAVE_WEBOS_VISIBILITY
+    /* This webOS API can report SDL_FALSE with no SDL error on firmware where the
+     * visibility request is still best-effort. Cursor shapes may be applied repeatedly
+     * during motion, so logging every failure here stalls the hot path and can disturb
+     * the shared media pipeline. Keep one diagnostic for each requested state. */
+    static bool webos_failure_logged[2] = {false, false};
     /* Never SDL_ShowCursor(SDL_DISABLE) on webOS: it stops pointer-event delivery
      * entirely (verified live), so a server-driven hide (e.g. the remote browser hiding
      * the pointer over a video) would become unrecoverable by mouse input — our moves
      * would never reach the server and it would never re-show its cursor. The platform
      * visibility call hides only the image; events keep flowing and the system re-shows
      * the pointer on genuine activity, in step with the remote side doing the same. */
-    SDL_webOSCursorVisibility(visible ? SDL_TRUE : SDL_FALSE);
-    SDL_ShowCursor(SDL_ENABLE);
+    SDL_ClearError();
+    SDL_bool webos_result = SDL_webOSCursorVisibility(visible ? SDL_TRUE : SDL_FALSE);
+    unsigned visibility_index = visible ? 1u : 0u;
+    if (webos_result != SDL_TRUE && !webos_failure_logged[visibility_index]) {
+        const char *error = SDL_GetError();
+        webos_failure_logged[visibility_index] = true;
+        clog(cLogLevelWarning, "SDL_webOSCursorVisibility(%d) failed: %s", visible ? 1 : 0,
+             error && error[0] ? error : "no SDL error");
+    }
+    SDL_ClearError();
+    int sdl_result = SDL_ShowCursor(SDL_ENABLE);
+    if (sdl_result < 0) {
+        clog_limited(cLogLevelWarning, 4, 5000, "SDL_ShowCursor(SDL_ENABLE) failed: %s",
+                     SDL_GetError());
+    }
+    return webos_result == SDL_TRUE && sdl_result >= 0;
 #else
-    SDL_ShowCursor(visible ? SDL_ENABLE : SDL_DISABLE);
+    int result = SDL_ShowCursor(visible ? SDL_ENABLE : SDL_DISABLE);
+    if (result < 0) {
+        clog_limited(cLogLevelWarning, 4, 5000, "SDL_ShowCursor(%d) failed: %s",
+                     visible ? SDL_ENABLE : SDL_DISABLE, SDL_GetError());
+    }
+    return result >= 0;
 #endif
 }
 
-static void native_cursor_set_visible(NativeCursor *cursor, bool visible) {
-    native_cursor_platform_show(visible);
-    cursor->visible = visible;
+static bool native_cursor_set_visible(NativeCursor *cursor, bool visible) {
+    bool applied = native_cursor_platform_show(visible);
+    if (applied) {
+        cursor->visible = visible;
+    }
+    return applied;
 }
 
 void native_cursor_show_default(void) {
@@ -270,7 +314,27 @@ void native_cursor_show_default(void) {
     if (system_default) {
         SDL_SetCursor(system_default);
     }
-    native_cursor_platform_show(true);
+    (void)native_cursor_platform_show(true);
+}
+
+void native_cursor_note_platform_visibility(NativeCursor *cursor, bool visible) {
+    if (!cursor) {
+        return;
+    }
+    pthread_mutex_lock(&cursor->lock);
+    uint32_t desired = cursor->desired;
+    uint32_t shape_serial = cursor->shape_serial;
+    pthread_mutex_unlock(&cursor->lock);
+    cursor->visible = visible;
+    int sdl_visible = SDL_ShowCursor(SDL_QUERY);
+    clog(cLogLevelInfo,
+         "webOS reports platform pointer %s; server=%s shape_serial=%u built_serial=%u "
+         "SDL_ShowCursor=%d",
+         visible ? "shown" : "hidden",
+         desired == NATIVE_CURSOR_HIDDEN
+             ? "hidden"
+             : (desired == NATIVE_CURSOR_SHAPE ? "shape" : "default"),
+         (unsigned)shape_serial, (unsigned)cursor->built_serial, sdl_visible);
 }
 
 static void native_cursor_apply_shape(NativeCursor *cursor, uint8_t *rgba, uint16_t width,
@@ -326,6 +390,12 @@ static void native_cursor_apply_shape(NativeCursor *cursor, uint8_t *rgba, uint1
         /* Color cursors are unproven on the webOS SDL port; degrade to the visible default
          * arrow (the server draws no pointer of its own and considers it shown, so leaving
          * it hidden would strand the user with no pointer). Probe line logged once. */
+        if (!cursor->color_cursor_unavailable) {
+            /* The fallback visibility calls clear SDL's error state for their own
+             * diagnostics, so report the cursor-creation failure before invoking them. */
+            cursor->color_cursor_unavailable = true;
+            clog(cLogLevelWarning, "color cursor unavailable: %s", SDL_GetError());
+        }
         SDL_Cursor *system_default = SDL_GetDefaultCursor();
         if (system_default) {
             SDL_SetCursor(system_default);
@@ -335,10 +405,6 @@ static void native_cursor_apply_shape(NativeCursor *cursor, uint8_t *rgba, uint1
             cursor->cursor = NULL;
         }
         native_cursor_set_visible(cursor, true);
-        if (!cursor->color_cursor_unavailable) {
-            cursor->color_cursor_unavailable = true;
-            clog(cLogLevelWarning, "color cursor unavailable: %s", SDL_GetError());
-        }
     }
     if (surface) {
         SDL_FreeSurface(surface);
@@ -467,10 +533,12 @@ void native_cursor_reassert(NativeCursor *cursor) {
     uint32_t desired = cursor->desired;
     pthread_mutex_unlock(&cursor->lock);
     if (desired == NATIVE_CURSOR_HIDDEN) {
-        native_cursor_set_visible(cursor, false);
+        (void)native_cursor_set_visible(cursor, false);
         return;
     }
-    native_cursor_set_visible(cursor, true);
+    /* Install the artwork first, then ask webOS to expose the cursor plane. Every other
+     * show path uses this ordering; doing it backwards here allowed a cursor replacement
+     * to race/undo the visibility request on some firmware revisions. */
     if (cursor->cursor) {
         SDL_SetCursor(cursor->cursor);
     } else {
@@ -479,6 +547,7 @@ void native_cursor_reassert(NativeCursor *cursor) {
             SDL_SetCursor(system_default);
         }
     }
+    (void)native_cursor_set_visible(cursor, true);
 }
 
 #endif /* HELLOLG_WITH_SDL */

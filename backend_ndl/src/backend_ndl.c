@@ -727,6 +727,9 @@ BackendNdlResult backend_ndl_feed_video(BackendNdl *ctx,
         return BACKEND_NDL_NEED_KEYFRAME;
     }
 
+    if (ndl_pts == BACKEND_NDL_PTS_AUTO) {
+        ndl_pts = backend_ndl_media_time_ms_locked(ctx);
+    }
     int rc = ctx->api.DirectVideoPlay((void *)data, (unsigned int)len, ndl_pts);
     if (rc != 0) {
         BACKEND_NDL_LOG(ctx, BACKEND_NDL_LOG_ERROR,
@@ -783,6 +786,9 @@ BackendNdlResult backend_ndl_feed_audio(BackendNdl *ctx,
         }
     }
 
+    if (ndl_pts == BACKEND_NDL_PTS_AUTO) {
+        ndl_pts = backend_ndl_media_time_ms_locked(ctx);
+    }
     int rc = ctx->api.DirectAudioPlay((void *)data, (unsigned int)len, ndl_pts);
     if (rc != 0) {
         BACKEND_NDL_LOG(ctx, BACKEND_NDL_LOG_ERROR,
