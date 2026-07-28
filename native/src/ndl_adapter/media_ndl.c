@@ -19,7 +19,7 @@ struct NativeMedia {
     bool has_video;
     BackendNdlVideoInfo video;
     bool has_audio;
-    BackendNdlPcmInfo audio;
+    BackendNdlAudioInfo audio;
 #else
     int unused;
 #endif
@@ -80,10 +80,12 @@ static BackendNdlResult native_media_ndl_apply_tracks(NativeMedia *media) {
 }
 #endif
 
-NativeMedia *native_media_open(uint16_t viewport_width, uint16_t viewport_height) {
+NativeMedia *native_media_open(uint16_t viewport_width, uint16_t viewport_height,
+                               const char *webos_sdk_version) {
 #ifndef HELLOLG_WITH_NDL
     (void)viewport_width;
     (void)viewport_height;
+    (void)webos_sdk_version;
     clog(cLogLevelError, "NDL backend is not linked; hardware media unavailable");
     return NULL;
 #else
@@ -98,6 +100,7 @@ NativeMedia *native_media_open(uint16_t viewport_width, uint16_t viewport_height
     backend_ndl_config_defaults(&config);
     const char *app_id = getenv("APPID");
     config.app_id = app_id && app_id[0] ? app_id : GNOMECAST_NDL_FALLBACK_APP_ID;
+    config.webos_sdk_version = webos_sdk_version;
     config.log_fn = native_media_ndl_log;
     config.minimum_log_level = native_media_ndl_min_level();
     config.require_keyframe_after_reload = true;
@@ -109,7 +112,8 @@ NativeMedia *native_media_open(uint16_t viewport_width, uint16_t viewport_height
         free(media);
         return NULL;
     }
-    clog(cLogLevelNotice, "NDL DirectMedia backend ready (viewport %ux%u)",
+    clog(cLogLevelNotice, "NDL DirectMedia backend ready (profile=%s viewport=%ux%u)",
+         backend_ndl_abi_profile_name(backend_ndl_get_abi_profile(media->backend)),
          (unsigned)viewport_width, (unsigned)viewport_height);
     return media;
 #endif
@@ -123,6 +127,12 @@ void native_media_close(NativeMedia *media) {
     backend_ndl_close(media->backend);
 #endif
     free(media);
+}
+
+void native_media_emergency_release(void) {
+#ifdef HELLOLG_WITH_NDL
+    (void)backend_ndl_emergency_release();
+#endif
 }
 
 void native_media_set_viewport(NativeMedia *media, uint16_t viewport_width, uint16_t viewport_height) {
@@ -175,7 +185,7 @@ BackendNdlResult native_media_ndl_configure_video(NativeMedia *media,
 }
 
 BackendNdlResult native_media_ndl_configure_audio(NativeMedia *media,
-                                                   const BackendNdlPcmInfo *info) {
+                                                   const BackendNdlAudioInfo *info) {
 #ifndef HELLOLG_WITH_NDL
     (void)media;
     (void)info;
@@ -185,7 +195,7 @@ BackendNdlResult native_media_ndl_configure_audio(NativeMedia *media,
         return BACKEND_NDL_INVALID_ARGUMENT;
     }
     bool had_audio = media->has_audio;
-    BackendNdlPcmInfo saved = media->audio;
+    BackendNdlAudioInfo saved = media->audio;
     media->has_audio = true;
     media->audio = *info;
     BackendNdlResult result = native_media_ndl_apply_tracks(media);
@@ -227,7 +237,7 @@ BackendNdlResult native_media_ndl_clear_audio(NativeMedia *media) {
         return BACKEND_NDL_INVALID_ARGUMENT;
     }
     bool had_audio = media->has_audio;
-    BackendNdlPcmInfo saved = media->audio;
+    BackendNdlAudioInfo saved = media->audio;
     media->has_audio = false;
     memset(&media->audio, 0, sizeof(media->audio));
     BackendNdlResult result = native_media_ndl_apply_tracks(media);

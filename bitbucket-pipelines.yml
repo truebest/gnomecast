@@ -4,7 +4,7 @@
 # ("--privileged=true is not allowed"), and rebuilding the toolchain image every run
 # wasted minutes anyway. Rebuild + push with tools/push-build-image.sh after changing
 # the Dockerfile, then bump the tag here.
-image: cubicattache/gnomecast-webos-build:20260705
+image: cubicattache/gnomecast-webos-build:20260716
 
 clone:
   depth: full
@@ -20,7 +20,7 @@ pipelines:
           - "linux"
         script:
           - git config --global --add safe.directory '*'
-          - git submodule update --init third_party/IronRDP third_party/lvgl third_party/miniaudio
+          - git submodule update --init third_party/backend_ndl third_party/IronRDP third_party/lvgl third_party/miniaudio
           - cargo fmt --manifest-path webrdp-min/Cargo.toml --check
           # Quoted: a plain YAML scalar ending in ':' parses as a mapping key.
           - "cargo test --manifest-path webrdp-min/Cargo.toml --features native --locked native::tests::"

@@ -8,3 +8,6 @@
 [submodule "third_party/miniaudio"]
 	path = third_party/miniaudio
 	url = https://github.com/mackron/miniaudio.git
+[submodule "backend_ndl"]
+	path = third_party/backend_ndl
+	url = https://github.com/truebest/backend_ndl.git

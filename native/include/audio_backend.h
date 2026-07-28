@@ -14,11 +14,11 @@ typedef enum NativeAudioResult {
 } NativeAudioResult;
 
 /* Attaches an audio track to the shared media pipeline. codec takes RdpAudioCodec
- * values from rdp_ffi.h; the NDL backend accepts only PCM S16LE (2=PCM) — Opus is
- * decoded and mixed upstream, so no passthrough path exists. Returns NULL when the
- * backend is not linked, the format is unsupported, or the hardware open fails —
- * callers degrade to silent video. Jitter buffering and resampling live upstream in
- * NativeAudioPipeline; this boundary feeds already-paced PCM directly. */
+ * values from rdp_ffi.h; the gnomecast sink accepts only PCM S16LE (2=PCM) — Opus
+ * is decoded and mixed upstream, so no passthrough path exists. Returns NULL when
+ * the backend is not linked, the format is unsupported, or the hardware open fails
+ * — callers degrade to silent video. Jitter buffering and resampling live upstream
+ * in NativeAudioPipeline; this boundary feeds already-paced PCM directly. */
 NativeAudio *native_audio_open(NativeMedia *media, uint32_t codec, uint32_t sample_rate, uint16_t channels);
 /* Feed one interleaved S16LE PCM chunk. Transient conditions (pipeline reloading,
  * buffer overflow) drop the chunk and still return OK. */

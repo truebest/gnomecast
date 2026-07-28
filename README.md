@@ -105,7 +105,7 @@ decoded frames.
   (`input_evdev.c`, with an SDL pointer fallback), SDL presentation, gnomecast-specific
   DirectMedia adapters under `native/src/ndl_adapter/`, RemoteFX RGBA presentation,
   pre-connect UI, and package targets.
-- `backend_ndl/` — standalone MIT C11 DirectMedia library with a public SDK-independent
+- `third_party/backend_ndl/` — standalone MIT C11 DirectMedia git submodule with a public SDK-independent
   header, CMake package, runtime `dlopen`, callbacks, and host tests.
 - `webrdp-min/` — Rust static library implementing the RDP client (direct TCP + TLS +
   CredSSP/NTLM, EGFX, rdpsnd-over-DVC), exposed through the C ABI in
@@ -138,7 +138,8 @@ gnomecast's own code is released under the [MIT License](LICENSE).
 
 Bundled dependencies under `third_party/` keep their own licenses: IronRDP
 (MIT OR Apache-2.0), LVGL (MIT), miniaudio (MIT-0), and the IBM Plex and JetBrains Mono
-fonts (SIL Open Font License 1.1). The `backend_ndl/`
-subproject, including its host-test ABI double, is MIT (see `backend_ndl/THIRD_PARTY.md`).
+fonts (SIL Open Font License 1.1). The `third_party/backend_ndl/`
+subproject, including its host-test ABI double, is MIT (see
+`third_party/backend_ndl/THIRD_PARTY.md`).
 Packaged builds ship dependency provenance and applicable notices under `licenses/`
 inside the `.ipk`.

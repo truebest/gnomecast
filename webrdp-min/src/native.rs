@@ -36,7 +36,7 @@ use ironrdp_dvc::{DrdynvcClient, DvcEncode, DvcMessage, DvcProcessor};
 use ironrdp_egfx::client::{BitmapUpdate, GraphicsPipelineClient, GraphicsPipelineHandler};
 use ironrdp_egfx::pdu::{
     CacheToSurfacePdu, CapabilitiesV81Flags, CapabilitiesV8Flags, CapabilitySet, Codec1Type,
-    GfxPdu, MapSurfaceToOutputPdu, SolidFillPdu, SurfaceToSurfacePdu, WireToSurface2Pdu,
+    GfxPdu, SolidFillPdu, SurfaceToSurfacePdu, WireToSurface2Pdu,
 };
 use ironrdp_graphics::image_processing::PixelFormat;
 use ironrdp_graphics::pointer::DecodedPointer;
@@ -747,11 +747,11 @@ impl GraphicsPipelineHandler for NativeGfxHandler {
         }
     }
 
-    fn on_map_surface_to_output(&mut self, pdu: &MapSurfaceToOutputPdu) {
+    fn on_surface_mapped(&mut self, surface_id: u16, origin_x: u32, origin_y: u32) {
         if let Ok(mut shared) = self.shared.lock() {
             shared
                 .surface_origins
-                .insert(pdu.surface_id, (pdu.output_origin_x, pdu.output_origin_y));
+                .insert(surface_id, (origin_x, origin_y));
         }
     }
 
@@ -3211,11 +3211,7 @@ mod tests {
         };
 
         // Server maps surface 7 at a non-zero desktop position (e.g. a second monitor).
-        handler.on_map_surface_to_output(&MapSurfaceToOutputPdu {
-            surface_id: 7,
-            output_origin_x: 1920,
-            output_origin_y: 100,
-        });
+        handler.on_surface_mapped(7, 1920, 100);
 
         handler.on_bitmap_updated(&BitmapUpdate {
             surface_id: 7,
@@ -3265,11 +3261,7 @@ mod tests {
 
         // DeleteSurface destroys a single surface the same way; a reused id must start
         // unmapped rather than inherit the deleted surface's origin.
-        handler.on_map_surface_to_output(&MapSurfaceToOutputPdu {
-            surface_id: 7,
-            output_origin_x: 500,
-            output_origin_y: 600,
-        });
+        handler.on_surface_mapped(7, 500, 600);
         handler.on_surface_deleted(7);
         {
             let mut shared = handler.shared.lock().unwrap();

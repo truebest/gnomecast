@@ -33,6 +33,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       openssh-client \
       build-essential \
       cmake \
+      libgtest-dev \
       pkg-config \
       python3 \
       file \

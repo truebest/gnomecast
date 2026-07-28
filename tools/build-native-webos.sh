@@ -106,6 +106,9 @@ PY
   if grep -Eq 'NEEDED.*libNDL_directmedia' <<<"$dynamic_tags"; then
     fail "native binary must not link libNDL_directmedia directly; backend_ndl dlopens it"
   fi
+  if find "$root" -type f -name 'libNDL_directmedia*' -print -quit | grep -q .; then
+    fail "webOS firmware NDL libraries must not be staged in the application package"
+  fi
   # The packaged libopus lives in lib/ next to the binary.
   if [[ -n "$(find "$root/lib" -maxdepth 1 -type f -name 'libopus.so*' -print -quit 2>/dev/null)" ]]; then
     if ! grep -Eq '\((RPATH|RUNPATH)\).*\$ORIGIN/\.\./lib' <<<"$dynamic_tags"; then
@@ -158,10 +161,11 @@ if [[ "$skip_build" != "1" ]]; then
   [[ -f "$toolchain" ]] || fail "webOS toolchain file not found: $toolchain (set WEBOS_TOOLCHAIN_FILE=/path/to/toolchainfile.cmake)"
   sdk="$(cd "$(dirname "$toolchain")/../.." && pwd)"
 
-  if [[ ! -f "$repo_root/third_party/IronRDP/Cargo.toml" ||
+  if [[ ! -f "$repo_root/third_party/backend_ndl/CMakeLists.txt" ||
+        ! -f "$repo_root/third_party/IronRDP/Cargo.toml" ||
         ! -f "$repo_root/third_party/lvgl/CMakeLists.txt" ||
         ! -f "$repo_root/third_party/miniaudio/miniaudio.c" || ! -f "$repo_root/third_party/miniaudio/miniaudio.h" ]]; then
-    fail "native submodules are not initialized; run: git submodule update --init third_party/IronRDP third_party/lvgl third_party/miniaudio"
+    fail "native submodules are not initialized; run: git submodule update --init third_party/backend_ndl third_party/IronRDP third_party/lvgl third_party/miniaudio"
   fi
 
   rustup target add "$target"
@@ -180,6 +184,7 @@ if [[ "$skip_build" != "1" ]]; then
     -DHELLOLG_WITH_SDL=ON \
     -DHELLOLG_WITH_PRECONNECT_UI=ON \
     -DHELLOLG_LINK_RDP_FFI=ON \
+    -DBUILD_TESTING=OFF \
     -DRDP_FFI_LIB="$rdp_ffi_lib" \
     -DCMAKE_C_FLAGS_MINSIZEREL="-Os -DNDEBUG -g" \
     -DCMAKE_CXX_FLAGS_MINSIZEREL="-Os -DNDEBUG -g" \

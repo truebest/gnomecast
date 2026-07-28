@@ -32,7 +32,7 @@ The reference environment is Ubuntu 24.04 with these host packages:
 sudo apt update
 sudo apt install -y --no-install-recommends \
   ca-certificates curl xz-utils tar git openssh-client build-essential \
-  cmake pkg-config python3 file binutils
+  cmake libgtest-dev pkg-config python3 file binutils
 ```
 
 Install the remaining tools at the versions used by the Dockerfile:
@@ -74,7 +74,7 @@ $HOME/.local/opt/arm-webos-linux-gnueabi_sdk-buildroot/share/buildroot/toolchain
 Initialize the pinned dependencies from the repository root:
 
 ```sh
-git submodule update --init third_party/IronRDP third_party/lvgl third_party/miniaudio
+git submodule update --init third_party/backend_ndl third_party/IronRDP third_party/lvgl third_party/miniaudio
 ```
 
 Their pinned revisions and licenses are recorded in

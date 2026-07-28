@@ -50,9 +50,9 @@ NativeAudio *native_audio_open(NativeMedia *media, uint32_t codec, uint32_t samp
         return NULL;
     }
     if (codec == RDP_AUDIO_CODEC_OPUS) {
-        /* Deliberate: the mixer upstream decodes every Opus stream to PCM, and the
-         * NDL Opus passthrough ABI (sampleRate units) is undocumented. */
-        clog(cLogLevelWarning, "NDL backend has no Opus passthrough; upstream decodes to PCM");
+        /* Deliberate: the mixer upstream decodes every Opus stream, and this sink
+         * receives only the final mixed PCM output. */
+        clog(cLogLevelWarning, "direct Opus passthrough is disabled; upstream decodes and mixes to PCM");
         return NULL;
     }
     if (codec != RDP_AUDIO_CODEC_PCM_S16LE) {
@@ -75,7 +75,8 @@ NativeAudio *native_audio_open(NativeMedia *media, uint32_t codec, uint32_t samp
     audio->media = media;
     audio->backend = backend;
 
-    BackendNdlPcmInfo info = {
+    BackendNdlAudioInfo info = {
+        .codec = BACKEND_NDL_AUDIO_PCM_S16LE,
         .sample_rate_hz = sample_rate,
         .channels = channels,
     };

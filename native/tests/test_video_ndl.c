@@ -24,7 +24,7 @@ struct NativeMedia {
     bool has_video;
     BackendNdlVideoInfo video;
     bool has_audio;
-    BackendNdlPcmInfo audio;
+    BackendNdlAudioInfo audio;
 };
 
 BackendNdl *native_media_ndl_backend(NativeMedia *media) {
@@ -44,7 +44,7 @@ BackendNdlResult native_media_ndl_configure_video(NativeMedia *media,
 }
 
 BackendNdlResult native_media_ndl_configure_audio(NativeMedia *media,
-                                                   const BackendNdlPcmInfo *info) {
+                                                   const BackendNdlAudioInfo *info) {
     media->has_audio = true;
     media->audio = *info;
     return apply_tracks(media);
@@ -77,13 +77,16 @@ static void fake_reset(void) {
 }
 
 static const char *fake_get_error(void) { return "fake error"; }
-static int fake_media_init(const char *app_id, ResourceReleased cb) {
+static int fake_set_window(const char *window_id) {
+    (void)window_id;
+    return 0;
+}
+static int fake_media_init(const char *app_id) {
     (void)app_id;
-    (void)cb;
     return 0;
 }
 static int fake_media_quit(void) { return 0; }
-static int fake_media_load(NDL_DIRECTMEDIA_DATA_INFO_T *data, NDLMediaLoadCallback cb) {
+static int fake_media_load(NDL_DIRECTMEDIA_DATA_INFO_T *data, StateCallbackFP cb) {
     (void)cb;
     g_fake.load_calls++;
     g_fake.last_load = *data;
@@ -111,9 +114,10 @@ static BackendNdl *open_fake_backend(void) {
     BackendNdlApi api;
     memset(&api, 0, sizeof(api));
     api.DirectMediaGetError = fake_get_error;
-    api.DirectMediaInit = fake_media_init;
+    api.DirectMediaSetWindowId = fake_set_window;
+    api.DirectMediaInitCurrent = fake_media_init;
     api.DirectMediaQuit = fake_media_quit;
-    api.DirectMediaLoad = fake_media_load;
+    api.DirectMediaLoadCurrent = fake_media_load;
     api.DirectMediaUnload = fake_media_unload;
     api.DirectVideoPlay = fake_video_play;
     api.DirectAudioPlay = fake_audio_play;
@@ -121,7 +125,7 @@ static BackendNdl *open_fake_backend(void) {
     backend_ndl_config_defaults(&config);
     config.app_id = "test.video.ndl";
     config.require_keyframe_after_reload = true;
-    return backend_ndl_open_with_api(&config, &api);
+    return backend_ndl_open_with_api(&config, BACKEND_NDL_ABI_V2_WINDOW_ID_INIT, &api);
 }
 
 /* AVC length-prefixed AU builder (one-byte NAL payloads), same shape as the
@@ -164,8 +168,10 @@ static int test_open_gating_and_stream_open(void) {
     failures += expect_true(native_video_feed(video, idr, idr_len, true, 0) == NATIVE_VIDEO_OK,
                             "config IDR opens stream and feeds");
     failures += expect_true(g_fake.load_calls == 1, "stream open loads the pipeline");
-    failures += expect_true(g_fake.last_load.video.type == NDL_VIDEO_TYPE_H264 &&
-                            g_fake.last_load.video.width == 1920 && g_fake.last_load.video.height == 1080,
+    failures += expect_true(
+        g_fake.last_load.videoDataInfo.source == NDL_DIRECTVIDEO_SRC_TYPE_H264 &&
+            g_fake.last_load.videoDataInfo.width == 1920 &&
+            g_fake.last_load.videoDataInfo.height == 1080,
                             "load info matches open size");
     failures += expect_true(g_fake.video_play_calls == 1, "config IDR reaches VideoPlay");
 
@@ -196,8 +202,12 @@ static int test_reload_keyframe_recovery(void) {
     native_video_feed(video, idr, idr_len, true, 0);
 
     /* An audio (re)open reloads the pipeline underneath the live video track. */
-    BackendNdlPcmInfo pcm = {.sample_rate_hz = 48000, .channels = 2};
-    failures += expect_true(native_media_ndl_configure_audio(&media, &pcm) == BACKEND_NDL_OK,
+    BackendNdlAudioInfo audio = {
+        .codec = BACKEND_NDL_AUDIO_PCM_S16LE,
+        .sample_rate_hz = 48000,
+        .channels = 2,
+    };
+    failures += expect_true(native_media_ndl_configure_audio(&media, &audio) == BACKEND_NDL_OK,
                             "audio configure reloads");
     failures += expect_true(native_video_feed(video, delta, delta_len, false, 0) == NATIVE_VIDEO_NEED_KEYFRAME,
                             "delta after reload needs keyframe");
@@ -221,8 +231,9 @@ static int test_reload_keyframe_recovery(void) {
     /* Removing audio reloads the surviving video track and re-arms keyframe recovery. */
     failures += expect_true(native_media_ndl_clear_audio(&media) == BACKEND_NDL_OK,
                             "audio clear reloads surviving video");
-    failures += expect_true(g_fake.last_load.video.type == NDL_VIDEO_TYPE_H264 &&
-                                g_fake.last_load.audio.type == 0,
+    failures += expect_true(
+        g_fake.last_load.videoDataInfo.source == NDL_DIRECTVIDEO_SRC_TYPE_H264 &&
+            g_fake.last_load.audioDataInfo.audioCodec == NDL_DIRECTAUDIO_SRC_TYPE_NONE,
                             "audio clear keeps only video");
     failures += expect_true(native_video_feed(video, delta, delta_len, false, 0) == NATIVE_VIDEO_NEED_KEYFRAME,
                             "delta after audio clear needs keyframe");

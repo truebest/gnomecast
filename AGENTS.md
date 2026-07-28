@@ -29,10 +29,11 @@ linked through a C ABI (`native/include/rdp_ffi.h`).
   (Magic Remote) only. The grab follows window focus so a webOS overlay (TV menu) stays usable.
 
 Stack: C11 + CMake (native shell, decoder boundary, CTests), Rust 2021 (`webrdp-min`
-`staticlib` + C ABI), pinned git submodules under `third_party/` (IronRDP fork,
-LVGL, miniaudio), and the webOS buildroot toolchain + `ares` CLI for packaging. NDL test
-headers live with the standalone backend under `backend_ndl/tests/support/libndl-media/`;
-libopus builds from the own recipe in `native/cmake/ExternalOPUS.cmake`.
+`staticlib` + C ABI), pinned git submodules under `third_party/` (`backend_ndl`, IronRDP,
+LVGL, and miniaudio), and the webOS buildroot toolchain + `ares` CLI for packaging. The
+private production NDL ABI lives in `third_party/backend_ndl/src/backend_ndl_window_id_abi.h`;
+an optional host test checks it against an installed official target-NDK header. Libopus
+builds from the own recipe in `native/cmake/ExternalOPUS.cmake`.
 
 ## Key paths
 
@@ -45,7 +46,7 @@ libopus builds from the own recipe in `native/cmake/ExternalOPUS.cmake`.
 - `native/src/input_sdl.c` / `.h` — RDP fast-path input: window↔desktop coordinate mapping and
   the Linux-keycode / SDL-scancode → RDP scancode maps.
 - `native/src/cursor_sdl.c` / `.h` — server-driven cursor on the platform cursor plane.
-- `backend_ndl/` — standalone MIT C11 DirectMedia library: public API, dlopen/symbol table,
+- `third_party/backend_ndl/` — standalone MIT C11 DirectMedia git submodule: public API, dlopen/symbol table,
   atomic combined-track state machine, callbacks, host tests, and installable CMake package.
 - `native/include/audio_backend.h`, `media_backend.h`, `video_backend.h` — the adapter
   interface `ndl_adapter/` implements; a future non-NDL backend would implement these instead.

@@ -23,7 +23,7 @@ static int expect_true(int condition, const char *name) {
 struct NativeMedia {
     BackendNdl *backend;
     bool has_audio;
-    BackendNdlPcmInfo audio;
+    BackendNdlAudioInfo audio;
 };
 
 BackendNdl *native_media_ndl_backend(NativeMedia *media) {
@@ -31,7 +31,7 @@ BackendNdl *native_media_ndl_backend(NativeMedia *media) {
 }
 
 BackendNdlResult native_media_ndl_configure_audio(NativeMedia *media,
-                                                   const BackendNdlPcmInfo *info) {
+                                                   const BackendNdlAudioInfo *info) {
     media->has_audio = true;
     media->audio = *info;
     return backend_ndl_set_media(media->backend, NULL, &media->audio);
@@ -60,13 +60,16 @@ static void fake_reset(void) {
 }
 
 static const char *fake_get_error(void) { return "fake error"; }
-static int fake_media_init(const char *app_id, ResourceReleased cb) {
+static int fake_set_window(const char *window_id) {
+    (void)window_id;
+    return 0;
+}
+static int fake_media_init(const char *app_id) {
     (void)app_id;
-    (void)cb;
     return 0;
 }
 static int fake_media_quit(void) { return 0; }
-static int fake_media_load(NDL_DIRECTMEDIA_DATA_INFO_T *data, NDLMediaLoadCallback cb) {
+static int fake_media_load(NDL_DIRECTMEDIA_DATA_INFO_T *data, StateCallbackFP cb) {
     (void)cb;
     g_fake.load_calls++;
     g_fake.last_load = *data;
@@ -98,9 +101,10 @@ static BackendNdl *open_fake_backend(void) {
     BackendNdlApi api;
     memset(&api, 0, sizeof(api));
     api.DirectMediaGetError = fake_get_error;
-    api.DirectMediaInit = fake_media_init;
+    api.DirectMediaSetWindowId = fake_set_window;
+    api.DirectMediaInitCurrent = fake_media_init;
     api.DirectMediaQuit = fake_media_quit;
-    api.DirectMediaLoad = fake_media_load;
+    api.DirectMediaLoadCurrent = fake_media_load;
     api.DirectMediaUnload = fake_media_unload;
     api.DirectVideoPlay = fake_video_play;
     api.DirectAudioPlay = fake_audio_play;
@@ -109,7 +113,7 @@ static BackendNdl *open_fake_backend(void) {
     backend_ndl_config_defaults(&config);
     config.app_id = "test.audio.ndl";
     config.prime_pcm_after_load = true;
-    return backend_ndl_open_with_api(&config, &api);
+    return backend_ndl_open_with_api(&config, BACKEND_NDL_ABI_V2_WINDOW_ID_INIT, &api);
 }
 
 /* One 10 ms pump block: 480 frames of S16 stereo. */
@@ -135,8 +139,10 @@ static int test_open_validation(void) {
     NativeAudio *audio = native_audio_open(&media, RDP_AUDIO_CODEC_PCM_S16LE, 48000, 2);
     failures += expect_true(audio != NULL, "PCM 48k stereo accepted");
     failures += expect_true(g_fake.load_calls == 1, "audio open loads the pipeline");
-    failures += expect_true(g_fake.last_load.audio.pcm.type == NDL_AUDIO_TYPE_PCM &&
-                            strcmp(g_fake.last_load.audio.pcm.channelMode, "stereo") == 0,
+    failures += expect_true(
+        g_fake.last_load.audioDataInfo.audioCodec == NDL_DIRECTAUDIO_SRC_TYPE_PCM &&
+            strcmp(g_fake.last_load.audioDataInfo.audio_data.pcmInfo.channelMode,
+                   "stereo") == 0,
                             "PCM load config");
     failures += expect_true(g_fake.audio_play_calls == 1, "PCM sink primed after load");
 
@@ -169,8 +175,12 @@ static int test_feed_semantics(void) {
     failures += expect_true(native_audio_feed(audio, k_pcm_block, sizeof(k_pcm_block)) == NATIVE_AUDIO_OK,
                             "not-ready drops but returns OK");
 
-    BackendNdlPcmInfo pcm = {.sample_rate_hz = 48000, .channels = 2};
-    backend_ndl_set_media(media.backend, NULL, &pcm);
+    BackendNdlAudioInfo audio_info = {
+        .codec = BACKEND_NDL_AUDIO_PCM_S16LE,
+        .sample_rate_hz = 48000,
+        .channels = 2,
+    };
+    backend_ndl_set_media(media.backend, NULL, &audio_info);
     g_fake.fail_audio_play = true;
     failures += expect_true(native_audio_feed(audio, k_pcm_block, sizeof(k_pcm_block)) == NATIVE_AUDIO_ERROR,
                             "hard AudioPlay failure is ERROR");

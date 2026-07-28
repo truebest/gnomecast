@@ -4,6 +4,16 @@ This file records native webOS dependencies that are pinned for the native-only
 `gnomecast` target. The historical browser app, JavaScript service, browser harnesses,
 and browser WASM bundle were removed and are not runtime dependencies of the native package.
 
+## backend_ndl (first-party submodule)
+
+- Path: `third_party/backend_ndl` (git submodule —
+  `git@bitbucket.org:kodavr/backend_ndl.git`)
+- Version: 0.4.0
+- Pinned commit: `9d28f59903932eec1c272bc4b98d4bcc64be4248`
+- License: MIT; see `third_party/backend_ndl/LICENSE`
+- Native usage: runtime-loaded NDL DirectMedia facade wrapper for hardware video and mixed
+  PCM audio. Firmware NDL binaries and SDK headers are not redistributed.
+
 ## IronRDP
 
 - Path: `third_party/IronRDP` (git submodule — gnomecast fork

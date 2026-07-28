@@ -1,11 +1,16 @@
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #endif
+/* XSI superset of the above for sigaltstack()/SA_ONSTACK. */
+#ifndef _XOPEN_SOURCE
+#define _XOPEN_SOURCE 700
+#endif
 
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -59,6 +64,7 @@ typedef void NativePreconnectUi;
 #include "settings_json.h"
 #include "video_rgba_sdl.h"
 #include "video_backend.h"
+#include "webos_platform.h"
 #include "clog.h"
 
 clog_define(g_native_log_config, cLogLevelInfo, cLogFlags_Default, "native", NULL);
@@ -197,6 +203,7 @@ typedef struct NativeSessionSlot {
 } NativeSessionSlot;
 
 typedef struct App {
+    NativeWebosPlatformInfo webos_platform;
     NativeSessionSlot sessions[NATIVE_SETTINGS_MAX_SESSIONS];
     /* Which slot owns the screen: it feeds the single hardware video plane (when
      * connected) or shows its configurator form (when not), and receives input. Written
@@ -241,7 +248,8 @@ typedef struct App {
     unsigned hub_return_replacement_baseline_frames;
     /* Shared SS4S library/player owner; video and audio attach tracks to it. Its lifetime
      * and the video track use video_lock; the audio pointer/feed use audio_lock, while the
-     * backend serializes actual NDL calls internally. */
+     * backend uses atomic generations for concurrent NDL feeds and serializes
+     * only control-plane reload/lifecycle calls. */
     NativeMedia *media;
     NativeVideo *video;
     /* Which slot/connection generation the open video track decodes (video_lock). A
@@ -519,6 +527,69 @@ static void native_prepare_webos_logging(void) {
     }
     if (freopen(path, "w", stderr)) {
         setvbuf(stderr, NULL, _IOLBF, 0);
+    }
+}
+
+/* webOS keeps the DirectMedia pipeline acquired until NDL_DirectMediaQuit, so a
+ * process that dies without it leaves the media server holding the resource and
+ * the next launch can fail to init until the server notices the dead client.
+ * The orderly teardown runs off SDL_QUIT / SDL_APP_TERMINATING (user close, and
+ * system close via SDL's own SIGINT/SIGTERM handlers); the hooks below cover
+ * the paths that bypass it: fatal signals and stray exit() calls. SIGINT and
+ * SIGTERM are deliberately untouched — SDL only installs its graceful quit
+ * handlers over SIG_DFL. */
+static void native_fatal_signal_release(int sig) {
+    /* NDL quit talks to the media server; if that hangs in a dying process, let
+     * SIGALRM finish the termination instead of leaving a stuck card. */
+    alarm(3);
+    native_media_emergency_release();
+    /* SA_RESETHAND restored the default disposition: die by the original signal
+     * so webOS crash reporting still sees the real cause. */
+    raise(sig);
+}
+
+static void native_release_media_at_exit(void) {
+    native_media_emergency_release();
+}
+
+static void native_install_termination_hooks(void) {
+    /* A stack-overflow SIGSEGV cannot run the release handler on the exhausted
+     * stack; give the main thread an alternate one. Worker threads keep their
+     * own stacks (no per-thread sigaltstack) — best effort there. */
+    static char fatal_stack[32768];
+    stack_t stack_info;
+    memset(&stack_info, 0, sizeof(stack_info));
+    stack_info.ss_sp = fatal_stack;
+    stack_info.ss_size = sizeof(fatal_stack);
+    bool have_alt_stack = sigaltstack(&stack_info, NULL) == 0;
+
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = native_fatal_signal_release;
+    action.sa_flags = SA_RESETHAND | SA_NODEFER | (have_alt_stack ? SA_ONSTACK : 0);
+    sigemptyset(&action.sa_mask);
+    static const int fatal_signals[] = {SIGSEGV, SIGBUS, SIGILL, SIGFPE,
+                                        SIGABRT, SIGHUP, SIGQUIT};
+    int failed = 0;
+    for (size_t i = 0; i < sizeof(fatal_signals) / sizeof(fatal_signals[0]); i++) {
+        if (sigaction(fatal_signals[i], &action, NULL) != 0) {
+            failed++;
+        }
+    }
+    /* IronRDP is a Rust staticlib under a C main, so Rust's usual startup
+     * SIGPIPE ignore is absent; a peer-dropped socket must surface as EPIPE on
+     * the write, not terminate the process. */
+    if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
+        failed++;
+    }
+    if (atexit(native_release_media_at_exit) != 0) {
+        failed++;
+    }
+    if (!have_alt_stack || failed > 0) {
+        clog(cLogLevelWarning,
+             "termination hooks incomplete (alt-stack=%s, %d registrations failed); "
+             "an abnormal exit may leave DirectMedia acquired",
+             have_alt_stack ? "yes" : "no", failed);
     }
 }
 
@@ -1543,7 +1614,9 @@ static NativeMedia *native_ensure_media_locked(App *app) {
     if (viewport_height == 0) {
         viewport_height = (uint16_t)atomic_load(&active->desktop_height);
     }
-    app->media = native_media_open(viewport_width, viewport_height);
+    app->media = native_media_open(
+        viewport_width, viewport_height,
+        app->webos_platform.sdk_version[0] ? app->webos_platform.sdk_version : NULL);
     return app->media;
 }
 
@@ -5380,6 +5453,7 @@ int main(int argc, char **argv) {
     native_prepare_webos_logging();
     (void)clog_configure_env();
     clog(cLogLevelNotice, "--- launch ---");
+    native_install_termination_hooks();
     native_prepare_webos_environment();
 
     NativeSettings native_settings;
@@ -5422,8 +5496,24 @@ int main(int argc, char **argv) {
     }
 #endif
 
+    NativeWebosPlatformInfo webos_platform;
+    if (!native_webos_platform_query(&webos_platform)) {
+        clog(cLogLevelWarning,
+             "webOS sdkVersion unavailable; DirectMedia ABI probe will decide compatibility");
+    } else if (webos_platform.sdk_major < 5) {
+        clog(cLogLevelError, "unsupported %s sdkVersion=%s; webOS TV 5.0+ is required",
+             native_webos_tv_release(webos_platform.sdk_major),
+             webos_platform.sdk_version);
+        native_shutdown_sdl_runtime();
+        return 2;
+    } else if (webos_platform.sdk_major > 11) {
+        clog(cLogLevelWarning, "unqualified future sdkVersion=%s; continuing with ABI probe",
+             webos_platform.sdk_version);
+    }
+
     App app;
     memset(&app, 0, sizeof(app));
+    app.webos_platform = webos_platform;
     if (pthread_mutex_init(&app.video_lock, NULL) != 0) {
         native_shutdown_sdl_runtime();
         return 2;

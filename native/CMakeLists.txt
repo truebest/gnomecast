@@ -18,10 +18,9 @@ option(HELLOLG_WITH_PRECONNECT_UI "Build the LVGL pre-connect UI for SDL product
 
 # The DirectMedia state machine is a standalone subproject. Only the three
 # NativeMedia/NativeVideo/NativeAudio adapters remain owned by gnomecast.
-set(BACKEND_NDL_ENABLE ${HELLOLG_WITH_NDL})
 set(BACKEND_NDL_BUILD_TESTS ${BUILD_TESTING})
 set(BACKEND_NDL_INSTALL OFF)
-add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../backend_ndl"
+add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../third_party/backend_ndl"
                  "${CMAKE_CURRENT_BINARY_DIR}/backend_ndl")
 
 
@@ -71,6 +70,7 @@ add_executable(gnomecast-native
   src/rdp_log.c
   src/au_snapshot.c
   src/luna_volume.c
+  src/webos_platform.c
   src/config_paths.c
   src/settings_json.c
   src/video_rgba_sdl.c
@@ -466,6 +466,13 @@ if(BUILD_TESTING)
   target_link_libraries(test-luna-volume PRIVATE Threads::Threads)
   add_test(NAME luna-volume COMMAND test-luna-volume)
 
+  add_executable(test-webos-platform
+    tests/test_webos_platform.c
+    src/webos_platform.c
+  )
+  target_include_directories(test-webos-platform PRIVATE include)
+  add_test(NAME webos-platform COMMAND test-webos-platform)
+
   add_executable(test-audio-pipeline
     tests/test_audio_pipeline.c
     src/audio_pipeline.c
@@ -491,7 +498,7 @@ if(BUILD_TESTING)
   foreach(native_test_target IN ITEMS
       test-rdp-ffi-layout test-rdp-log test-h264-annexb test-video-rgba-sdl test-input-sdl
       test-cursor-sdl test-config-paths test-settings-json test-au-snapshot
-      test-luna-volume test-audio-pipeline test-audio-opus)
+      test-luna-volume test-webos-platform test-audio-pipeline test-audio-opus)
     if(TARGET ${native_test_target})
       target_link_libraries(${native_test_target} PRIVATE category-log)
     endif()

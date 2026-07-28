@@ -6,6 +6,29 @@ AVC420/H.264 is preferred through the in-house NDL DirectMedia backend
 (`backend_ndl`, dlopen of `libNDL_directmedia.so.1`); RemoteFX is supported only as a native
 Rust/IronRDP decode path with RGBA updates presented by SDL.
 
+## webOS TV compatibility
+
+One ARM32 package targets webOS TV 5.0, 6.0, and TV 22 through TV 26. At
+startup the native LS2 client performs one bounded `getSystemInfo` request for
+`sdkVersion` before any RDP, miniaudio, or NDL thread starts. SDK 1-4 is
+rejected; an unavailable version falls back to the DirectMedia ABI probe.
+
+The backend selects the ABI from one facade's symbols, never from a guessed
+release cutoff: `DirectMediaSetWindowId` means the one-argument Init profile;
+without it, a complete v2 control plane uses callback Init with a NULL
+resource callback. The guaranteed common path is H.264 plus S16LE mono/stereo
+PCM. TV 23 / SDK 8.x is the reference device. Other generations remain
+ABI-supported candidates until the same IPK passes launch, H.264/PCM,
+reload/IDR, reconnect and concurrent audio/video smoke tests on that runtime.
+SDK 11 is treated as TV 26 pending confirmation from the first device audit.
+
+No NDL library is packaged or linked. Product builds retain the existing
+Buildroot compiler and compile against backend_ndl's private minimal ABI
+declarations, so the webOS NDK is not a build dependency. When an official ARM
+target NDK is available, use backend_ndl's separate optional conformance test
+to compare enum values, layouts and signatures; the x86_64 NDK sysroot is
+rejected.
+
 ## Multi-RDP Sessions (red/green/yellow/blue)
 
 The app can hold up to four simultaneous RDP sessions to different servers, mapped to
@@ -262,7 +285,7 @@ cmake --build /tmp/gnomecast-native-rust-build
 The product webOS build requires:
 
 - webOS buildroot toolchain;
-- initialized `third_party/IronRDP`,
+- initialized `third_party/backend_ndl`, `third_party/IronRDP`,
   `third_party/lvgl`, and `third_party/miniaudio` submodules;
 - SDL2 for the webOS target;
 - Rust target support for `armv7-unknown-linux-gnueabi`.
@@ -481,7 +504,7 @@ Implemented:
 - C FFI stub for local scaffold builds; product webOS builds require the Rust staticlib.
 - Pinned native dependency submodules, including miniaudio 0.11.25, with provenance and
   license staging.
-- Standalone `backend_ndl/` DirectMedia library plus gnomecast adapters in
+- Standalone `third_party/backend_ndl/` DirectMedia library plus gnomecast adapters in
   `native/src/ndl_adapter/`: dlopen, atomic combined-track loads, callbacks, optional PCM
   priming/keyframe gating, and application-owned H.264 framing/recovery policy.
 - H.264 framing normalization, including AU size caps. NOTE: the wire carries BOTH
@@ -521,7 +544,7 @@ Not yet implemented or not yet TV-verified:
 Initialize pinned native dependencies:
 
 ```sh
-git submodule update --init third_party/IronRDP third_party/lvgl third_party/miniaudio
+git submodule update --init third_party/backend_ndl third_party/IronRDP third_party/lvgl third_party/miniaudio
 ```
 
 See `third_party/PROVENANCE.md` for pinned commits, licenses, and the Moonlight reference boundary.

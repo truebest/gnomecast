@@ -12,7 +12,7 @@ BackendNdl *native_media_ndl_backend(NativeMedia *media);
 BackendNdlResult native_media_ndl_configure_video(NativeMedia *media,
                                                    const BackendNdlVideoInfo *info);
 BackendNdlResult native_media_ndl_configure_audio(NativeMedia *media,
-                                                   const BackendNdlPcmInfo *info);
+                                                   const BackendNdlAudioInfo *info);
 BackendNdlResult native_media_ndl_clear_video(NativeMedia *media);
 BackendNdlResult native_media_ndl_clear_audio(NativeMedia *media);
 

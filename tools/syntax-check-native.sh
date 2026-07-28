@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fast stub-mode syntax check of the native C sources — the single source of
+# Fast host syntax check of the native C sources — the single source of
 # truth for the file list that CI (bitbucket-pipelines.yml) and the docs
 # (AGENTS.md, docs/build-environment.md, docs/native-runbook.md) used to
 # hardcode and let drift. Every native/src/*.c, NDL adapter, and standalone
@@ -22,7 +22,7 @@ excluded=(input_evdev.c ui_preconnect.c)
 
 files=()
 for f in "$repo_root"/native/src/*.c "$repo_root"/native/src/ndl_adapter/*.c \
-         "$repo_root"/backend_ndl/src/backend_ndl.c; do
+         "$repo_root"/third_party/backend_ndl/src/*.c; do
   base="$(basename "$f")"
   for skip in "${excluded[@]}"; do
     if [[ "$base" == "$skip" ]]; then
@@ -40,8 +40,8 @@ fi
 "${CC:-cc}" -fsyntax-only \
   -I"$repo_root/native/include" \
   -I"$repo_root/native/src/ndl_adapter" \
-  -I"$repo_root/backend_ndl/include" \
-  -I"$repo_root/backend_ndl/src" \
+  -I"$repo_root/third_party/backend_ndl/include" \
+  -I"$repo_root/third_party/backend_ndl/src" \
   -I"$repo_root/third_party/miniaudio" \
   "${files[@]}" "$@"
 
